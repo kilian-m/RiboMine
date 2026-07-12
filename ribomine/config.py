@@ -179,6 +179,13 @@ DEFAULTS: dict[str, Any] = {
         # and keeping them yields a SHORT UMI, which umi_tools refuses outright.
         # Set false to keep them anyway -- the missing UMI bases are then written as N.
         "discard_untrimmed": True,
+        # nt of the fixed 3' scaffold (barcode + adapter) that must be visible in a read
+        # before it is cut there. 7 nt of a known string, anchored at the read end,
+        # matches by chance about once in 16,000 reads. Lower it when the library's
+        # molecules barely fit the read -- the scaffold then runs off the end of most
+        # reads and they cannot be trimmed at all (RiboMine warns when that happens).
+        # It is a specificity/depth trade: a bad cut corrupts the footprint boundary.
+        "adapter_min_overlap": 7,
         "umi_dedup": False,          # umi_tools dedup on the BAM -- OFF by default
         "umi_dedup_method": "directional",
         "filter_contaminants": True, # bowtie2 rRNA/tRNA removal before mapping

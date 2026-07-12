@@ -28,6 +28,9 @@ LOG = logging.getLogger("ribomine.arch.trim")
 # values that mean "this element is absent from the call"
 _ABSENT = ("none", "unknown", "", None)
 
+# a library that cannot show its 3' scaffold to this share of its reads will lose them
+NO_ADAPTER_WARN = 0.30
+
 
 def max_mm(overlap: int) -> int:
     """Mismatches tolerated over an adapter overlap of `overlap` nt (cutadapt's
@@ -67,9 +70,10 @@ def trim_polyA(read: str, min_run: int = 6) -> int:
     return n
 
 
-def plan_from_call(call: dict) -> dict:
+def plan_from_call(call: dict, *, min_overlap: int = 7) -> dict:
     """Extract the trimming plan from an `infer()` result."""
     fn = call.get("functional") or {}
+    bc3 = call.get("barcode3_seq", "none")
     return {
         "status": call.get("status"),
         "trim_5p": fn.get("trim_5p", 0),
@@ -79,11 +83,18 @@ def plan_from_call(call: dict) -> dict:
         "p5_layout": call.get("p5_layout") or [],
         "umi3": _as_int(call.get("umi3_len"), 0),
         "nt3": _as_int(call.get("nt3_len"), 0),
-        "bc3": call.get("barcode3_seq", "none"),
+        "bc3": bc3,
+        # the barcode's actual bases -- part of the fixed 3' scaffold we anchor on
+        "bc3_seq": bc3 if bc3 not in _ABSENT else "",
         "adapter_name": call.get("adapter3_name", "unknown"),
         "adapter_seq": call.get("adapter3_seq", ""),
         "polyA": call.get("polyA_tail", "none"),
         "fp_mode": call.get("footprint_len_mode") or 28,
+        # nt of the fixed scaffold that must be visible before we will cut on it.
+        # 7 nt of a known string, anchored at the read end, matches by chance once in
+        # 16,000 reads. Lowering it trades that specificity for depth on a library
+        # whose molecules barely fit the read (see trim_read).
+        "min_overlap": max(1, int(min_overlap)),
     }
 
 
@@ -123,17 +134,39 @@ def trim_read(seq: str, qual: str, p: dict) -> tuple[str, str, str, bool | None]
     umi3 = ""
     adapter_found: bool | None = None
     if name not in _ABSENT and name != "none_visible" and p["adapter_seq"]:
-        # find the ligated adapter and cut it, plus the 3' construct in front of it
-        a = find_adapter(seq, p["adapter_seq"], min_start=max(s5, p["fp_mode"] - 6))
-        adapter_found = a >= 0
-        if a < 0:
-            e3 = len(seq)                      # adapter not in this read: keep to end
+        # Anchor on the whole FIXED 3' scaffold -- the barcode AND the adapter -- not
+        # on the adapter alone. The sample barcode is just as constant and just as
+        # known, and it sits `bc3len` nt CLOSER to the insert, so it is visible in
+        # reads whose adapter has already run off the end. That matters enormously
+        # when the molecule is about as long as the read: on SRR11945406 (46 nt reads,
+        # a 44 nt molecule) only 2.5% of reads show >= 7 nt of TruSeq, but 35% show
+        # >= 7 nt of [barcode + TruSeq]. Anchoring on the adapter alone therefore threw
+        # away 97% of a perfectly good library. Specificity is unchanged: a 7-nt match
+        # to a known string, anchored at the read end, happens by chance once in 16,000.
+        lo = max(s5, p["fp_mode"] - 6)
+        scaffold = p["bc3_seq"] + p["adapter_seq"]
+        s = find_adapter(seq, scaffold, min_start=lo, min_overlap=p["min_overlap"])
+        if s < 0 and bc3len:
+            # The scaffold match must start AT the barcode, so a sequencing error in
+            # the barcode blocks it -- and at a 7-nt overlap the error budget is zero.
+            # Those reads were trimmable before (the adapter alone matched), so fall
+            # back to it and derive the same cut point. This keeps the scaffold anchor
+            # a strict superset: it can only ever find MORE reads, never fewer.
+            # search from the same `lo` the adapter-only anchor always used, or reads
+            # whose adapter sits right at that bound would be lost to the tighter start
+            a = find_adapter(seq, p["adapter_seq"], min_start=lo,
+                             min_overlap=p["min_overlap"])
+            if a >= bc3len:
+                s = a - bc3len
+        adapter_found = s >= 0
+        if s < 0:
+            e3 = len(seq)                      # scaffold not in this read: keep to end
         else:
-            # umi3 + a degenerate non-templated block + barcode3 all sit between the
-            # footprint and the adapter, and all of it comes off the footprint
-            cons_len = p["umi3"] + p["nt3"] + bc3len
-            umi3 = seq[a - p["umi3"] - bc3len:a - bc3len] if p["umi3"] else ""
-            e3 = a - cons_len
+            # the scaffold starts at the barcode; the UMI (and any degenerate
+            # non-templated block) sit between the footprint and it, and all of it
+            # comes off the footprint
+            umi3 = seq[s - p["umi3"]:s] if p["umi3"] else ""
+            e3 = s - p["umi3"] - p["nt3"]
     elif p["polyA"] not in ("none", "", None) or name == "none_visible":
         e3 = trim_polyA(seq)                   # trim the poly(A) tail (adapter beyond it)
     else:
@@ -150,7 +183,8 @@ def trim_read(seq: str, qual: str, p: dict) -> tuple[str, str, str, bool | None]
 
 
 def trim_fastq(in_fq: str, call: dict, out_fq: str, *, min_len: int = 20,
-               label: str = "", discard_untrimmed: bool = True) -> dict:
+               label: str = "", discard_untrimmed: bool = True,
+               min_overlap: int = 7) -> dict:
     """Trim `in_fq` according to the architecture `call`, writing `out_fq`.
 
     Both paths may be plain or `.gz`. The FASTQ is streamed record by record.
@@ -185,7 +219,7 @@ def trim_fastq(in_fq: str, call: dict, out_fq: str, *, min_len: int = 20,
         LOG.warning("%s: architecture is '%s' (%s); trimming with best-effort plan",
                     label or os.path.basename(in_fq), status,
                     str(call.get("reason", ""))[:70])
-    p = plan_from_call(call)
+    p = plan_from_call(call, min_overlap=min_overlap)
     # every UMI written must have exactly this length, or umi_tools will refuse the file
     umi_len = p["umi5"] + p["umi3"]
 
@@ -237,6 +271,9 @@ def trim_fastq(in_fq: str, call: dict, out_fq: str, *, min_len: int = 20,
         "n_dropped_untrimmed": n_no_adapter if discard_untrimmed else 0,
         "n_umi_padded": n_padded,
         "discard_untrimmed": discard_untrimmed,
+        "min_overlap": p["min_overlap"],
+        "frac_no_adapter": round(n_no_adapter / max(n_in, 1), 4),
+        "frac_kept": round(n_out / max(n_in, 1), 4),
         "mean_len_in": round(len_in / max(n_in, 1), 1),
         "mean_len_out": round(len_out / max(n_out, 1), 1),
     }
@@ -249,4 +286,20 @@ def trim_fastq(in_fq: str, call: dict, out_fq: str, *, min_len: int = 20,
              stats["label"], f"{n_out:,}", f"{n_in:,}", f"{n_short:,}", min_len, extra,
              stats["mean_len_in"], stats["mean_len_out"], p["trim_5p"], p["umi5"],
              p["umi3"], p["adapter_name"], p["polyA"])
+
+    # Losing most of a library must never be quiet. When the molecule is about as long
+    # as the read, the fixed 3' scaffold runs off the end and the read cannot be cut at
+    # the footprint boundary -- so those reads are (rightly) discarded, and the dataset
+    # silently arrives at a fraction of its advertised depth. Say so, with the lever.
+    if stats["frac_no_adapter"] >= NO_ADAPTER_WARN and p["adapter_name"] not in _ABSENT:
+        LOG.warning(
+            "%s: the 3' scaffold is missing from %.0f%% of reads -- the molecule is about "
+            "as long as the read, so it runs off the end. Only %s of %s reads survive "
+            "trimming, and THEY ARE LENGTH-BIASED: it is precisely a long footprint that "
+            "pushes the scaffold past the read end, so the survivors skew short. That is a "
+            "property of the library, not a failure -- but do not read the footprint-length "
+            "distribution of this dataset off the BAM. Lowering process.adapter_min_overlap "
+            "(now %d) recovers depth at the cost of specificity.",
+            stats["label"], 100 * stats["frac_no_adapter"], f"{n_out:,}", f"{n_in:,}",
+            p["min_overlap"])
     return stats

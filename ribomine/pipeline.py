@@ -262,7 +262,8 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
     if not (resume and nonempty(s.trimmed_fastq) and nonempty(s.trim_json)):
         tst = arch_trim.trim_fastq(full, call, s.trimmed_fastq,
                                    min_len=cfg["process.min_len"], label=acc,
-                                   discard_untrimmed=cfg["process.discard_untrimmed"])
+                                   discard_untrimmed=cfg["process.discard_untrimmed"],
+                                   min_overlap=cfg["process.adapter_min_overlap"])
         write_json(s.trim_json, tst)
     info["trim"] = read_json(s.trim_json, {})
 

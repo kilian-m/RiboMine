@@ -142,6 +142,7 @@
   "process": {
     "min_len": 20,
     "discard_untrimmed": true,
+    "adapter_min_overlap": 7,
     "umi_dedup": false,
     "umi_dedup_method": "directional",
     "filter_contaminants": true,

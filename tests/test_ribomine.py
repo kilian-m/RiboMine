@@ -325,3 +325,62 @@ def test_a_minority_adapter_is_still_an_adapter():
     weak = (p["frac_anchored"] < thr.min_anchor_frac
             and p["n_anchored"] < infer.MIN_ANCHORED_READS)
     assert not weak, "742 anchored reads is ample evidence, whatever the fraction"
+
+
+# --- the 3' scaffold: the barcode is part of the anchor, not just something to cut ---
+BC_CALL = dict(CALL, umi3_len=5, barcode3_seq="ATCGT", footprint_len_mode=32,
+               functional={"trim_5p": 2, "dedup_umi_len": 7})
+
+
+def test_barcode_is_trimmed_and_kept_out_of_the_umi():
+    """A sample barcode is CONSTANT across the library -- measured on SRR11945406 it is
+    98.6% one sequence, 0.14 bits of entropy against a 5-nt UMI's ~10. Putting it in the
+    dedup key adds no information at all, while adding error-prone positions that eat
+    umi_tools --directional's edit-distance-1 budget. So: trim it, never dedup on it."""
+    fn = infer.functional_view(
+        {"umi5_len": 2, "barcode5_seq": "none", "p5_layout": [], "rt5_len": 0,
+         "rt5_penetrance": 0.0, "rt_nt": False, "ts5_len": 0, "ts5_seq": ""},
+        {"umi3_len": 5, "nt3_len": 0, "barcode3_seq": "ATCGT", "polyA_tail": "none",
+         "adapter3_name": "illumina_truseq", "adapter3_seq": ADAP})
+    bc = [s for s in fn["segments_3p"] if s["role"] == "barcode3"][0]
+    assert bc["cat"] == "fixed-templated" and bc["fate"] == "trim"   # trimmed...
+    assert fn["dedup_umi_len"] == 7                                  # ...but 2+5, not 2+5+5
+    assert "ATCGT" not in fn["dedup_umi_mask"]
+    assert fn["trim_3p_construct"] == 10                             # umi + barcode both cut
+
+
+def test_the_scaffold_anchor_recovers_reads_the_adapter_alone_cannot(tmp_path):
+    """SRR11945406: a 44-nt molecule in a 46-nt read. The adapter runs off the end of
+    97% of reads, so anchoring on it alone found nothing and discard_untrimmed threw the
+    library away (2.3% survived). The BARCODE is just as fixed and just as known, and it
+    sits 5 nt closer to the insert -- anchoring on [barcode + adapter] recovers them."""
+    # a read whose TruSeq is truncated to 2 nt: adapter-only (min_overlap 7) cannot see it
+    read = "GG" + FOOT[:32] + "ACGTA" + "ATCGT" + ADAP[:2]
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [read]), BC_CALL, out, min_len=20)
+    (name, seq), = _read(out)
+    assert seq == FOOT[:32]              # the footprint, exactly
+    assert name.endswith("_GGACGTA")     # 2 nt 5' UMI + 5 nt 3' UMI; barcode NOT in it
+    assert st["n_reads_out"] == 1
+
+
+def test_scaffold_anchoring_is_a_strict_superset(tmp_path):
+    """A sequencing error in the barcode blocks the scaffold match (at a 7-nt overlap the
+    error budget is zero). Those reads were trimmable before, so the adapter alone must
+    still be tried -- the new anchor may only ever find MORE reads, never fewer."""
+    bad_bc = "GG" + FOOT[:32] + "ACGTA" + "ATCGA" + ADAP     # barcode ATCGT -> ATCGA
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [bad_bc]), BC_CALL, out, min_len=20)
+    assert st["n_reads_out"] == 1, "a barcode typo must not lose a read the adapter can anchor"
+    (_, seq), = _read(out)
+    assert seq == FOOT[:32]
+
+
+def test_losing_most_of_a_library_is_reported(tmp_path):
+    """Silently keeping 2% of a dataset is the worst possible outcome: it looks like it
+    worked. The fraction must reach the caller and the TSV."""
+    reads = [ "GG" + FOOT[:32] + "ACGTA" + "ATCGT" + ADAP ] + \
+            [ "GG" + FOOT + "ACGTACGTAC" ] * 9              # 9 reads with no scaffold at all
+    st = trim.trim_fastq(_fastq(tmp_path, reads), BC_CALL, str(tmp_path / "o.fq"))
+    assert st["frac_no_adapter"] == 0.9
+    assert st["frac_kept"] == 0.1

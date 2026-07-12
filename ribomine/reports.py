@@ -57,7 +57,7 @@ ARCH_COLUMNS = [
 
 PROCESS_COLUMNS = [
     "run_accession", "verdict", "architecture", "download_route", "download_mb_per_s",
-    "fastq_bytes", "n_reads_raw", "n_reads_after_trim", "frac_trimmed_out",
+    "fastq_bytes", "n_reads_raw", "n_reads_after_trim", "frac_trimmed_out", "frac_no_adapter",
     "mean_len_before_trim", "mean_len_after_trim", "n_contaminant_removed",
     "frac_contaminant", "n_reads_into_mapping", "n_uniquely_mapped",
     "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped", "umi_dedup",
@@ -340,6 +340,10 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         "n_reads_raw": n_in,
         "n_reads_after_trim": n_out,
         "frac_trimmed_out": frac_trimmed_out,
+        # reads whose fixed 3' scaffold ran off the end of the read: they cannot be cut
+        # at the footprint boundary and are discarded. High here = the library's
+        # molecules are as long as its reads, and most of its depth is unusable.
+        "frac_no_adapter": trim.get("frac_no_adapter"),
         "mean_len_before_trim": trim.get("mean_len_in"),
         "mean_len_after_trim": trim.get("mean_len_out"),
         "n_contaminant_removed": n_contam,
