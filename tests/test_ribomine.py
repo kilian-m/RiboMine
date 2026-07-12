@@ -183,3 +183,45 @@ def test_infer_refuses_rather_than_guesses():
     call = infer.infer({"label": "x", "n_used": 10})
     assert call["status"] == "undetermined"
     assert "10" in call["reason"]
+
+
+# --- shipped reference data ------------------------------------------------
+def test_contaminant_fasta_is_bundled():
+    """The QC stage cannot silently run without a contaminant filter: an unfiltered
+    rRNA read maps to hundreds of genomic copies, so the library then looks like
+    ~78% multimapping junk. Shipping the reference means the default just works."""
+    from ribomine import data
+    from ribomine.qc import contaminants
+
+    p = data.human_contaminants()
+    with open(p) as fh:
+        heads = [ln for ln in fh if ln.startswith(">")]
+    assert len(heads) > 3000
+    blob = "".join(heads)
+    for kind in ("tRNA", "snRNA", "snoRNA", "rRNA"):
+        assert kind in blob, f"{kind} missing from the bundled contaminant reference"
+
+    # and an unconfigured run resolves to it rather than skipping the filter
+    cfg = cfgmod.load(None)
+    assert contaminants.resolve_fasta(cfg) == p
+
+
+def test_explicit_contaminant_fasta_wins(tmp_path):
+    fa = tmp_path / "mine.fa"
+    fa.write_text(">x\nACGT\n")
+    from ribomine.qc import contaminants
+    cfg = cfgmod.load(None, {"reference": {"contaminant_fasta": str(fa)}})
+    assert contaminants.resolve_fasta(cfg) == str(fa)
+
+
+def test_missing_contaminant_fasta_is_an_error():
+    from ribomine.qc import contaminants
+    cfg = cfgmod.load(None, {"reference": {"contaminant_fasta": "/nope/absent.fa"}})
+    with pytest.raises(ValueError, match="not found"):
+        contaminants.resolve_fasta(cfg)
+
+
+def test_no_option_can_leave_a_bam_unindexed():
+    """Every BAM RiboMine leaves on disk is sorted+indexed. There is deliberately no
+    config key that turns that off -- an unindexed BAM is one nobody can open."""
+    assert "sort_index_bam" not in cfgmod.DEFAULTS["process"]

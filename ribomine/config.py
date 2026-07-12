@@ -56,8 +56,11 @@ DEFAULTS: dict[str, Any] = {
         "gtf": "/path/to/data/homo_sapiens.90.gtf",
         "star_index": "/path/to/data/index_files/STAR-index",
         # bowtie2 index PREFIX of rRNA/tRNA/snRNA/snoRNA/Mt contaminant sequences.
-        # null => `ribomine setup` builds one from `contaminant_fasta`.
+        # null => built from `contaminant_fasta` into <workdir>/refs/ on first use.
         "contaminant_index": None,
+        # null => the HUMAN contaminant reference bundled with RiboMine
+        # (ribomine/data/human_riboseq_contaminants.rRNA_tRNA_snRNA_snoRNA_Mt.fa).
+        # For another organism, point this at that organism's sequences.
         "contaminant_fasta": None,
         # cached GTF index used by the QC stage; null => <workdir>/refs/<gtf>.idx.pkl
         "annotation_index": None,
@@ -180,8 +183,12 @@ DEFAULTS: dict[str, Any] = {
         "umi_dedup_method": "directional",
         "filter_contaminants": True, # bowtie2 rRNA/tRNA removal before mapping
         "filter_pileups": True,      # data-driven pile-up removal after mapping
-        "sort_index_bam": True,
         "keep_trimmed_fastq": False,
+        # Every BAM RiboMine leaves on disk is coordinate-sorted and indexed -- the
+        # deliverable ones and the QC-stage ones alike -- so any of them can be opened
+        # in a genome browser without a further step. This is not optional: an
+        # unindexed BAM is a BAM nobody can look at, and UMI deduplication requires a
+        # sorted, indexed input anyway.
     },
 
     "mapping": {

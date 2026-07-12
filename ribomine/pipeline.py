@@ -172,6 +172,14 @@ def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
     if cfg["plots.enabled"]:
         qc_plot.plot_qc(q, s.qc_plot(cfg["plots.format"]), dpi=cfg["plots.dpi"])
 
+    # 7. leave the QC alignments coordinate-sorted and indexed. STAR writes them
+    #    unsorted, and the steps above read them in file order, so this happens last
+    #    -- but it does happen: the BAM the verdict and the architecture were computed
+    #    on is exactly the one you want to open in a browser when a call looks wrong.
+    for b in (s.local_bam, s.pileup_bam):
+        if nonempty(b):
+            star.ensure_sorted_indexed(b, threads=min(threads, 8))
+
     LOG.info("[%s] %s  (in-frame %.0f%%, CDS %.0f%% of genic, %.0fs)", acc, q["verdict"],
              100 * q["periodicity_inframe_frac"], 100 * q["cds_frac_of_genic"],
              time.time() - t0)
@@ -284,11 +292,8 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         bam = pb
 
     # 6. sort + index -- the BAM users get
-    if cfg["process.sort_index_bam"]:
-        star.sort_index(bam, s.bam, threads=min(threads, 8))
-        rm(bam)
-    else:
-        os.replace(bam, s.bam)
+    star.sort_index(bam, s.bam, threads=min(threads, 8))
+    rm(bam)
 
     # 7. optional UMI deduplication. OFF by default, and deliberately so: it is only
     #    correct when the library actually carries a UMI, and on a library that does
@@ -296,15 +301,11 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
     #    are real signal (a highly translated codon IS covered many times).
     info["umi_dedup"] = bool(cfg["process.umi_dedup"])
     if cfg["process.umi_dedup"]:
-        if not cfg["process.sort_index_bam"]:
-            raise RuntimeError(
-                f"{acc}: process.umi_dedup needs a coordinate-sorted, indexed BAM; "
-                f"process.sort_index_bam is false")
         tmp = s.bam + ".dedup.bam"
         info["dedup"] = proc_dedup.dedup(s.bam, tmp, cfg, log=s.log)
         os.replace(tmp, s.bam)
         rm(s.bam + ".bai", tmp + ".bai")
-        star.index(s.bam)                       # umi_tools preserves the sort order
+        star.index(s.bam, threads=min(threads, 8))   # umi_tools preserves the sort order
         LOG.info("[%s] UMI dedup: %s -> %s reads (%.0f%% duplicates)", acc,
                  human(info["dedup"]["n_in"]), human(info["dedup"]["n_out"]),
                  100 * (1 - info["dedup"]["frac_kept"]))
@@ -385,6 +386,7 @@ def run(cfg: Config) -> dict:
     # pool forks. Anything built lazily inside a worker is built by all of them at
     # once, and two processes writing the same file is corruption, not a slowdown.
     annotation.ensure_index(cfg)     # the 22 MB GTF pickle
+    contaminants.ensure_index(cfg)   # the bowtie2 contaminant index (bundled FASTA by default)
     _ensure_fasta_index(cfg)         # the genome .fai -- pysam builds it silently otherwise
     meta = _run_meta(cfg)
 

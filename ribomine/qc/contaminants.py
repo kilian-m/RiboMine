@@ -144,34 +144,68 @@ def build_index(fasta: str, cfg: Config) -> str:
     return prefix
 
 
-def index_path(cfg: Config) -> str | None:
-    """The bowtie2 contaminant index prefix to filter against, or None.
+def resolve_fasta(cfg: Config) -> str:
+    """The contaminant FASTA to filter against.
 
-    `reference.contaminant_index` wins. If it is unset, look where `ribomine
-    setup` puts the index it builds -- otherwise a user who ran `setup` (which
-    does not rewrite their config) would silently get the low-complexity screen
-    only, which is exactly the failure this fallback exists to prevent.
+    `reference.contaminant_fasta` wins; otherwise the human rRNA/tRNA/snRNA/snoRNA/Mt
+    reference bundled with RiboMine. Bundling it means the common case needs no
+    configuration at all -- and, more to the point, that the QC stage cannot silently
+    run without a contaminant filter, which is the failure mode that makes a library
+    look like 78% multimapping junk (each rRNA has hundreds of genomic copies, so
+    every rRNA read maps to "too many loci").
+    """
+    fa = cfg.ref("contaminant_fasta")
+    if fa:
+        if not os.path.isfile(fa):
+            raise ValueError(f"reference.contaminant_fasta not found: {fa}")
+        return fa
+    from ribomine import data
+
+    return data.human_contaminants()
+
+
+def index_path(cfg: Config) -> str | None:
+    """The bowtie2 contaminant index prefix to filter against, or None if unbuilt.
+
+    `reference.contaminant_index` wins. Otherwise the index built from
+    `resolve_fasta` -- looked up where `ensure_index` / `ribomine setup` put it, so a
+    user who ran `setup` (which does not rewrite their config) does not silently fall
+    back to the low-complexity screen alone.
     """
     idx = cfg.ref("contaminant_index")
     if idx:
         return idx
 
-    fa = cfg.ref("contaminant_fasta")
-    if fa:
-        p = _index_prefix(cfg, fa)
-        return p if _index_exists(p) else None
+    p = _index_prefix(cfg, resolve_fasta(cfg))
+    if _index_exists(p):
+        return p
 
-    # No FASTA in the config either: `ribomine setup --contaminant-fasta X` still
-    # leaves its index in refs/. Adopt it only if there is exactly one -- guessing
-    # between several would silently filter against the wrong reference.
+    # Last resort: `ribomine setup --contaminant-fasta X` leaves its index in refs/.
+    # Adopt it only if there is exactly one -- guessing between several would
+    # silently filter against the wrong reference.
     refs = cfg.dir("refs")
-    hits = [p for suf in (".1.bt2", ".1.bt2l")
-            for p in glob.glob(os.path.join(refs, "*" + suf))
+    hits = [q for suf in (".1.bt2", ".1.bt2l")
+            for q in glob.glob(os.path.join(refs, "*" + suf))
             # bowtie2-build also writes <prefix>.rev.1.bt2; that is not a prefix
-            if not p.endswith(".rev" + suf)]
+            if not q.endswith(".rev" + suf)]
     if len(hits) == 1:
         return hits[0].rsplit(".1.bt2", 1)[0]
     return None
+
+
+def ensure_index(cfg: Config) -> str | None:
+    """Index prefix, building it from the resolved FASTA if it does not exist yet.
+
+    MUST be called from the parent process, before the sample pool forks: N workers
+    all discovering a missing index and all running bowtie2-build into the same
+    prefix is corruption, not a slowdown. `pipeline.run` does this alongside the
+    annotation index.
+    """
+    if cfg.ref("contaminant_index"):
+        return cfg.ref("contaminant_index")
+    if not cfg["contaminants.enabled"]:
+        return None
+    return build_index(resolve_fasta(cfg), cfg)
 
 
 # --- the two filters --------------------------------------------------------

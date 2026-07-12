@@ -131,7 +131,6 @@
     "umi_dedup_method": "directional",
     "filter_contaminants": true,
     "filter_pileups": true,
-    "sort_index_bam": true,
     "keep_trimmed_fastq": false
   },
   "mapping": {

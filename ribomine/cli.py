@@ -145,14 +145,11 @@ def _dispatch(a: argparse.Namespace) -> int:
 
     if a.cmd == "setup":
         from .qc import annotation, contaminants
-        idx = annotation.ensure_index(cfg)
-        print(f"annotation index: {idx}")
-        fa = a.contaminant_fasta or cfg.ref("contaminant_fasta")
-        if fa:
-            print(f"contaminant index: {contaminants.build_index(fa, cfg)}")
-        else:
-            LOG.warning("no contaminant FASTA (reference.contaminant_fasta or "
-                        "--contaminant-fasta); rRNA/tRNA reads will not be removed")
+        print(f"annotation index:  {annotation.ensure_index(cfg)}")
+        fa = a.contaminant_fasta or contaminants.resolve_fasta(cfg)
+        bundled = not (a.contaminant_fasta or cfg.ref("contaminant_fasta"))
+        print(f"contaminant FASTA: {fa}" + ("  (bundled with RiboMine)" if bundled else ""))
+        print(f"contaminant index: {contaminants.build_index(fa, cfg)}")
         return 0
 
     if a.cmd == "benchmark":

@@ -31,5 +31,10 @@ Homepage = "https://github.com/kilian-m/RiboMine"
 [tool.setuptools.packages.find]
 include = ["ribomine*"]
 
+[tool.setuptools.package-data]
+# the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt) -- see
+# ribomine/data/__init__.py. Without this it is missing from a built wheel.
+"ribomine.data" = ["*.fa"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -301,6 +301,34 @@ def sort_index(bam: str, out_bam: str, *, threads: int = 4) -> str:
     return out_bam
 
 
+def is_coordinate_sorted(bam: str) -> bool:
+    import pysam
+
+    try:
+        with pysam.AlignmentFile(bam, "rb", check_sq=False) as fh:
+            return fh.header.get("HD", {}).get("SO") == "coordinate"
+    except Exception:  # noqa: BLE001 -- an unreadable BAM is "not sorted"
+        return False
+
+
+def ensure_sorted_indexed(bam: str, *, threads: int = 4) -> str:
+    """Leave `bam` coordinate-sorted and indexed, in place. Idempotent.
+
+    Every BAM RiboMine leaves behind goes through this, so there is never a BAM on
+    disk that a genome browser cannot open. It is called only AFTER the analysis
+    steps have read a BAM, never before: `qc/pileups.py` and `qc/profile.py` read
+    their input in file order, and re-ordering an input they are about to read would
+    be a change to the analysis, not to the packaging.
+    """
+    if is_coordinate_sorted(bam) and nonempty(bam + ".bai"):
+        return bam
+    if not is_coordinate_sorted(bam):
+        tmp = bam + ".sorted.tmp.bam"
+        run(["samtools", "sort", "-@", str(int(threads)), "-o", tmp, bam])
+        os.replace(tmp, bam)
+    return index(bam, threads=threads)
+
+
 def index(bam: str, *, threads: int = 4) -> str:
     """Index an already coordinate-sorted BAM.
 

@@ -42,6 +42,18 @@ ribomine setup -c config.json        # build the annotation + contaminant indexe
 ribomine run -c config.json          # the whole thing
 ```
 
+The **human contaminant reference is bundled** (rRNA / tRNA / snRNA / snoRNA / Mt,
+3,856 sequences), so the only thing you have to supply is the genome, the GTF and a
+STAR index. That matters more than it sounds: a Ribo-seq library that is *not*
+contaminant-filtered looks like ~78 % multimapping junk, because every rRNA has
+hundreds of genomic copies and so every rRNA read maps to "too many loci". For a
+non-human organism, point `reference.contaminant_fasta` at that organism's sequences.
+
+**Every BAM RiboMine writes is coordinate-sorted and indexed** — the deliverables in
+`bams/` and the QC-stage alignments alike — so when a verdict looks wrong you can open
+the exact alignment it was computed from. There is deliberately no option to turn that
+off.
+
 ## Start and end points
 
 You rarely want the whole pipeline. Both ends move:
@@ -217,6 +229,7 @@ ribomine/
   process/
     star.py         alignment (local for reading architecture, end-to-end for the BAM)
     dedup.py        optional UMI deduplication
+  data/             the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt)
   reports.py        the TSVs
 docs/
   DOWNLOAD.md       how to get data out of the SRA fast, with measurements
