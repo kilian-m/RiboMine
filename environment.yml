@@ -1,0 +1,41 @@
+# conda env create -f environment.yml && conda activate ribomine && pip install -e .
+#
+# Pinned only where a pin is load-bearing:
+#   python >=3.10   -- match statements / X | None annotations
+#   pysam, ncls     -- the QC interval index and BAM reader
+#   sra-tools       -- prefetch/fasterq-dump, the fallback download route
+#   aria2           -- multi-connection HTTPS, the fast route (see docs/DOWNLOAD.md)
+#   umi_tools       -- optional UMI deduplication (off by default)
+name: ribomine
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10,<3.13
+
+  # --- core scientific stack
+  - numpy>=1.24
+  - scipy>=1.10
+  - pandas>=2.0
+  - matplotlib-base>=3.7
+  - pysam>=0.22
+  - ncls>=0.0.68
+  - requests>=2.31
+
+  # --- read processing / alignment
+  - star>=2.7.10
+  - bowtie2>=2.5
+  - samtools>=1.19
+  - cutadapt>=4.6
+  - umi_tools>=1.1.4
+
+  # --- SRA / ENA download
+  - sra-tools>=3.0.10          # prefetch + fasterq-dump (fallback route)
+  - aria2>=1.36                # multi-connection HTTPS from ENA (the fast route)
+  - pigz>=2.7                  # parallel gzip: fasterq-dump writes plain FASTQ
+
+  # --- dev
+  - pytest>=7.4
+  - pip
+  - pip:
+      - kingfisher>=0.4.1      # multi-route SRA fetcher, used as a last-resort route

@@ -1,0 +1,21 @@
+# RiboMine outputs: everything a run writes lands under the configured workdir
+work/
+*.egg-info/
+build/
+dist/
+
+# data that must never be committed
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.sra
+*.pkl
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

@@ -1,0 +1,151 @@
+{
+  "project": {
+    "name": "ribomine",
+    "workdir": "work",
+    "threads": 8,
+    "jobs": 8,
+    "seed": 20260712
+  },
+  "pipeline": {
+    "start": "query",
+    "end": "bam",
+    "accession_list": null,
+    "fastq_dir": null,
+    "resume": true,
+    "keep_verdicts": [
+      "RIBO-SEQ",
+      "TI-SEQ"
+    ]
+  },
+  "reference": {
+    "species": "Homo sapiens",
+    "taxon_id": 9606,
+    "genome_fasta": "/path/to/data/homo_sapiens.90.fasta",
+    "gtf": "/path/to/data/homo_sapiens.90.gtf",
+    "star_index": "/path/to/data/index_files/STAR-index",
+    "contaminant_index": null,
+    "contaminant_fasta": null,
+    "annotation_index": null
+  },
+  "query": {
+    "source": "both",
+    "terms": [
+      "ribo",
+      "ribosome",
+      "riboseq",
+      "RPF",
+      "translatome",
+      "footprint",
+      "harringtonine",
+      "lactimidomycin",
+      "monosome",
+      "ARTseq",
+      "RiboLace"
+    ],
+    "taxon_id": null,
+    "library_strategies": [
+      "RNA-Seq",
+      "OTHER",
+      "ncRNA-Seq",
+      "miRNA-Seq"
+    ],
+    "instrument_platform": "ILLUMINA",
+    "layout": "SINGLE",
+    "min_read_count": 1000000,
+    "max_runs": 0,
+    "runs_per_study": 0,
+    "exclude_runs": [],
+    "exclude_studies": [],
+    "ncbi_api_key": null,
+    "ncbi_email": null
+  },
+  "download": {
+    "route": "auto",
+    "routes": [
+      "ena_https",
+      "aws_odp",
+      "prefetch"
+    ],
+    "connections": 8,
+    "max_retries": 4,
+    "retry_backoff_s": 5,
+    "tmpdir": null,
+    "keep_fastq": false,
+    "keep_sra": false
+  },
+  "qc": {
+    "sample_reads": 200000,
+    "scan_reads": 1000000,
+    "max_reads_scored": 200000,
+    "footprint_len_lo": 25,
+    "footprint_len_hi": 36,
+    "read_len_peak_frac_min": 0.4,
+    "cds_enrich_min": 0.2,
+    "cds_strong": 0.55,
+    "periodic_min": 0.42,
+    "periodic_strong": 0.5,
+    "tvd_min": 0.1,
+    "tvd_strong": 0.2,
+    "min_cds_reads": 150,
+    "single_locus_max": 0.5,
+    "locus_vs_cds": 1.0,
+    "locus_min_to_judge": 0.05,
+    "min_unique_frac": 0.15,
+    "tiseq_ratio_min": 40,
+    "tiseq_min_peak": 200
+  },
+  "contaminants": {
+    "enabled": true,
+    "min_entropy": 1.1,
+    "max_base_frac": 0.85,
+    "pileup_min_count": 30,
+    "pileup_min_frac": 0.005,
+    "pileup_len_conc": 0.85,
+    "pileup_max_frac": 0.1
+  },
+  "architecture": {
+    "min_reads": 5000,
+    "min_plateau": 0.55,
+    "footprint_uniform_max": 0.85,
+    "single_locus_max": 0.5,
+    "genomic_frac": 0.55,
+    "umi_match_frac": 0.25,
+    "ent_random": 1.7,
+    "ent_const": 0.9,
+    "footprint_pen": 0.5,
+    "struct_pen": 0.85,
+    "rt_max_len": 2,
+    "rt_pen_hi": 0.65,
+    "at_jump": 0.16,
+    "at_abs": 0.66,
+    "gc_template": 0.82,
+    "gc_mid": 0.6,
+    "linker_max": 10,
+    "min_anchor_frac": 0.15,
+    "process_undetermined": false
+  },
+  "process": {
+    "min_len": 20,
+    "discard_untrimmed": true,
+    "umi_dedup": false,
+    "umi_dedup_method": "directional",
+    "filter_contaminants": true,
+    "filter_pileups": true,
+    "sort_index_bam": true,
+    "keep_trimmed_fastq": false
+  },
+  "mapping": {
+    "align_ends_type": "EndToEnd",
+    "multimap_nmax": 1,
+    "mismatch_nmax": 3,
+    "mismatch_noverlmax": 0.1,
+    "match_nmin_over_lread": 0.9,
+    "align_intron_max": 0,
+    "extra_args": []
+  },
+  "plots": {
+    "enabled": true,
+    "format": "png",
+    "dpi": 110
+  }
+}
