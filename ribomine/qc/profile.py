@@ -81,6 +81,14 @@ _PANEL_SEQ = dict(ADAPTER_PANEL)
 # the default.
 MIN_PANEL_FRAC = 0.15
 
+# ... unless the adapter is hiding behind a long insert. When the molecule is about
+# as long as the read, only the short-footprint minority sequences far enough to
+# reach the adapter -- but those reads read the construct out perfectly well. An
+# adapter seen in this many reads, sitting at a FIXED distance from the footprint
+# end (`MIN_GAP_CONC`), is a real adapter no matter how small its share.
+MIN_ANCHOR_READS = 300
+MIN_GAP_CONC = 0.30
+
 COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
 # base -> 0..3 for the composition counts; anything else (N) -> 4, counted in the
@@ -360,8 +368,38 @@ def profile_bam(bam: str, fasta: str, *, label: str, max_reads: int = 150_000,
         s = sorted(x for x in panel_starts[name] if x >= 0)
         return s[len(s) // 2] if s else 10 ** 9
 
-    qual = [name for name in panel_hits
-            if panel_hits[name] >= min_panel_frac * n and name not in ("polyA", "polyG")]
+    def gap_concentration(name: str) -> float:
+        """How sharply the adapter sits at a fixed distance from the footprint end.
+
+        A real ligated adapter is separated from the footprint by a construct of
+        FIXED length (a UMI, a barcode, or nothing), so the gap has a sharp mode. A
+        chance 7-mer match to a panel sequence lands anywhere, so its gaps scatter.
+        This is what lets a minority-of-reads adapter be trusted (below).
+        """
+        gaps = Counter(s - r.fp_end for r, s in zip(recs, panel_starts[name])
+                       if s >= 0 and s >= r.fp_end - 2)
+        tot = sum(gaps.values())
+        return max(gaps.values()) / tot if tot else 0.0
+
+    def qualifies(name: str) -> bool:
+        if name in ("polyA", "polyG"):
+            return False
+        hits = panel_hits[name]
+        if hits >= min_panel_frac * n:
+            return True
+        # A MINORITY of reads showing the adapter does not mean there is no adapter.
+        # When the insert is about as long as the read -- 2 nt UMI + ~32 nt footprint
+        # + 10 nt construct in a 46 nt read -- the adapter simply falls off the end of
+        # most reads, and only the short-footprint minority reaches it. Those reads
+        # still read the construct out exactly (the architecture is a per-molecule
+        # property, not a per-read one), and they are what an adapter-anchored profile
+        # needs. Rejecting them forces the caller onto the read's own 3' end, which
+        # SMEARS the construct across positions and fabricates a long "UMI".
+        # So accept a minority adapter on two conditions: enough reads to measure a
+        # construct from, and a gap to the footprint end that is actually fixed.
+        return hits >= MIN_ANCHOR_READS and gap_concentration(name) >= MIN_GAP_CONC
+
+    qual = [name for name in panel_hits if qualifies(name)]
     if qual:
         best_panel = min(qual, key=median_start)
         use_panel = True

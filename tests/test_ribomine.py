@@ -269,3 +269,59 @@ def test_query_does_not_demand_the_accession_list_it_may_produce():
     cfg.validate(need_reference=False, need_inputs=False)      # must not raise
     with pytest.raises(ConfigError, match="accession list not found"):
         cfg.validate(need_reference=False)                     # but `run` still checks
+
+
+# --- the 3' anchor: a hidden adapter must not become a fabricated UMI ---------
+def _t3_profile(t3_match, *, n_anchored=0, frac_anchored=0.0, anchor="none"):
+    """A minimal profile exercising the no-adapter 3' fallback."""
+    import numpy as np
+    plateau = [0.99] * 24
+    return {
+        "label": "x", "n_used": 50_000, "n_anchored": n_anchored,
+        "frac_anchored": frac_anchored, "anchor_kind": anchor, "anchor_offset": 30,
+        "p5_match": plateau, "p5_comp": [[0.25] * 4] * 24,
+        "t3_match": t3_match, "t3_comp": [[0.25] * 4] * len(t3_match),
+        "adap_match": [float("nan")] * 60, "adap_comp": [[float("nan")] * 4] * 60,
+        "footprint_len_hist": {str(L): 100 for L in range(26, 35)},
+        "read_len_hist": {"46": 900}, "top5p_locus_frac": 0.01,
+    }
+
+
+def test_a_flat_3p_tail_is_a_umi():
+    """A genuinely trimmed deposit with a retained UMI: the walked positions sit AT
+    chance for all of them, then jump. That is a step, and it is a real 5-nt UMI."""
+    flat = [0.26, 0.25, 0.26, 0.25, 0.26] + [0.99] * 12      # 5 non-genomic, then plateau
+    call = infer.call_3prime(_t3_profile(flat), 0.99, [], infer.Thresholds())
+    res, deposit = call
+    assert res["umi3_len"] == 5
+    assert deposit == "adapter_trimmed_umi_retained"
+
+
+def test_a_ramping_3p_tail_is_refused_not_read_as_a_long_umi():
+    """SRR11945406: a McGlincy-Ingolia library whose 46-nt reads barely reach the
+    adapter, so the adapter anchor was rejected and the caller fell back to the read's
+    own 3' end. There the construct+adapter SMEAR across positions and the match rate
+    RAMPS instead of stepping. A level-only walk read that ramp as one 11-nt UMI --
+    which was really 5 nt of UMI + a 5-nt barcode + an adapter base. Refuse the ramp."""
+    ramp = [0.27, 0.27, 0.27, 0.26, 0.26, 0.26, 0.28, 0.31, 0.33, 0.39,
+            0.52, 0.72, 0.86, 0.93, 0.96, 0.99]
+    flags: list[str] = []
+    res, deposit = infer.call_3prime(_t3_profile(ramp), 0.99, flags, infer.Thresholds())
+    assert deposit == "unknown", "a ramp must not be read as a fixed-length construct"
+    assert any(f.startswith("3p_tail_ramps_not_steps") for f in flags)
+    assert res["umi3_len"] == "unknown"
+
+
+def test_a_minority_adapter_is_still_an_adapter():
+    """When the insert is as long as the read, only the short-footprint minority
+    reaches the adapter. Enough of those reads (and a construct that sits a FIXED
+    distance from the footprint end) make it a real anchor -- rejecting it is what
+    forced the fallback that fabricated the 11-nt UMI."""
+    from ribomine.qc import profile as prof
+    assert prof.MIN_ANCHOR_READS <= 500
+    # the caller must accept an anchor carried by few reads but many of them
+    thr = infer.Thresholds(min_anchor_frac=0.15)
+    p = _t3_profile([0.99] * 16, n_anchored=742, frac_anchored=0.023, anchor="panel:x")
+    weak = (p["frac_anchored"] < thr.min_anchor_frac
+            and p["n_anchored"] < infer.MIN_ANCHORED_READS)
+    assert not weak, "742 anchored reads is ample evidence, whatever the fraction"

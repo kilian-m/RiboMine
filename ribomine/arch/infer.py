@@ -121,6 +121,12 @@ RT_TERMINAL_PEN_LO = 0.15  # a 5'-terminal RT base (no UMI in front) sits at
                          # intermediate penetrance; below this position 0 is
                          # genomic (a footprint 5'-ligation bias), not an RT base
 MAX_WALK = 26            # positions to walk left of the adapter
+MIN_ANCHORED_READS = 300  # an adapter this well evidenced is real even in a minority
+                          # of reads (a long insert hides it from the rest)
+TAIL_FLAT_MAX = 0.10     # a fixed-length 3' construct is FLAT at chance across all its
+                         # positions; a match rate that ramps is a smear of constructs
+                         # of differing length, not one construct -- refuse to read a
+                         # UMI length off it (see call_3prime)
 MAX_BARCODE = 8          # constant blocks longer than this are linker, not sample barcode
 
 PANEL = {
@@ -514,8 +520,13 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
         flags.append(f"polyA_tail_adapter_not_visible:{htype}")
         return res, "raw"
 
-    if kind == "none" or profile["frac_anchored"] < thr.min_anchor_frac:
-        # no adapter in the deposit: fall back to the read's own 3' end
+    # An anchor backed by enough reads is usable even when those reads are a small
+    # minority: a long insert hides the adapter from most reads, not from all of them,
+    # and the construct is a property of the molecule, not of how far we sequenced.
+    weak = (profile["frac_anchored"] < thr.min_anchor_frac
+            and profile["n_anchored"] < MIN_ANCHORED_READS)
+    if kind == "none" or weak:
+        # no usable adapter: fall back to the read's own 3' end
         t3m = np.asarray(profile["t3_match"], dtype=float)
         t3c = profile["t3_comp"]
         n = 0
@@ -527,6 +538,22 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
             res.update(adapter3_name="none", adapter3_seq="none", umi3_len=0,
                        barcode3_seq="none", layout3_order="none")
             return res, "trimmed"
+
+        # THE BOUNDARY IS A STEP, NOT A LEVEL -- the same rule the 5' side is built on.
+        # A fixed-length 3' construct sits at the chance match rate for ALL of its
+        # positions and then jumps to the genomic plateau: the walked region is FLAT.
+        # What is not flat is a smear: when the deposit still carries an adapter that
+        # was too rare to anchor on, the read's 3' end mixes reads whose construct +
+        # visible-adapter length differs, and the match rate RAMPS up gradually. Walking
+        # that ramp on a level test alone counts every position until the ramp happens
+        # to cross the threshold, and reports the lot as one long UMI -- fabricating,
+        # for one McGlincy-Ingolia library, an "11 nt UMI" that was really 5 nt of UMI
+        # plus a 5 nt barcode plus an adapter base. Refuse the ramp instead.
+        span = float(np.nanmax(t3m[:n]) - np.nanmin(t3m[:n])) if n > 1 else 0.0
+        if span > TAIL_FLAT_MAX:
+            flags.append(f"3p_tail_ramps_not_steps:{span:.2f}")
+            return res, "unknown"
+
         kinds = [classify(entropy(t3c[k]), thr) for k in range(n)]
         if all(k in ("random", "degenerate") for k in kinds):
             if "degenerate" in kinds:
