@@ -384,3 +384,30 @@ def test_losing_most_of_a_library_is_reported(tmp_path):
     st = trim.trim_fastq(_fastq(tmp_path, reads), BC_CALL, str(tmp_path / "o.fq"))
     assert st["frac_no_adapter"] == 0.9
     assert st["frac_kept"] == 0.1
+
+
+def test_polyA_tail_is_trimmed_even_when_an_adapter_is_also_present(tmp_path):
+    """[footprint][poly-A][adapter]: the tail is enzymatically added, variable-length and
+    NOT genomic, and the functional view already says fate=trim. But the adapter branch
+    used to cut only the FIXED construct (here 0 nt), leaving the whole tail on the
+    footprint -- on SRR19641906 that left 99.6% of trimmed reads ending in a run of A's,
+    which end-to-end alignment then has to explain. Both must come off."""
+    call = dict(CALL, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
+                footprint_len_mode=29, functional={"trim_5p": 0, "dedup_umi_len": 0})
+    call["umi5_len"] = 0
+    read = FOOT[:29] + "AAAAAAAAAAAAAA" + ADAP
+    out = str(tmp_path / "o.fastq")
+    trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=20)
+    (_, seq), = _read(out)
+    assert seq == FOOT[:29], "the poly(A) tail must not survive as footprint"
+
+
+def test_polyA_still_trimmed_when_the_adapter_is_beyond_it(tmp_path):
+    """The other poly(A) case -- adapter not visible past the tail -- must keep working."""
+    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
+                adapter3_name="none_visible", adapter3_seq="none_visible",
+                footprint_len_mode=29, functional={"trim_5p": 0, "dedup_umi_len": 0})
+    out = str(tmp_path / "o.fastq")
+    trim.trim_fastq(_fastq(tmp_path, [FOOT[:29] + "AAAAAAAAAAAA"]), call, out, min_len=20)
+    (_, seq), = _read(out)
+    assert seq == FOOT[:29]

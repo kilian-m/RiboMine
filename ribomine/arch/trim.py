@@ -167,6 +167,14 @@ def trim_read(seq: str, qual: str, p: dict) -> tuple[str, str, str, bool | None]
             # comes off the footprint
             umi3 = seq[s - p["umi3"]:s] if p["umi3"] else ""
             e3 = s - p["umi3"] - p["nt3"]
+            # ... and a poly(A) tail sits between the FOOTPRINT and that construct
+            # (insert-first: [footprint][poly-A][nt3][UMI][barcode][adapter]). It is
+            # enzymatically added, variable in length, and NOT genomic, so it has to
+            # come off too. Cutting only the fixed construct leaves the whole tail on
+            # the footprint -- on SRR19641906, 99.6% of trimmed reads still ended in a
+            # run of >= 6 A's, which end-to-end alignment would then have to explain.
+            if p["polyA"] not in _ABSENT:
+                e3 = trim_polyA(seq[:e3])
     elif p["polyA"] not in ("none", "", None) or name == "none_visible":
         e3 = trim_polyA(seq)                   # trim the poly(A) tail (adapter beyond it)
     else:
