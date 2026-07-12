@@ -357,9 +357,15 @@ def load(path: str | None, overrides: dict | None = None) -> Config:
 
 
 def _unknown_keys(user: dict, schema: dict, prefix: str = "") -> list[str]:
-    """Keys in `user` that the schema does not define (typo guard)."""
+    """Keys in `user` that the schema does not define (typo guard).
+
+    Keys starting with `_` are comments and are ignored -- JSON has no comment
+    syntax, and a config you cannot annotate is a config nobody can read.
+    """
     bad = []
     for k, v in (user or {}).items():
+        if k.startswith("_"):
+            continue
         if k not in schema:
             bad.append(f"{prefix}{k}")
         elif isinstance(v, dict) and isinstance(schema[k], dict):
@@ -367,7 +373,44 @@ def _unknown_keys(user: dict, schema: dict, prefix: str = "") -> list[str]:
     return bad
 
 
+# What `null` means, per key. In JSON a null reads as "nothing / switched off", but
+# for every key below it means "work it out for me" -- the opposite. That is not a
+# distinction a reader can make from the file alone, so `write_example` spells it out
+# in the file itself.
+NULL_MEANS = {
+    "reference.contaminant_fasta":
+        "use the HUMAN contaminant reference bundled with RiboMine "
+        "(rRNA/tRNA/snRNA/snoRNA/Mt + 45S pre-rRNA + rDNA repeat). Contaminant "
+        "filtering is ON either way -- set contaminants.enabled=false to turn it off.",
+    "reference.contaminant_index":
+        "build the bowtie2 index from contaminant_fasta into <workdir>/refs/ on first "
+        "use (takes ~1s). Set this only to reuse an index you already have.",
+    "reference.annotation_index":
+        "build the cached GTF index into <workdir>/refs/<gtf-stem>.idx.pkl on first use.",
+    "query.taxon_id": "use reference.taxon_id.",
+    "query.ncbi_api_key": "no key: NCBI Entrez is rate-limited to 3 requests/s instead of 10.",
+    "query.ncbi_email": "not sent to NCBI (optional, they ask for it on heavy use).",
+    "download.tmpdir": "use <workdir>/tmp.",
+    "pipeline.accession_list": "not used (only needed when pipeline.start = 'accessions').",
+    "pipeline.fastq_dir": "not used (only needed when pipeline.start = 'fastq').",
+}
+
+
 def write_example(path: str) -> None:
+    """Write a config with every default -- and with what `null` means, inline.
+
+    The `_null_means` block is a comment: `load()` ignores any key starting with `_`.
+    """
+    doc = {
+        "_README": [
+            "Every key below is RiboMine's own default; delete anything you do not "
+            "want to change. Keys starting with '_' are comments and are ignored.",
+            "An unknown key is an ERROR, not a silent no-op -- a typo'd threshold "
+            "that gets ignored is worse than a crash.",
+        ],
+        "_null_means": NULL_MEANS,
+        **DEFAULTS,
+    }
     with open(path, "w") as fh:
-        json.dump(DEFAULTS, fh, indent=2)
+        json.dump(doc, fh, indent=2)
         fh.write("\n")

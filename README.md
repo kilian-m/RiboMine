@@ -198,10 +198,16 @@ ribomine benchmark SRR618773 -c config.json
 
 ## Configuration
 
-One JSON file describes a run; `ribomine init-config` writes it with every default and
-a comment on each. CLI flags override it. `config.py` *is* the schema — an unknown key
-is an error, not a silent no-op, because a typo'd threshold that gets ignored is worse
-than a crash.
+One JSON file describes a run; `ribomine init-config` writes it with every default.
+CLI flags override it. `config.py` *is* the schema — an unknown key is an error, not a
+silent no-op, because a typo'd threshold that gets ignored is worse than a crash.
+
+**`null` means "work it out for me", not "off".** JSON has no way to say that, so the
+generated config carries a `_null_means` block spelling out each one (keys starting
+with `_` are comments and are ignored). The one that catches people:
+`reference.contaminant_fasta: null` selects the **bundled human reference** — it does
+*not* disable contaminant filtering. To actually disable it, set
+`contaminants.enabled: false`. Either way the run log says which reference it used.
 
 RiboMine is human-first but not human-only: the `reference` block (genome FASTA, GTF,
 STAR index, contaminant index, taxon) is all that ties it to a species.

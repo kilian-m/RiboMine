@@ -200,12 +200,25 @@ def ensure_index(cfg: Config) -> str | None:
     all discovering a missing index and all running bowtie2-build into the same
     prefix is corruption, not a slowdown. `pipeline.run` does this alongside the
     annotation index.
+
+    It also LOGS which reference is in use. `reference.contaminant_fasta: null` means
+    "the bundled human one", but in a JSON file a null reads as "nothing", so the run
+    log has to say which it is -- otherwise the one thing a reader most needs to check
+    (am I filtering against the right organism?) is the one thing they cannot see.
     """
-    if cfg.ref("contaminant_index"):
-        return cfg.ref("contaminant_index")
     if not cfg["contaminants.enabled"]:
+        LOG.warning("contaminants.enabled=false: rRNA/tRNA reads will NOT be removed. "
+                    "Expect inflated multimapping -- each rRNA has hundreds of genomic copies.")
         return None
-    return build_index(resolve_fasta(cfg), cfg)
+    idx = cfg.ref("contaminant_index")
+    if idx:
+        LOG.info("contaminant index: %s (configured)", idx)
+        return idx
+    fasta = resolve_fasta(cfg)
+    bundled = not cfg.ref("contaminant_fasta")
+    LOG.info("contaminant reference: %s%s", fasta,
+             "  (bundled with RiboMine -- human)" if bundled else "  (from reference.contaminant_fasta)")
+    return build_index(fasta, cfg)
 
 
 # --- the two filters --------------------------------------------------------

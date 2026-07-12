@@ -231,3 +231,30 @@ def test_no_option_can_leave_a_bam_unindexed():
     """Every BAM RiboMine leaves on disk is sorted+indexed. There is deliberately no
     config key that turns that off -- an unindexed BAM is one nobody can open."""
     assert "sort_index_bam" not in cfgmod.DEFAULTS["process"]
+
+
+def test_null_means_is_documented_for_every_nullable_key():
+    """In JSON a `null` reads as 'nothing / off'. For these keys it means the
+    opposite -- 'work it out for me'. A reader cannot tell those apart from the file,
+    so every nullable default must carry an explanation in the generated config."""
+    def nullable(d, prefix=""):
+        out = []
+        for k, v in d.items():
+            if isinstance(v, dict):
+                out += nullable(v, f"{prefix}{k}.")
+            elif v is None:
+                out.append(f"{prefix}{k}")
+        return out
+
+    undocumented = [k for k in nullable(cfgmod.DEFAULTS) if k not in cfgmod.NULL_MEANS]
+    assert not undocumented, f"nullable keys with no explanation of what null means: {undocumented}"
+
+
+def test_generated_config_explains_itself_and_still_loads(tmp_path):
+    p = tmp_path / "c.json"
+    cfgmod.write_example(str(p))
+    raw = json.loads(p.read_text())
+    assert "bundled" in raw["_null_means"]["reference.contaminant_fasta"]
+    # the comment keys must not trip the unknown-key guard
+    cfg = cfgmod.load(str(p))
+    assert cfg["qc.periodic_min"] == cfgmod.DEFAULTS["qc"]["periodic_min"]
