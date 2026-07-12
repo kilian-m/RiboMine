@@ -138,7 +138,8 @@ def _dispatch(a: argparse.Namespace) -> int:
 
     if a.cmd == "query":
         from .sra import query
-        cfg.validate(need_reference=False)
+        # the query neither reads the pipeline's start point nor touches the genome
+        cfg.validate(need_reference=False, need_inputs=False)
         path = query.run_query(cfg)
         print(f"\ncandidates -> {path}")
         return 0

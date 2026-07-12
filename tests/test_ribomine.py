@@ -258,3 +258,14 @@ def test_generated_config_explains_itself_and_still_loads(tmp_path):
     # the comment keys must not trip the unknown-key guard
     cfg = cfgmod.load(str(p))
     assert cfg["qc.periodic_min"] == cfgmod.DEFAULTS["qc"]["periodic_min"]
+
+
+def test_query_does_not_demand_the_accession_list_it_may_produce():
+    """`ribomine query` searches the archive; it has no use for pipeline.start's
+    inputs. Validating them would make the query unusable in exactly the workflow it
+    exists for: query the archive, THEN feed the accessions back in."""
+    cfg = cfgmod.load(None, {"pipeline": {"start": "accessions",
+                                          "accession_list": "does/not/exist.txt"}})
+    cfg.validate(need_reference=False, need_inputs=False)      # must not raise
+    with pytest.raises(ConfigError, match="accession list not found"):
+        cfg.validate(need_reference=False)                     # but `run` still checks

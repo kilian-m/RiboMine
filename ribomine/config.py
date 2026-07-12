@@ -287,25 +287,33 @@ class Config:
         return self._abs(self.get(f"reference.{key}"))
 
     # -- validation ---------------------------------------------------------
-    def validate(self, *, need_reference: bool = True) -> None:
+    def validate(self, *, need_reference: bool = True, need_inputs: bool = True) -> None:
+        """Check the config makes sense for what is about to run.
+
+        `need_inputs` is False for sub-commands that do not consume the pipeline's
+        start point -- `ribomine query` searches the archive and has no use for an
+        accession list, so demanding one (which the query is often the thing that
+        produces) would be absurd.
+        """
         start = self.get("pipeline.start")
         end = self.get("pipeline.end")
         if start not in START_POINTS:
             raise ConfigError(f"pipeline.start must be one of {START_POINTS}, got {start!r}")
         if end not in END_POINTS:
             raise ConfigError(f"pipeline.end must be one of {END_POINTS}, got {end!r}")
-        if start == "accessions" and not self.get("pipeline.accession_list"):
-            raise ConfigError("pipeline.start='accessions' needs pipeline.accession_list")
-        if start == "fastq" and not self.get("pipeline.fastq_dir"):
-            raise ConfigError("pipeline.start='fastq' needs pipeline.fastq_dir")
-        if start == "accessions":
-            p = self._abs(self.get("pipeline.accession_list"))
-            if not os.path.isfile(p):
-                raise ConfigError(f"accession list not found: {p}")
-        if start == "fastq":
-            p = self._abs(self.get("pipeline.fastq_dir"))
-            if not os.path.isdir(p):
-                raise ConfigError(f"fastq dir not found: {p}")
+        if need_inputs:
+            if start == "accessions":
+                p = self.get("pipeline.accession_list")
+                if not p:
+                    raise ConfigError("pipeline.start='accessions' needs pipeline.accession_list")
+                if not os.path.isfile(self._abs(p)):
+                    raise ConfigError(f"accession list not found: {self._abs(p)}")
+            if start == "fastq":
+                p = self.get("pipeline.fastq_dir")
+                if not p:
+                    raise ConfigError("pipeline.start='fastq' needs pipeline.fastq_dir")
+                if not os.path.isdir(self._abs(p)):
+                    raise ConfigError(f"fastq dir not found: {self._abs(p)}")
         if not need_reference:
             return
         for key in ("genome_fasta", "gtf", "star_index"):
