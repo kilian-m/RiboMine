@@ -394,11 +394,11 @@ def _plot_3p_adapter(ax, prof: dict, call: dict, plateau) -> None:
         # a barcode (the McGlincy-Ingolia design: 5 nt random, then AGCTA) would
         # otherwise show its barcode shaded as UMI, which is precisely the distinction
         # the figure exists to let you check.
-        x = astart_k - clen - 0.5
+        edge = astart_k - clen - 0.5
         for span, colour in ((umi3, C_UMI), (nt3, C_TS), (bc3len, C_BC)):
             if span:
-                _shade(ax, x, x + span, colour, alpha=0.22)
-                x += span
+                _shade(ax, edge, edge + span, colour, alpha=0.22)
+                edge += span
         ax.axvline(astart_k - clen - 0.5, color=C_FOOT, lw=1.6, zorder=6)
         ax.text(astart_k - clen - 0.4, 0.02, "footprint end", fontsize=6.5,
                 color=C_FOOT, va="bottom", ha="left")
