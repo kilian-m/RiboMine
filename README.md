@@ -42,8 +42,10 @@ ribomine setup -c config.json        # build the annotation + contaminant indexe
 ribomine run -c config.json          # the whole thing
 ```
 
-The **human contaminant reference is bundled** (rRNA / tRNA / snRNA / snoRNA / Mt,
-3,856 sequences), so the only thing you have to supply is the genome, the GTF and a
+The **human contaminant reference is bundled** (3,858 sequences: rRNA / tRNA / snRNA /
+snoRNA / Mt, plus the 45S pre-rRNA and the rDNA repeating unit — those two carry the
+transcribed spacers, which are excised during rRNA maturation and so appear in no
+mature sequence), so the only thing you have to supply is the genome, the GTF and a
 STAR index. That matters more than it sounds: a Ribo-seq library that is *not*
 contaminant-filtered looks like ~78 % multimapping junk, because every rRNA has
 hundreds of genomic copies and so every rRNA read maps to "too many loci". For a

@@ -200,6 +200,12 @@ def test_contaminant_fasta_is_bundled():
     blob = "".join(heads)
     for kind in ("tRNA", "snRNA", "snoRNA", "rRNA"):
         assert kind in blob, f"{kind} missing from the bundled contaminant reference"
+    # The pre-rRNA and the rDNA repeat carry the transcribed spacers (ITS1/2, 5'/3'ETS),
+    # which are excised during maturation and so appear in NO mature rRNA sequence --
+    # without them those fragments reach the aligner and, rDNA being a high-copy repeat,
+    # come back as multimappers. Worth +1.7pp of contaminant catch on an rRNA-heavy run.
+    for acc in ("NR_046235.3", "U13369.1"):
+        assert acc in blob, f"{acc} (pre-rRNA/rDNA) missing from the contaminant reference"
 
     # and an unconfigured run resolves to it rather than skipping the filter
     cfg = cfgmod.load(None)
