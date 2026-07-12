@@ -392,22 +392,25 @@ def test_polyA_tail_is_trimmed_even_when_an_adapter_is_also_present(tmp_path):
     used to cut only the FIXED construct (here 0 nt), leaving the whole tail on the
     footprint -- on SRR19641906 that left 99.6% of trimmed reads ending in a run of A's,
     which end-to-end alignment then has to explain. Both must come off."""
-    call = dict(CALL, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
-                footprint_len_mode=29, functional={"trim_5p": 0, "dedup_umi_len": 0})
-    call["umi5_len"] = 0
-    read = FOOT[:29] + "AAAAAAAAAAAAAA" + ADAP
+    # NB the footprint must not itself end in A: poly(A) trimming cannot tell a genomic
+    # terminal A from the tail, and does not try to (nor does cutadapt).
+    fp = FOOT[:28]
+    assert not fp.endswith("A")
+    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
+                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
     out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=20)
+    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAAAA" + ADAP]), call, out, min_len=20)
     (_, seq), = _read(out)
-    assert seq == FOOT[:29], "the poly(A) tail must not survive as footprint"
+    assert seq == fp, "the poly(A) tail must not survive as footprint"
 
 
 def test_polyA_still_trimmed_when_the_adapter_is_beyond_it(tmp_path):
     """The other poly(A) case -- adapter not visible past the tail -- must keep working."""
+    fp = FOOT[:28]
     call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
                 adapter3_name="none_visible", adapter3_seq="none_visible",
-                footprint_len_mode=29, functional={"trim_5p": 0, "dedup_umi_len": 0})
+                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
     out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [FOOT[:29] + "AAAAAAAAAAAA"]), call, out, min_len=20)
+    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call, out, min_len=20)
     (_, seq), = _read(out)
-    assert seq == FOOT[:29]
+    assert seq == fp
