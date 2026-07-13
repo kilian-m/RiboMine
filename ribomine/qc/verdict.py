@@ -49,6 +49,9 @@ LOG = logging.getLogger("ribomine.qc.verdict")
 # The window the metagene is computed over: a property of the plot/measurement,
 # not a calling threshold, so it is not a config key.
 METAGENE_WIN = (-30, 60)          # nt around the start/stop codon, 5'-end based
+# above this share of reads on the mitochondrion, the library is not a cytosolic
+# ribo-seq with mito contamination -- it is (or is dominated by) mitoribosome profiling
+MITO_DOMINANT = 0.30
 
 
 # --------------------------------------------------------------------------
@@ -93,8 +96,17 @@ def _classify(idx, ncls, chrom: str, pos: int, strand: int):
     strand is the read strand (+1/-1); CDS/UTR require a strand match (ribo-seq
     footprints map sense to the transcript).
     """
-    if chrom in ("MT", "Mt", "chrM", "M"):
-        return "mito", None
+    # The mitochondrion is kept as its OWN region, never folded into CDS: in an ordinary
+    # cytosolic library its reads are mostly degradation background, and pooling them
+    # would dilute the nuclear periodicity that the verdict rests on.
+    #
+    # But it still has 13 protein-coding genes and a reading frame, and MITORIBOSOME
+    # profiling exists -- SRR28710935 ("Monitoring mitochondrial translation") is 60%
+    # mito, and its 4,490 MT-CDS reads are 50% in-frame. Returning frame=None there threw
+    # away the entire experiment and left the verdict to be decided by 1,699 nuclear reads
+    # of contamination. So: report the frame, and let the caller keep it in a separate
+    # pool (it does) rather than pretend the mitochondrion does not translate.
+    mito = chrom in ("MT", "Mt", "chrM", "M")
     cds = ncls["cds"].get(chrom)
     ids = _overlap_ids(cds, pos)
     if ids:
@@ -110,7 +122,9 @@ def _classify(idx, ncls, chrom: str, pos: int, strand: int):
                     frame = (pos - cs - fr) % 3
                 else:
                     frame = (ce - 1 - pos - fr) % 3
-                return "CDS", frame
+                return ("mito" if mito else "CDS"), frame
+    if mito:
+        return "mito", None            # on MT, but not inside one of its 13 CDS
     for cat, tag in (("utr5", "5'UTR"), ("utr3", "3'UTR")):
         c = ncls[cat].get(chrom)
         if _overlap_ids(c, pos):
@@ -184,6 +198,10 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     region_hist: Counter = Counter()
     # per-length frame counts within CDS (5'-end frame)
     frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
+    # the same, for the 13 mitochondrial CDS -- kept SEPARATE so it can never dilute the
+    # nuclear periodicity the verdict is decided on, but measured, because in a
+    # mitoribosome-profiling library this is the experiment
+    mito_frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
     # metagene: 5'-end offset (read - codon, translation dir) -> count
     meta = {"start_codon": Counter(), "stop_codon": Counter()}
     loc_hist: Counter = Counter()
@@ -208,6 +226,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         region_hist[region] += 1
         if region == "CDS" and frame is not None:
             frame_by_len[L][frame] += 1
+        elif region == "mito" and frame is not None:
+            mito_frame_by_len[L][frame] += 1        # a separate pool; decides nothing
 
         for kind in ("start_codon", "stop_codon"):
             arr = codons[kind].get((chrom, strand))
@@ -241,6 +261,22 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             per_len[L] = {"n": tot, "dom_frame": dom, "inframe_frac": c3[dom] / tot}
     periodicity_frac = inframe / cds_reads if cds_reads else 0.0
     tvd = _tvd_uniform(pooled)
+
+    # ---- the same measurement on the 13 mitochondrial CDS. Reported, never used in the
+    # verdict: it is a diagnostic that tells a mitoribosome-profiling library apart from
+    # an ordinary one whose mito reads are degradation background.
+    mito_cds_reads = sum(sum(v) for v in mito_frame_by_len.values())
+    mito_inframe = 0
+    mito_pooled = [0, 0, 0]
+    for L, c3 in mito_frame_by_len.items():
+        if sum(c3) == 0:
+            continue
+        dom = int(np.argmax(c3))
+        mito_inframe += c3[dom]
+        for f in range(3):
+            mito_pooled[(f - dom) % 3] += c3[f]
+    mito_periodicity = mito_inframe / mito_cds_reads if mito_cds_reads else 0.0
+    mito_tvd = _tvd_uniform(mito_pooled)
 
     # ---- region fractions (gene-body = everything except intergenic, for CDS enrichment)
     reg_frac = {k: v / n for k, v in region_hist.items()}
@@ -326,6 +362,14 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         reasons.append(f"periodicity {lvl} (in-frame {periodicity_frac:.0%}, TVD {tvd:.2f})")
     else:
         reasons.append(f"periodicity untested (only {cds_reads} CDS reads)")
+    if reg_frac.get("mito", 0.0) >= MITO_DOMINANT:
+        # Say this out loud. Everything above was measured on the NUCLEAR reads, which in
+        # a mitoribosome library are the minority and arguably the contamination.
+        reasons.append(
+            f"MITOCHONDRIAL-DOMINATED ({reg_frac['mito']:.0%} of reads) -- this looks like "
+            f"mitoribosome profiling. The verdict above was decided on the {cds_reads:,} "
+            f"NUCLEAR CDS reads; the {mito_cds_reads:,} MT-CDS reads are "
+            f"{mito_periodicity:.0%} in-frame (TVD {mito_tvd:.2f}) and are not scored")
     if frac_unique is not None:
         reasons.append(f"unique mapping {'LOW' if low_unique else 'ok'} ({frac_unique:.0%})")
     if contaminant:
@@ -379,6 +423,14 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         "periodicity_inframe_frac": round(periodicity_frac, 3),
         "periodicity_tvd_uniform": round(tvd, 3),
         "n_cds_reads": cds_reads,
+        # mitochondrial translation, measured the same way but pooled separately. In an
+        # ordinary cytosolic library these are a handful of degradation reads and mean
+        # nothing; in a MITORIBOSOME-profiling library they are the entire experiment,
+        # and the nuclear numbers above are then measuring the contamination.
+        "mito_periodicity_inframe_frac": round(mito_periodicity, 3),
+        "mito_periodicity_tvd_uniform": round(mito_tvd, 3),
+        "n_mito_cds_reads": mito_cds_reads,
+        "mito_dominated": bool(reg_frac.get("mito", 0.0) >= MITO_DOMINANT),
         "cds_frac_of_genic": round(cds_of_genic, 3),
         "top5p_locus_frac": round(top5p_locus_frac, 3),
         "region_frac": {k: round(v, 4) for k, v in sorted(reg_frac.items(), key=lambda x: -x[1])},

@@ -414,3 +414,27 @@ def test_polyA_still_trimmed_when_the_adapter_is_beyond_it(tmp_path):
     trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call, out, min_len=20)
     (_, seq), = _read(out)
     assert seq == fp
+
+
+def test_a_polyA_tail_anchors_the_cut_when_the_adapter_is_gone(tmp_path):
+    """A poly(A) tail is SELF-ANCHORING: it sits between the footprint and the adapter,
+    so it marks the footprint's 3' end whether or not the adapter made it into the read.
+    Discarding those reads instead (SRR19641906: 28% retention) threw away exactly the
+    long-footprint reads, which is also what biased the surviving length distribution."""
+    fp = FOOT[:28]
+    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
+                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
+    # the adapter is present but only 2 nt of it -- far too short to anchor on (min 7).
+    # TruSeq begins with an A, so the read does not even END in an A-run.
+    read = fp + "AAAAAAAAAAAA" + ADAP[:2]
+    assert not read.endswith("A")
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=20)
+    assert st["n_reads_out"] == 1, "the tail locates the boundary; the read must survive"
+    (_, seq), = _read(out)
+    assert seq == fp
+
+    # and with NO adapter fragment at all
+    st2 = trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call,
+                          str(tmp_path / "p.fastq"), min_len=20)
+    assert st2["n_reads_out"] == 1

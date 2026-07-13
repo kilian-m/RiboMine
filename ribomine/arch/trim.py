@@ -160,7 +160,29 @@ def trim_read(seq: str, qual: str, p: dict) -> tuple[str, str, str, bool | None]
                 s = a - bc3len
         adapter_found = s >= 0
         if s < 0:
+            # The scaffold ran off the end of the read -- but a poly(A) TAIL is
+            # SELF-ANCHORING. It sits between the footprint and the construct, so it
+            # marks the footprint's 3' end whether or not the adapter is visible: the
+            # read simply ends inside the tail. Using it rescues exactly the reads a
+            # long footprint pushed the adapter off (SRR19641906: 38% -> ~100%
+            # retention), and removes the length bias that discarding them created.
+            # It only works when nothing FIXED sits between tail and adapter, though --
+            # a 3' UMI or barcode beyond the tail was never sequenced in these reads,
+            # so their boundary genuinely cannot be placed.
             e3 = len(seq)                      # scaffold not in this read: keep to end
+            if p["polyA"] not in _ABSENT and not p["umi3"] and not bc3len:
+                # Peel any adapter fragment too short to have anchored on (1..min_overlap-1
+                # nt), because it sits BETWEEN the tail and the read end and would
+                # otherwise hide it -- TruSeq begins with an A, so a read ending
+                # "...AAAAAAAG" has no trailing A-run at all. Only then read the tail.
+                end = len(seq)
+                adap = p["adapter_seq"]
+                for k in range(min(p["min_overlap"] - 1, len(adap)), 0, -1):
+                    if seq.endswith(adap[:k]):
+                        end = len(seq) - k
+                        break
+                e3 = trim_polyA(seq[:end])
+                adapter_found = e3 < end       # boundary located iff a tail was there
         else:
             # the scaffold starts at the barcode; the UMI (and any degenerate
             # non-templated block) sit between the footprint and it, and all of it

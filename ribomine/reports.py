@@ -39,6 +39,7 @@ QC_COLUMNS = [
     "n_reads_sampled", "n_reads_scored", "total_run_reads", "projected_usable_reads",
     "read_len_mode", "read_len_peak_frac", "periodicity_inframe", "periodicity_tvd",
     "cds_frac_of_genic", "start_codon_ratio", "top5p_locus_frac",
+    "mito_dominated", "mito_periodicity_inframe", "n_mito_cds_reads",
     "frac_rRNA_tRNA_etc", "frac_low_complexity", "frac_position_pileup",
     "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped",
     "region_CDS", "region_5UTR", "region_3UTR", "region_ncRNA", "region_intron",
@@ -224,6 +225,11 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
         "cds_frac_of_genic": qc.get("cds_frac_of_genic"),
         "start_codon_ratio": qc.get("start_codon_ratio"),
         "top5p_locus_frac": qc.get("top5p_locus_frac"),
+        # a mitoribosome-profiling library: the numbers above were measured on its
+        # NUCLEAR reads, which are the minority. These say what its mito reads do.
+        "mito_dominated": qc.get("mito_dominated"),
+        "mito_periodicity_inframe": qc.get("mito_periodicity_inframe_frac"),
+        "n_mito_cds_reads": qc.get("n_mito_cds_reads"),
         "frac_rRNA_tRNA_etc": _some(cm.get("frac_rRNA_tRNA_etc"),
                                     contam.get("frac_contaminant_structured_rna")),
         "frac_low_complexity": _some(cm.get("frac_low_complexity"),
