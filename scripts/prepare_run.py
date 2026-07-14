@@ -84,8 +84,17 @@ def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
         with open(src) as fh:
             accs = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
         print(f"accessions: {len(accs)} from {src}  (pipeline.start={start})")
-        # no ENA metadata for a bare list, so every run packs at the same weight
-        return accs, {}
+        # A bare list carries no sizes -- but if a query has ever run in this workdir,
+        # its candidates.tsv did, and the runs are the same runs. Without this the
+        # packing weighs a 6 GB run the same as a 0.2 GB one, which is exactly the
+        # imbalance the packing exists to prevent. It matters most in the case people
+        # will actually hit: screening with end="qc", then feeding the survivors back
+        # in as a list.
+        w = _weights_from_candidates(cfg, accs)
+        if w:
+            print(f"            {len(w)}/{len(accs)} weighted by read_count from "
+                  f"meta/candidates.tsv")
+        return accs, w
 
     tsv = os.path.join(cfg.dir("meta"), "candidates.tsv")
     if not (os.path.exists(tsv) and os.path.getsize(tsv) > 0):
@@ -107,6 +116,28 @@ def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
     print(f"accessions: {len(accs)} from {tsv} "
           f"({len(weights)} with a read count)")
     return accs, weights
+
+
+def _weights_from_candidates(cfg, accs: list[str]) -> dict[str, int]:
+    """read_count for the runs in `accs`, from a candidates.tsv left by an earlier
+    query in this workdir. Empty dict if there is none -- the packing then falls back
+    to one-run-one-weight, which is the old behaviour and not wrong, only blunter."""
+    tsv = os.path.join(cfg.workdir, "meta", "candidates.tsv")
+    if not (os.path.exists(tsv) and os.path.getsize(tsv) > 0):
+        return {}
+    want = set(accs)
+    out: dict[str, int] = {}
+    try:
+        for r in read_tsv(tsv):
+            a = r.get("run_accession")
+            if a in want:
+                try:
+                    out[a] = int(r["read_count"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+    except OSError:
+        return {}
+    return out
 
 
 def pack(accs: list[str], weights: dict[str, int], n: int,

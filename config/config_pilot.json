@@ -1,0 +1,85 @@
+{
+  "_README": [
+    "The pilot: the whole SLURM chain, end to end, on 18 runs and ~37 GB.",
+    "",
+    "    slurm/master.sh config/config_pilot.json",
+    "",
+    "It is the same chain, the same code and the same per-node settings as the real",
+    "run (config_lrz.json) -- only narrower: 1 job x 2 nodes instead of 2 x 4. So a",
+    "green pilot means the 896-core submit is a scale-up, not a leap. Run it, and read",
+    "logs/status.txt: it should say COMPLETE, with BAMs in merged/bams/ and a real",
+    "matrix in merged/counts/gene_counts.tsv.",
+    "",
+    "WHAT TO ACTUALLY MEASURE -- the pilot exists for this one number:",
+    "  awk -F'\\t' 'NR>1 {print $1, $NF}' merged/mapping_summary.tsv   # and the mb_per_s column",
+    "The download rate per run, times the 224 runs the real job holds in flight, is",
+    "what says whether the full cohort is bandwidth-bound. It is also the number to",
+    "lower `download.connections` on if ENA starts refusing."
+  ],
+
+  "_pilot_set": [
+    "config/pilot_runs.txt -- chosen from the 9,266-run candidates.tsv, not at random:",
+    "  * 16 STRONG-tier runs, one per STUDY. 18 runs from 18 labs exercise 18 library",
+    "    protocols; 18 runs from one study would exercise the same one 18 times, and",
+    "    reading the library architecture out of the reads is the thing most likely to",
+    "    break on a protocol nobody anticipated.",
+    "  * stratified 0.22 GB -> 6.34 GB, so the download rate is measured across the",
+    "    size distribution rather than at one end of it.",
+    "  * 2 WEAK-tier runs (SRR10142815, SRR4000640), which are there to be REJECTED.",
+    "    They test the half of the pipeline a happy path never reaches: the QC gate",
+    "    dropping a run, and merge counting it as 'dropped by QC' -- finished -- rather",
+    "    than as 'still to do', which would make status.txt ask for a resubmit forever.",
+    "Expect roughly 16 BAMs and 2 rejections. Rather fewer BAMs is a finding, not a bug:",
+    "strong-tier means the metadata says ribo-seq, and QC is the thing that does not",
+    "believe the metadata."
+  ],
+
+  "_slurm": {
+    "_": "1 job x 2 nodes = 224 cores. 2 is the FEWEST cm4_std takes -- there is no 1-node cm4_std job.",
+    "job_prefix": "rmpilot-",
+    "conda_env": "ribomine",
+    "mail_user": "",
+
+    "jobs": 1,
+    "nodes_per_job": 2,
+    "cpus_per_node": 112,
+    "mem_per_node": "480G",
+    "time": "04:00:00",
+
+    "prep_cpus": 28,
+    "prep_time": "01:00:00",
+    "merge_cpus": 28,
+    "merge_time": "01:00:00"
+  },
+
+  "project": {
+    "name": "ribomine-pilot",
+    "workdir": "/path/to/data_dir/ribomine/pilot_slurm",
+    "_": "jobs/threads are the REAL run's, deliberately -- a pilot that tests different settings tests nothing. 9 runs land on each node, so only 9 of the 28 slots are ever busy.",
+    "jobs": 28,
+    "threads": 8
+  },
+
+  "pipeline": {
+    "_": "start=accessions, so prep splits the list below instead of querying the archive. end=bam: go all the way, on 18 runs.",
+    "start": "accessions",
+    "accession_list": "pilot_runs.txt",
+    "end": "bam"
+  },
+
+  "reference": {
+    "species": "Homo sapiens",
+    "taxon_id": 9606,
+    "genome_fasta": "/path/to/index_files/homo_sapiens.90.fasta",
+    "gtf": "/path/to/index_files/homo_sapiens.90.gtf",
+    "star_index": "/path/to/price2-expansive/resources/indexes/STAR-index"
+  },
+
+  "download": {
+    "connections": 4
+  },
+
+  "keep": {
+    "bam": true
+  }
+}
