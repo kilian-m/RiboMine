@@ -375,7 +375,7 @@ def route_aws_odp(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
         raise RouteUnavailable(f"{acc}: not on the S3 Open Data mirror")
 
     fq = _fasterq(sra, acc, cfg, log)
-    if not cfg["download.keep_sra"]:
+    if not cfg["keep.sra"]:
         rm(sra)
     _finalise(fq, out_gz, threads=cfg["project.threads"])
     return {"url": url}
@@ -393,7 +393,7 @@ def route_prefetch(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
     if not nonempty(sra):
         raise RouteUnavailable(f"{acc}: prefetch produced no .sra")
     fq = _fasterq(sra, acc, cfg, log)
-    if not cfg["download.keep_sra"]:
+    if not cfg["keep.sra"]:
         rm(sra, os.path.join(d, acc))
     _finalise(fq, out_gz, threads=cfg["project.threads"])
     return {"url": f"sra:{acc}"}

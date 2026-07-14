@@ -709,3 +709,34 @@ def test_every_mapping_summary_column_is_actually_produced(tmp_path):
     # mean_len_after_trim, which still has the contaminants in it
     assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
     assert row["mean_mapped_len"] == 29.4
+
+
+# --- what a run leaves behind ------------------------------------------------
+def test_by_default_only_the_bam_survives():
+    """Mining the SRA means hundreds of 1-10 GB runs. Everything except the deliverable
+    BAM is an intermediate the pipeline can rebuild from the accession -- including the
+    QC/architecture working data, whose every result is already in the JSONs and TSVs."""
+    cfg = cfgmod.load(None)
+    keep = cfg["keep"]
+    assert keep["bam"] is True
+    assert [k for k, v in keep.items() if v] == ["bam"], f"kept by default: {keep}"
+
+
+def test_resume_does_not_re_download_a_run_whose_bam_was_deleted_on_purpose(tmp_path):
+    """With keep.bam off the BAM is *supposed* to be gone, so its absence cannot be the
+    test for "needs re-processing" -- that would re-download and re-map the whole cohort
+    on every resume."""
+    from ribomine.pipeline import is_processed
+    from ribomine.utils import Sample, write_json
+
+    s = Sample("SRR1", str(tmp_path))
+    kept = cfgmod.load(None, {"project": {"workdir": str(tmp_path)}})
+    dropped = cfgmod.load(None, {"project": {"workdir": str(tmp_path)},
+                                 "keep": {"bam": False}})
+
+    assert not is_processed(dropped, s), "nothing has run yet"
+    write_json(s.process_json, {"run_accession": "SRR1", "bam_bytes": 123})
+
+    assert is_processed(dropped, s), "a finished sample with no BAM is still done"
+    assert not is_processed(kept, s), "but a BAM that was meant to be kept and is not there is a re-run"
+

@@ -144,6 +144,28 @@ sample of the *untrimmed* reads. QC says whether the library is Ribo-seq; this s
 whether what came out of the pipeline still is. When the two disagree, the trim is the
 first suspect — and there is nowhere else that would show it.
 
+## What is kept
+
+Mining the SRA means hundreds of runs at 1–10 GB each, so **by default only the BAMs
+survive** (`keep` in the config):
+
+| | kept | |
+|---|---|---|
+| `keep.bam` | **yes** | the deliverable: trimmed, filtered, mapped reads |
+| `keep.fastq` | no | the raw run FASTQ, as downloaded |
+| `keep.trimmed_fastq` | no | after the architecture-driven trim |
+| `keep.clean_fastq` | no | after contaminant removal — the reads that were mapped |
+| `keep.qc_fastq` / `keep.qc_bam` | no | the QC/architecture working data: the 200k-read sample and its two local alignments |
+| `keep.sra` | no | the `.sra` container (only the SRA fallback routes make one) |
+
+Nothing that is deleted is needed to *read* the results: every number and every call is
+already in the JSONs, the TSVs and the plots, and those are always kept. Turning
+`keep.qc_bam` on gets you back the BAM a verdict was computed on, for when a call looks
+wrong and you want to open it in a browser. `keep.bam: false` is legitimate too — the
+count matrix and the periodicity are measured before the BAM goes, so a counts-only run
+is a real thing to want, and resume knows the difference between a BAM that was deleted
+on purpose and one that was never made.
+
 ## How it works
 
 ### Is it Ribo-seq? (`qc`)

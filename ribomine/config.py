@@ -104,9 +104,28 @@ DEFAULTS: dict[str, Any] = {
         "max_retries": 4,
         "retry_backoff_s": 5,
         "tmpdir": None,          # null => <workdir>/tmp
-        # delete the full FASTQ once the BAM exists (a ribo-seq run is 1-10 GB)
-        "keep_fastq": False,
-        "keep_sra": False,
+    },
+
+    # --- what survives the run ---------------------------------------------
+    # Mining the SRA means hundreds of runs at 1-10 GB each, so the default is to
+    # keep ONLY the deliverable BAM. Everything else here is an intermediate that
+    # the pipeline can regenerate from the accession, and nothing that is deleted
+    # is ever needed to READ the results: the JSONs, the TSVs and the plots -- the
+    # full record of every number and every call -- are always kept.
+    "keep": {
+        "bam": True,             # the deliverable: trimmed, filtered, mapped reads
+        "fastq": False,          # the raw run FASTQ, as downloaded
+        "trimmed_fastq": False,  # after the architecture-driven trim
+        "clean_fastq": False,    # after contaminant removal -- the reads that were mapped
+        "sra": False,            # the .sra container (only the SRA fallback routes make one)
+        # The QC / architecture stage's own working data: the 200k-read sample, the
+        # contaminant-filtered sample, and their two local alignments. They are the
+        # EVIDENCE for the verdict and the read-architecture call, so keeping them
+        # lets you re-examine a call in a browser -- but the call itself, and every
+        # number behind it, is already written to qc.json / profile.json / arch.json
+        # and to the two TSVs, which is why they go by default.
+        "qc_fastq": False,
+        "qc_bam": False,
     },
 
     # --- stage 2: read sample + QC -----------------------------------------
@@ -200,12 +219,12 @@ DEFAULTS: dict[str, Any] = {
         "umi_dedup_mem_gb": 8,       # JVM heap for umicollapse; ignored by umi_tools
         "filter_contaminants": True, # bowtie2 rRNA/tRNA removal before mapping
         "filter_pileups": True,      # data-driven pile-up removal after mapping
-        "keep_trimmed_fastq": False,
         # Every BAM RiboMine leaves on disk is coordinate-sorted and indexed -- the
         # deliverable ones and the QC-stage ones alike -- so any of them can be opened
         # in a genome browser without a further step. This is not optional: an
         # unindexed BAM is a BAM nobody can look at, and UMI deduplication requires a
         # sorted, indexed input anyway.
+        # What is KEPT on disk afterwards is the `keep` block's business, not this one.
     },
 
     "mapping": {

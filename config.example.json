@@ -78,9 +78,16 @@
     "connections": 8,
     "max_retries": 4,
     "retry_backoff_s": 5,
-    "tmpdir": null,
-    "keep_fastq": false,
-    "keep_sra": false
+    "tmpdir": null
+  },
+  "keep": {
+    "bam": true,
+    "fastq": false,
+    "trimmed_fastq": false,
+    "clean_fastq": false,
+    "sra": false,
+    "qc_fastq": false,
+    "qc_bam": false
   },
   "qc": {
     "sample_reads": 200000,
@@ -142,8 +149,7 @@
     "umi_dedup_method": "directional",
     "umi_dedup_mem_gb": 8,
     "filter_contaminants": true,
-    "filter_pileups": true,
-    "keep_trimmed_fastq": false
+    "filter_pileups": true
   },
   "mapping": {
     "align_ends_type": "EndToEnd",

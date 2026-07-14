@@ -173,13 +173,21 @@ def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
     if cfg["plots.enabled"]:
         qc_plot.plot_qc(q, s.qc_plot(cfg["plots.format"]), dpi=cfg["plots.dpi"])
 
-    # 7. leave the QC alignments coordinate-sorted and indexed. STAR writes them
-    #    unsorted, and the steps above read them in file order, so this happens last
-    #    -- but it does happen: the BAM the verdict and the architecture were computed
-    #    on is exactly the one you want to open in a browser when a call looks wrong.
-    for b in (s.local_bam, s.pileup_bam):
-        if nonempty(b):
-            star.ensure_sorted_indexed(b, threads=min(threads, 8))
+    # 7. the working data behind the verdict and the architecture call. Every number
+    #    they produced is already in qc.json / profile.json (and the architecture
+    #    stage reads ONLY the profile), so by default the reads and their alignments
+    #    go -- at several hundred runs they are the bulk of the workdir. Kept, they
+    #    are sorted and indexed: the BAM a call was computed on is the one to open in
+    #    a browser when the call looks wrong. STAR writes them unsorted, and the steps
+    #    above read them in file order, so that has to happen here, at the end.
+    if cfg["keep.qc_bam"]:
+        for b in (s.local_bam, s.pileup_bam):
+            if nonempty(b):
+                star.ensure_sorted_indexed(b, threads=min(threads, 8))
+    else:
+        rm(s.local_bam, s.local_bam + ".bai", s.pileup_bam, s.pileup_bam + ".bai")
+    if not cfg["keep.qc_fastq"]:
+        rm(s.sample_fastq, s.filtered_fastq)
 
     LOG.info("[%s] %s  (in-frame %.0f%%, CDS %.0f%% of genic, %.0fs)", acc, q["verdict"],
              100 * q["periodicity_inframe_frac"], 100 * q["cds_frac_of_genic"],
@@ -225,12 +233,24 @@ def arch_sample(acc: str, cfg: Config) -> dict:
 # ---------------------------------------------------------------------------
 # stage 4: full download -> trim -> filter -> map (-> dedup)
 # ---------------------------------------------------------------------------
+def is_processed(cfg: Config, s: Sample) -> bool:
+    """Has stage 4 already finished for this sample? (What `resume` skips.)
+
+    What "finished" looks like on disk depends on what the config KEEPS. With
+    `keep.bam` off the deliverable is deleted on purpose, so its absence is not
+    evidence that the sample needs re-processing -- the process JSON is. Testing for
+    the BAM would silently re-download and re-map an entire cohort on every resume of
+    a counts-only run.
+    """
+    return nonempty(s.process_json) and (nonempty(s.bam) or not cfg["keep.bam"])
+
+
 def process_sample(acc: str, cfg: Config, src: str) -> dict:
     s = Sample(acc, cfg.workdir)
     resume = cfg["pipeline.resume"]
     threads = cfg["project.threads"]
 
-    if resume and nonempty(s.bam) and nonempty(s.process_json):
+    if resume and is_processed(cfg, s):
         LOG.info("[%s] bam: cached", acc)
         return read_json(s.process_json)
 
@@ -342,13 +362,23 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
 
     info["bam"] = s.bam
     info["bam_bytes"] = os.path.getsize(s.bam)
+    info["keep"] = {k: bool(cfg[f"keep.{k}"])
+                    for k in ("bam", "fastq", "trimmed_fastq", "clean_fastq")}
     write_json(s.process_json, info)
 
-    # 8. housekeeping: a ribo-seq run is 1-10 GB and we keep hundreds of them
-    if not cfg["download.keep_fastq"] and not os.path.exists(src):
-        rm(s.full_fastq)
-    if not cfg["process.keep_trimmed_fastq"]:
-        rm(s.trimmed_fastq, s.clean_fastq)
+    # 9. housekeeping. A ribo-seq run is 1-10 GB and a mining run holds hundreds of
+    #    them, so nothing is kept unless `keep` says so. This is the LAST thing the
+    #    stage does: every number above was measured before its input was deleted.
+    if not cfg["keep.fastq"] and not os.path.exists(src):
+        rm(s.full_fastq)                       # never the user's own input FASTQ
+    if not cfg["keep.trimmed_fastq"]:
+        rm(s.trimmed_fastq)
+    if not cfg["keep.clean_fastq"]:
+        rm(s.clean_fastq)
+    if not cfg["keep.bam"]:
+        # the counts and the periodicity are already measured and written; the gene
+        # count table STAR wrote stays, so the matrix can still be built
+        rm(s.bam, s.bam + ".bai")
 
     LOG.info("[%s] BAM %s (%.0f%% uniquely mapped)", acc, human(info["bam_bytes"]),
              100 * (info.get("mapping", {}).get("frac_unique") or 0))
