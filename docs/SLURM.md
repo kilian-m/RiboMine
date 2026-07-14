@@ -65,7 +65,13 @@ an allocation**. A login node proves nothing: login nodes have internet whether 
 compute nodes do or not, and the compute nodes are the ones that download.
 
 ```bash
-salloc -M cm4 -p cm4_inter -N 1 -t 00:10:00       # <- the point. Not a login node.
+# -M inter, NOT -M cm4: the interactive partitions live on the `inter` cluster even
+# though cm4_inter runs on CoolMUC-4 hardware. And an allocation, not a login node --
+# that is the whole point of the check.
+salloc -M inter -p cm4_inter -N 1 -t 00:10:00
+# "Job prolog failed" is a broken node, not your command: the allocation itself
+# succeeded. Just retry -- SLURM usually lands you elsewhere. If the same node keeps
+# coming back, --exclude=<nodename> it.
 
 curl -s -o /dev/null -w 'ENA    %{http_code}\n' \
   "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=SRR12285169&result=read_run&fields=fastq_ftp"
