@@ -185,6 +185,39 @@ in an `salloc` — LRZ's default is ~2.1 GiB per core, and STAR needs 30 GB:
 salloc -M inter -p cm4_inter -N 1 --cpus-per-task=112 --mem=300G -t 04:00:00
 ```
 
+### The stuck segment
+
+A STAR killed **part-way through** loading the genome — an OOM kill, a wall-time
+SIGKILL — leaves its shared segment flagged *load in progress*, with nobody loading
+it. Every STAR afterwards then waits on that flag **forever**:
+
+```
+Another job is still loading the genome, sleeping for 1 min
+Another job is still loading the genome, sleeping for 1 min
+...
+```
+
+This is the failure mode to fear, because it does not fail. It *hangs* — and a hang
+burns the whole 24 h wall clock, on every node, in silence, and produces nothing,
+whereas a crash costs one round and tells you why. `--genomeLoad Remove` does not
+reliably clear it.
+
+`node_worker.sh` handles it in three ways, and they are all there on purpose:
+
+1. it `ipcrm`s stale segments before loading — anything over 1 GiB owned by this user,
+   which takes out a genome and spares everything small (and cm4_std nodes are
+   exclusive, so there is no other job of ours to hurt);
+2. it wraps the load in `timeout 900`, so a stuck segment produces an **error** rather
+   than a wait — without a clock there is no failure to detect;
+3. on that timeout it purges and retries exactly once, then gives up loudly.
+
+By hand, **on the affected node** (shared memory is node-local):
+
+```bash
+ipcs -m                 # the ~30 GB segment owned by you
+ipcrm -m <shmid>
+```
+
 **Per-node workdirs (`shards/work_NN/`), merged afterwards.** `ribomine run` writes
 its cohort tables (`qc_summary.tsv`, `failed.tsv`, …) at fixed paths under its
 workdir, so eight nodes sharing one workdir would each overwrite the other seven.

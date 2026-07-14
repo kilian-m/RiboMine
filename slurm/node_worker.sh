@@ -78,10 +78,43 @@ print(json.load(open(sys.argv[1])).get("reference", {}).get("star_index", ""))
 PY
 )
 
+# A STAR killed part-way through loading the genome leaves its shared segment flagged
+# "load in progress" with nobody loading it, and every later STAR then waits on that
+# flag FOREVER -- "Another job is still loading the genome, sleeping for 1 min", over
+# and over. `--genomeLoad Remove` does not reliably clear that state, so the segment
+# has to be taken out with ipcrm. Which is worth doing carefully, because a hang is
+# strictly worse than a crash here: a crash loses one shard and says so, while a hang
+# burns the whole 24 h wall clock in silence and produces nothing.
+#
+# The >1 GiB filter is what keeps this from being a blunt instrument: it removes the
+# genome segments and leaves anything small alone. Only this user's segments are even
+# visible to ipcrm, and cm4_std allocates nodes exclusively, so there is no other job
+# of ours here to take down with it.
+star_shm_purge() {
+    local id
+    for id in $(ipcs -m 2>/dev/null \
+                | awk -v u="${USER}" '$3 == u && $5 + 0 > 1073741824 {print $2}'); do
+        echo "[node ${HOST}] ipcrm stale shared-memory segment ${id} (a killed STAR left it behind)"
+        ipcrm -m "${id}" 2>/dev/null || true
+    done
+}
+
 star_genome_remove() {
     [[ -n "${STAR_INDEX}" ]] || return 0
     STAR --genomeLoad Remove --genomeDir "${STAR_INDEX}" \
          --outFileNamePrefix "${TMPDIR}/_star_remove." >/dev/null 2>&1 || true
+    star_shm_purge
+}
+
+# `timeout`, not patience: a stuck segment makes LoadAndExit wait forever rather than
+# fail, so without a clock the node hangs instead of erroring. 15 min is many times
+# what a real load takes (~2-5 min from a warm page cache) and a fraction of the wall.
+STAR_LOAD_TIMEOUT="${STAR_LOAD_TIMEOUT:-900}"
+
+star_genome_load() {
+    timeout "${STAR_LOAD_TIMEOUT}" \
+        STAR --genomeLoad LoadAndExit --genomeDir "${STAR_INDEX}" \
+             --outFileNamePrefix "${TMPDIR}/_star_load." >/dev/null 2>&1
 }
 
 cleanup() {
@@ -110,13 +143,28 @@ star_genome_remove
 # skips its own load and its own fallback entirely.
 if [[ -n "${STAR_INDEX}" ]]; then
     echo "[node ${HOST}] loading the STAR genome into shared memory (~30 GB, once for this node)"
-    if STAR --genomeLoad LoadAndExit --genomeDir "${STAR_INDEX}" \
-            --outFileNamePrefix "${TMPDIR}/_star_load." >/dev/null 2>&1; then
+    rc=0
+    star_genome_load || rc=$?
+
+    # 124 is `timeout`'s: the load did not fail, it HUNG -- which is the signature of a
+    # segment left mid-load by a killed STAR. The purge above should have caught it, so
+    # this is the belt to that braces (a segment created between the purge and now, or
+    # one that Remove revived). Purge again and take exactly one more run at it: a
+    # second hang is a real problem and must not be slept through.
+    if (( rc == 124 )); then
+        echo "[node ${HOST}] the genome load HUNG for ${STAR_LOAD_TIMEOUT}s -- a killed STAR" >&2
+        echo "[node ${HOST}] left its segment flagged 'loading'. Purging it and retrying once." >&2
+        star_genome_remove
+        rc=0
+        star_genome_load || rc=$?
+    fi
+
+    if (( rc == 0 )); then
         export RIBOMINE_STAR_GENOME_LOAD=LoadAndKeep
         echo "[node ${HOST}] STAR shared genome loaded"
     else
         cat >&2 <<EOF
-[node ${HOST}] FATAL: the STAR genome would not load into shared memory.
+[node ${HOST}] FATAL: the STAR genome would not load into shared memory (exit ${rc}).
 
   index : ${STAR_INDEX}
   needs : ~30 GB resident (the SA file alone is ~25 GB)
@@ -126,8 +174,10 @@ for ${RM_JOBS} separate copies of the index, and it would be OOM-killed on the s
 Refusing outright loses the same shard, and says why.
 
 Usual causes, in order:
-  * the job did not ask for enough memory   -> #SBATCH --mem in slurm/run.sh
-  * a leaked segment from a hard-killed job -> STAR --genomeLoad Remove --genomeDir <index>
+  * the job did not ask for enough memory        -> #SBATCH --mem in slurm/run.sh
+  * (exit 124 = it hung, twice) a shared segment stuck mid-load. By hand, ON THIS NODE:
+        ipcs -m                 # the ~30 GB one owned by ${USER}
+        ipcrm -m <shmid>
   * SHMALL/SHMMAX too small for a 30 GB segment (ask LRZ)
 EOF
         exit 1
