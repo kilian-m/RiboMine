@@ -232,7 +232,16 @@ def _plot_verdict(ax, qc: dict) -> None:
     if qc.get("verdict_reason"):
         lines += _wrap("reason: " + qc["verdict_reason"])
         lines.append("")
-    lines += [f"• {r}" for r in qc.get("reasons", [])]
+    # Wrap the bullets too. A reason is not always one short clause: the
+    # MITOCHONDRIAL-DOMINATED one runs to 211 characters where the rest sit under 52,
+    # and an unwrapped line does not overflow its panel -- it widens the whole FIGURE
+    # (savefig crops to the artists' bounding box), which squeezes the six panels into
+    # the left third and collides their titles. One long sentence, and the entire plot
+    # is unreadable, so this is a layout invariant and not a nicety.
+    for r in qc.get("reasons", []):
+        wrapped = _wrap(r, width=56)
+        lines.append(f"• {wrapped[0]}")
+        lines += [f"  {w}" for w in wrapped[1:]]      # continuation lines, hanging indent
 
     cm = qc.get("contaminants") or {}
     if cm.get("n_sampled"):

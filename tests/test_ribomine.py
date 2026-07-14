@@ -1002,3 +1002,52 @@ def test_a_transfer_that_dies_MID_stream_is_not_kept_as_a_short_sample(tmp_path,
                                seed=1, backoff_s=0)
     assert len(opened) == 2, "the truncated draw must be thrown away, not sampled from"
     assert st["n_sampled"] == 10
+
+
+# --- the QC figure -----------------------------------------------------------
+def _qc_dict(reason: str) -> dict:
+    """The smallest QC record plot_qc will draw."""
+    return {
+        "label": "SRRX", "verdict": "RIBO-SEQ", "is_riboseq": True, "verdict_reason": "",
+        "reasons": ["footprint length ok (mode 29 nt)", reason],
+        "n_reads_scored": 1000, "read_len_mode": 29, "read_len_peak_frac": 0.8,
+        "periodicity_inframe_frac": 0.6, "periodicity_tvd_uniform": 0.4,
+        "cds_frac_of_genic": 0.8, "start_codon_ratio": 5.0, "top5p_locus_frac": 0.01,
+        "n_cds_reads": 500, "read_len_hist": {28: 300, 29: 500, 30: 200},
+        "frame_by_len": {29: 0.6}, "frame_by_len_n": {29: 500},
+        "region_frac": {"CDS": 0.8, "intron": 0.1, "intergenic": 0.1},
+        "metagene_start": {-12: 100, 0: 50}, "metagene_stop": {-24: 40},
+        "pooled_frame_counts": [300, 100, 100],
+        "mapping": {"n_input": 1000, "frac_unique": 0.6, "frac_multimapping": 0.3,
+                    "frac_unmapped": 0.1},
+        "thresholds": {"footprint_len_lo": 25, "footprint_len_hi": 36,
+                       "periodic_min": 0.4, "periodic_strong": 0.5},
+    }
+
+
+def test_a_long_reason_wraps_instead_of_stretching_the_whole_figure(tmp_path):
+    """A reason is not always a short clause: the MITOCHONDRIAL-DOMINATED one runs to 211
+    characters where every other sits under 52. An unwrapped line does not overflow its
+    panel -- savefig crops to the artists' bounding box, so it widens the FIGURE, which
+    squeezes the six panels into the left third and collides their titles. One sentence
+    made SRR28710934's plot unreadable."""
+    from PIL import Image
+
+    from ribomine.qc import plot
+
+    long_reason = (
+        "MITOCHONDRIAL-DOMINATED (42% of reads) -- this looks like mitoribosome profiling. "
+        "The verdict above was decided on the 1,338 NUCLEAR CDS reads; the 586 MT-CDS reads "
+        "are 54% in-frame (TVD 0.21) and are not scored")
+    assert len(long_reason) > 200
+
+    a = str(tmp_path / "short.png")
+    b = str(tmp_path / "long.png")
+    plot.plot_qc(_qc_dict("unique mapping ok (18%)"), a, dpi=110)
+    plot.plot_qc(_qc_dict(long_reason), b, dpi=110)
+
+    wa = Image.open(a).size[0]
+    wb = Image.open(b).size[0]
+    assert wb <= wa + 20, (
+        f"a long reason widened the figure from {wa}px to {wb}px -- it must wrap, "
+        f"or the panels get squeezed and their titles overlap")
