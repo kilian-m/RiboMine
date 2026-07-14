@@ -562,3 +562,150 @@ def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
         download.sample_reads(str(local), str(tmp_path / "o.fastq"), n=10, backoff_s=0)
     assert len(opened) == 1, "a local file is not a flaky network"
 
+
+# --- gene counts / the read-count matrix ------------------------------------
+READS_PER_GENE = "\n".join([
+    # STAR's four bookkeeping rows, then the genes.
+    # columns: gene_id, unstranded, sense, antisense
+    "N_unmapped\t100\t100\t100",
+    "N_multimapping\t50\t50\t50",
+    "N_noFeature\t30\t35\t900",
+    "N_ambiguous\t10\t8\t4",
+    "ENSG01\t210\t200\t10",
+    "ENSG02\t0\t0\t0",
+    "ENSG03\t95\t90\t5",
+]) + "\n"
+
+GENE_INFO = "\n".join([        # STAR's own gene table: a count, then id/name/biotype
+    "3",
+    "ENSG01\tAAA\tprotein_coding",
+    "ENSG02\tBBB\tlincRNA",
+    "ENSG03\tCCC\tprotein_coding",
+]) + "\n"
+
+
+def _star_index(tmp_path):
+    d = tmp_path / "index"
+    d.mkdir()
+    (d / "geneInfo.tab").write_text(GENE_INFO)
+    return str(d)
+
+
+def _counts_tab(tmp_path, name: str, text: str = READS_PER_GENE) -> str:
+    p = tmp_path / name
+    p.write_text(text)
+    return str(p)
+
+
+def test_gene_counts_are_read_off_the_sense_strand(tmp_path):
+    """A ribosome footprint is a piece of the mRNA, so it maps to the transcript's own
+    strand. Reading the unstranded column would fold in antisense background; reading
+    the antisense column would report the background INSTEAD of the library."""
+    from ribomine.process import counts
+
+    c, stats = counts.read_counts(_counts_tab(tmp_path, "r.tab"))
+    assert c == {"ENSG01": 200, "ENSG02": 0, "ENSG03": 90}   # sense column, not 210/95
+    assert stats["n_in_genes"] == 290
+    assert stats["n_genes_detected"] == 2                    # the zero gene is not "detected"
+    # what the counts do NOT contain -- the honest denominator
+    assert stats["n_no_feature"] == 35 and stats["n_ambiguous"] == 8
+    assert stats["frac_in_genes"] == round(290 / (290 + 35 + 8), 4)
+    # STAR's N_multimapping row is 0 whenever multimap_nmax=1 (multimappers are dropped
+    # before counting), so it is deliberately not reported -- Log.final.out has the truth
+    assert "n_multimapping" not in stats
+    assert stats["sense_over_antisense"] == round(290 / 15, 1)
+
+
+def test_a_library_that_is_not_sense_stranded_is_called_out(tmp_path, caplog):
+    """If the reads are on the other strand, the sense column is a fraction of the
+    library rather than a measurement of it -- and every count in the matrix is wrong
+    by that factor. It must not pass silently."""
+    from ribomine.process import counts
+
+    flipped = "\n".join([
+        "N_noFeature\t0\t0\t0",
+        "N_ambiguous\t0\t0\t0",
+        "ENSG01\t2000\t1000\t1000",     # 1:1 -- unstranded or reversed, not ribo-seq
+    ]) + "\n"
+    with caplog.at_level("WARNING"):
+        _, stats = counts.read_counts(_counts_tab(tmp_path, "f.tab", flipped), label="SRRX")
+    assert stats["sense_over_antisense"] == 1.0
+    assert "does not look sense-stranded" in caplog.text
+
+
+def test_the_matrix_has_a_row_for_every_gene_including_the_zero_ones(tmp_path):
+    """A matrix whose row set depends on which runs are in it cannot be compared with
+    the next one. Rows come from the annotation, not from the data."""
+    from ribomine.process import counts
+    from ribomine.utils import read_tsv
+
+    out = str(tmp_path / "m.tsv")
+    counts.matrix(out, _star_index(tmp_path),
+                  [("SRR1", _counts_tab(tmp_path, "a.tab")),
+                   ("SRR2", _counts_tab(tmp_path, "b.tab"))])
+    rows = read_tsv(out)
+    assert [r["gene_id"] for r in rows] == ["ENSG01", "ENSG02", "ENSG03"]
+    assert rows[0]["gene_name"] == "AAA"          # names come free from the STAR index
+    assert rows[0]["SRR1"] == "200" and rows[0]["SRR2"] == "200"
+    assert rows[1]["SRR1"] == "0"                 # a gene with no reads is a 0, not a gap
+
+
+def test_a_run_with_no_counts_is_left_out_rather_than_left_blank(tmp_path):
+    """A blank is not a zero. Every downstream tool reads this file as a numeric table,
+    so a run that produced no counts must not become a column of empty cells."""
+    from ribomine.process import counts
+    from ribomine.utils import read_tsv
+
+    out = str(tmp_path / "m.tsv")
+    counts.matrix(out, _star_index(tmp_path),
+                  [("SRR1", _counts_tab(tmp_path, "a.tab")),
+                   ("SRR_MISSING", str(tmp_path / "nope.tab"))])
+    rows = read_tsv(out)
+    assert "SRR_MISSING" not in rows[0]
+    assert rows[0]["SRR1"] == "200"
+
+
+def test_every_mapping_summary_column_is_actually_produced(tmp_path):
+    """A column in the header that no row ever fills is a blank column, and a key a row
+    fills that the header does not list is silently DROPPED by write_tsv. Either way the
+    table lies about what was measured, so the two lists must match exactly."""
+    from ribomine import reports
+    from ribomine.utils import Sample, write_json
+
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)}})
+    s = Sample("SRR1", cfg.workdir)
+    # a process record with every block the row builder reads
+    write_json(s.process_json, {
+        "run_accession": "SRR1",
+        "download": {"route": "ena_https", "mb_per_s": 40.0, "bytes": 10},
+        "trim": {"n_reads_in": 100, "n_reads_out": 90, "mean_len_in": 50.0,
+                 "mean_len_out": 30.0, "frac_no_adapter": 0.1},
+        "contaminants": {"n_input": 90, "n_kept": 40, "n_contaminant_rRNA_tRNA_etc": 50},
+        "mapping": {"n_input": 40, "n_unique": 30, "frac_unique": 0.75,
+                    "frac_multimapping": 0.1, "frac_unmapped": 0.15,
+                    "avg_input_len": 31.0, "avg_mapped_len": 29.4},
+        "periodicity": {"n_reads_in_bam": 30, "n_reads_scored": 30, "mean_mapped_len": 29.4,
+                        "read_len_mode": 30, "periodicity_inframe_frac": 0.6,
+                        "periodicity_tvd_uniform": 0.4, "n_cds_reads": 20,
+                        "cds_frac_of_genic": 0.8},
+        "counts": {"n_in_genes": 25, "frac_in_genes": 0.83, "n_genes_detected": 9,
+                   "n_ambiguous": 1, "n_no_feature": 4, "sense_over_antisense": 20.0},
+        "umi_dedup": False, "bam_bytes": 123, "keep": {"bam": True},
+    })
+    row = reports._process_row(cfg, "SRR1")
+
+    missing = [c for c in reports.PROCESS_COLUMNS if c not in row]
+    extra = [k for k in row if k not in reports.PROCESS_COLUMNS]
+    assert not missing, f"columns in the header that no row fills: {missing}"
+    assert not extra, f"row keys write_tsv would silently drop: {extra}"
+
+    # the headline columns the table leads with, in order
+    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS
+    assert reports.PROCESS_COLUMNS[:7] == [
+        "run_accession", "verdict", "architecture", "n_mapped", "mean_footprint_len",
+        "mean_mapped_len", "periodicity_tvd"]
+    assert row["n_mapped"] == 30
+    # the footprint length is STAR's INPUT (trimmed + contaminant-free), never
+    # mean_len_after_trim, which still has the contaminants in it
+    assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
+    assert row["mean_mapped_len"] == 29.4

@@ -153,6 +153,103 @@ def _tvd_uniform(counts3) -> float:
     return 0.5 * sum(abs(pi - 1 / 3) for pi in p)
 
 
+def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
+                label: str = "") -> dict:
+    """3-nt periodicity of a FINISHED BAM -- measured on the deliverable itself.
+
+    The verdict in `qc()` is decided on the QC stage's own alignment: a 200k-read
+    sample, untrimmed, aligned locally. That is the right measurement to CALL a
+    library with, but it is not a measurement of what came out of the pipeline. This
+    is: the trimmed reads, end-to-end aligned, contaminant- and pile-up-filtered,
+    deduplicated if that was asked for. It decides nothing -- it is the number you
+    look at to see whether the reads you are about to analyse are periodic.
+
+    The two can legitimately disagree (a trim that cut the footprint boundary wrong
+    shows up here and nowhere else), which is the whole reason for measuring twice.
+
+    Reads are taken at a fixed STRIDE through the file, not from its front: the BAM
+    is coordinate-sorted by now, so its first `max_reads` reads are the first
+    chromosome, and periodicity there is not periodicity everywhere. `max_reads <= 0`
+    scores every read.
+    """
+    idx, ncls, _ = _load_index(index_path)
+    bamf = pysam.AlignmentFile(bam, "rb")
+    # The .bai's count is of ALIGNMENTS, not of reads -- with multimappers kept
+    # (mapping.multimap_nmax > 1) one read contributes several. It is exactly what the
+    # stride needs, and NOT what "reads in the BAM" means, so the reads are counted in
+    # the pass below and this is used for nothing else.
+    try:
+        n_alignments = bamf.mapped
+    except ValueError:                   # no index -- score everything
+        n_alignments = 0
+    stride = max(1, n_alignments // max_reads) if (n_alignments and max_reads > 0) else 1
+
+    len_hist: Counter = Counter()
+    region_hist: Counter = Counter()
+    frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
+    seen = n = 0
+    for aln in bamf:
+        if aln.is_unmapped or aln.is_secondary or aln.is_supplementary:
+            continue
+        seen += 1
+        if (seen - 1) % stride:
+            continue
+        n += 1
+        chrom, p5, strand, L = _read_5p(aln)
+        len_hist[L] += 1
+        region, frame = _classify(idx, ncls, chrom, p5, strand)
+        region_hist[region] += 1
+        if region == "CDS" and frame is not None:
+            frame_by_len[L][frame] += 1
+    bamf.close()
+
+    if n == 0:
+        raise ValueError(f"no usable alignments in {bam}")
+
+    # same construction as qc(): align each read length to its own dominant frame
+    # before pooling, so a length whose 5' end sits one base off does not cancel out
+    # a length that is in phase
+    cds_reads = sum(sum(v) for v in frame_by_len.values())
+    inframe = 0
+    pooled = [0, 0, 0]
+    for c3 in frame_by_len.values():
+        if not sum(c3):
+            continue
+        dom = int(np.argmax(c3))
+        inframe += c3[dom]
+        for f in range(3):
+            pooled[(f - dom) % 3] += c3[f]
+
+    genic = n - region_hist.get("intergenic", 0) - region_hist.get("mito", 0)
+    res = {
+        "n_reads_in_bam": seen,          # primary alignments = reads, counted, not inferred
+        "n_reads_scored": n,
+        "stride": stride,
+        # The ALIGNED length (soft clips excluded), which for the deliverable BAM is the
+        # whole read -- it is aligned end-to-end, so nothing is clipped. It stops being
+        # the whole read the moment someone sets mapping.align_ends_type to Local, and
+        # then the aligned length is the honest one: it is the part that is genomic.
+        #
+        # Reported as BOTH a mean and a mode, because they answer different questions. The
+        # mode is where the footprint PEAK is, and a peak is a mode: contamination in the
+        # tails cannot move it (SRR25706716 peaks at 28 nt with a median of 26, dragged
+        # down by miRNA). The mean is what you want when the whole distribution matters.
+        "mean_mapped_len": round(sum(L * c for L, c in len_hist.items()) / n, 1),
+        "read_len_mode": max(len_hist, key=lambda k: len_hist[k]),
+        "periodicity_inframe_frac": round(inframe / cds_reads, 3) if cds_reads else 0.0,
+        "periodicity_tvd_uniform": round(_tvd_uniform(pooled), 3),
+        "n_cds_reads": cds_reads,
+        "cds_frac_of_genic": round(region_hist.get("CDS", 0) / genic, 3) if genic else 0.0,
+        "region_frac": {k: round(v / n, 4)
+                        for k, v in sorted(region_hist.items(), key=lambda x: -x[1])},
+    }
+    LOG.info("%s: BAM %s reads, in-frame %.0f%% (TVD %.2f) on %s CDS reads of %s scored",
+             label or os.path.basename(bam), f"{res['n_reads_in_bam']:,}",
+             100 * res["periodicity_inframe_frac"], res["periodicity_tvd_uniform"],
+             f"{cds_reads:,}", f"{n:,}")
+    return res
+
+
 def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str = "",
        contam: dict | None = None, pileup: dict | None = None,
        total_reads: int | None = None) -> dict:

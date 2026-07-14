@@ -33,6 +33,7 @@ from .arch import infer as arch_infer
 from .arch import plot as arch_plot
 from .arch import trim as arch_trim
 from .config import Config, stages_to_run
+from .process import counts
 from .process import dedup as proc_dedup
 from .process import star
 from .qc import annotation, contaminants, pileups, plot as qc_plot, profile, verdict
@@ -278,9 +279,19 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         info["contaminants"] = read_json(contam_full, {})
         to_map = s.clean_fastq
 
-    # 4. map end-to-end -- the deliverable alignment
+    # 4. map end-to-end -- the deliverable alignment. STAR counts the reads into genes
+    #    as it aligns them (--quantMode GeneCounts), so the count matrix costs nothing
+    #    extra; `reports.counts_tsv` joins the per-run tables at the end of the batch.
     bam = star.align_final(to_map, s.star_final, cfg, threads=threads, log=s.log)
     info["mapping"] = star.parse_log(os.path.join(s.star_final, "Log.final.out"))
+
+    gene_counts = counts.path(s.star_final)
+    if nonempty(gene_counts):
+        info["counts"] = counts.read_counts(gene_counts, label=acc)[1]
+        LOG.info("[%s] gene counts: %s reads in %s genes (%.0f%% of counted reads)", acc,
+                 human(info["counts"]["n_in_genes"]),
+                 human(info["counts"]["n_genes_detected"]),
+                 100 * (info["counts"].get("frac_in_genes") or 0))
 
     # 5. pile-up removal (adapter dimers / fixed contaminants that survived the
     #    sequence filter). Cheapest on the unsorted BAM STAR just wrote.
@@ -315,6 +326,19 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         LOG.info("[%s] UMI dedup: %s -> %s reads (%.0f%% duplicates)", acc,
                  human(info["dedup"]["n_in"]), human(info["dedup"]["n_out"]),
                  100 * (1 - info["dedup"]["frac_kept"]))
+        if "counts" in info:
+            # STAR counted during the alignment, which is before this step ran. Say so
+            # once, per sample, rather than let someone discover it in a volcano plot.
+            LOG.warning("[%s] the gene counts are NOT deduplicated: STAR counts while it "
+                        "aligns, and UMI dedup happens after. The BAM is deduplicated; "
+                        "the count matrix is of the reads that went into it.", acc)
+
+    # 8. periodicity of the reads we are actually handing over. The QC verdict was
+    #    decided on a 200k-read sample of the UNTRIMMED reads, locally aligned; this
+    #    is the finished article -- trimmed, filtered, deduplicated, end-to-end. A
+    #    trim that cut the footprint boundary wrong shows up here and nowhere else.
+    info["periodicity"] = verdict.periodicity(
+        s.bam, cfg.annotation_index, max_reads=cfg["qc.max_reads_scored"], label=acc)
 
     info["bam"] = s.bam
     info["bam_bytes"] = os.path.getsize(s.bam)
@@ -433,6 +457,7 @@ def run(cfg: Config) -> dict:
         ok_b, failed = _pool(cfg, process_sample, [(a, cfg, src[a]) for a in ok_a], "bam")
         all_failed += failed
         reports.process_tsv(cfg, ok_a)
+        reports.counts_tsv(cfg, ok_b)
         summary["bam"] = len(ok_b)
     finally:
         star.unload_genome(cfg)

@@ -101,6 +101,16 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     periodicity_tvd_uniform, cds_frac_of_genic, top5p_locus_frac, read_len_mode,
     region_frac{}, metagene_start{}, metagene_stop{}, frame_by_len{}, mapping{},
     contaminants{}, usable{projected_usable_reads,...}. Written to Sample.qc_json."""
+
+def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
+                label: str = "") -> dict
+    """3-nt periodicity of a FINISHED BAM -- trimmed, filtered, deduplicated. Decides
+    nothing (qc() makes the call, on the untrimmed QC sample); this is the measurement
+    OF THE OUTPUT, and the only place a mis-trimmed footprint boundary shows up.
+    Reads are taken at a fixed stride, not from the front -- the BAM is coordinate-
+    sorted, so its first reads are its first chromosome. Returns {'n_reads_in_bam',
+    'n_reads_scored', 'stride', 'read_len_mode', 'periodicity_inframe_frac',
+    'periodicity_tvd_uniform', 'n_cds_reads', 'cds_frac_of_genic', 'region_frac'}."""
 ```
 
 ## ribomine.qc.plot / ribomine.arch.plot
@@ -148,11 +158,36 @@ def align_local(fastq: str, outdir: str, cfg: Config, *, threads: int = 8, log: 
 
 def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8, log: str = "") -> str
     """End-to-end alignment of the TRIMMED reads (the deliverable BAM), using the
-    cfg['mapping'] parameters. Returns the BAM."""
+    cfg['mapping'] parameters. Also writes ReadsPerGene.out.tab (--quantMode GeneCounts)
+    when the index has the annotation. Returns the BAM."""
 
+def has_annotation(cfg: Config) -> bool  # was the STAR index built with --sjdbGTFfile?
 def sort_index(bam: str, out_bam: str, *, threads: int = 4) -> str
 def parse_log(star_log: str) -> dict    # n_input, n_unique, n_multi, frac_* (unique+multi+unmapped = 1)
 ```
+
+## ribomine.process.counts
+
+```python
+def path(star_final_dir: str) -> str    # where STAR left this run's ReadsPerGene.out.tab
+
+def read_counts(tab: str, *, label: str = "") -> tuple[dict[str, int], dict]
+    """({gene_id: count}, stats). Counts are STAR's SENSE column (a footprint is a
+    piece of the mRNA). stats = {'n_in_genes', 'n_genes_detected', 'n_no_feature',
+    'n_ambiguous', 'n_antisense', 'sense_over_antisense', 'frac_in_genes'} -- i.e.
+    what the counts do NOT contain. Warns when the library does not read as
+    sense-stranded. STAR's N_multimapping row is deliberately NOT reported: under
+    multimap_nmax=1 it reads 0 no matter how multimapping the library is, because the
+    multimappers were dropped before counting. Log.final.out has that number."""
+
+def matrix(out_tsv: str, star_index: str, columns: list[tuple[str, str]]) -> str
+    """Join per-run count tables into the genes x runs matrix. Rows come from the
+    index's geneInfo.tab -- every gene, including the all-zero ones, so two matrices
+    are comparable. A run with no counts is left OUT as a column (a blank is not a 0)."""
+```
+
+Counts are taken DURING the alignment, so they precede the pile-up filter and any UMI
+dedup, and they are over the whole gene (all exons, any biotype), not the CDS.
 
 ## ribomine.process.dedup
 

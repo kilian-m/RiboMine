@@ -14,7 +14,8 @@ Two alignments, for two different jobs:
 * `align_final` -- the deliverable BAM. The trimmed reads, aligned end-to-end
   with the `mapping` section of the config. Mapping metrics are taken from this
   alignment, never from the local one (a permissive local alignment inflates
-  multimapping).
+  multimapping). This pass also counts reads into genes as it goes
+  (`--quantMode GeneCounts`), which is where the read-count matrix comes from.
 
 Both write an unsorted BAM; `sort_index` produces the coordinate-sorted+indexed
 file. That split is not cosmetic: STAR's own BAM sorting is incompatible with
@@ -104,6 +105,10 @@ LOCAL_ARGS: list[str] = [
 _STAR_BAM = "Aligned.out.bam"     # what STAR writes
 _OUT_BAM = "aligned.bam"          # what we hand on (Sample.local_bam / star_final)
 _LOG_FINAL = "Log.final.out"
+# --quantMode GeneCounts writes this next to the BAM; the index's gene table names
+# the rows (id -> symbol, biotype). Both are read by ribomine.process.counts.
+GENE_COUNTS = "ReadsPerGene.out.tab"
+GENE_INFO = "geneInfo.tab"
 
 
 # --- alignment -------------------------------------------------------------
@@ -125,6 +130,11 @@ def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
 
     Parameters come from `cfg['mapping']` -- this alignment is the user's, and
     what "a mapped read" means for their downstream analysis is theirs to set.
+
+    Also emits `ReadsPerGene.out.tab` (`--quantMode GeneCounts`) when the index
+    carries the annotation: STAR counts reads into genes *while* it aligns them,
+    which is free, so RiboMine does not run a second counting tool over the BAM.
+    See `ribomine.process.counts` for what those counts do and do not include.
     """
     args = [
         "--outSAMtype", "BAM", "Unsorted",
@@ -136,11 +146,39 @@ def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
         "--outFilterMatchNminOverLread", str(float(cfg.get("mapping.match_nmin_over_lread", 0.9))),
         "--outSJtype", "None",
     ]
+    if has_annotation(cfg):
+        args += ["--quantMode", "GeneCounts"]
+    else:
+        LOG.warning(
+            "the STAR index was built without a GTF (--sjdbGTFfile), so STAR cannot "
+            "count reads into genes: no read-count matrix will be written. Rebuild the "
+            "index with --sjdbGTFfile %s to get one.", cfg.get("reference.gtf"))
     intron_max = int(cfg.get("mapping.align_intron_max", 0) or 0)
     if intron_max:      # 0 == STAR's own default (spliced); only pass it when set
         args += ["--alignIntronMax", str(intron_max)]
     args += [str(a) for a in (cfg.get("mapping.extra_args") or [])]
     return _align(fastq, outdir, cfg, args=args, threads=threads, log=log, what="final")
+
+
+def has_annotation(cfg: Config) -> bool:
+    """Was the STAR index generated with a GTF?
+
+    `--quantMode GeneCounts` needs the annotation to be IN the index. It can also be
+    supplied at mapping time (`--sjdbGTFfile`), but that inserts junctions on the fly,
+    which STAR refuses to do against a shared-memory genome -- and the shared genome
+    is what makes a several-hundred-sample batch affordable. So the index either has
+    the annotation or the run gets no gene counts; it is not a trade we can make
+    per-sample.
+
+    `geneInfo.tab` holds the gene count on its first line, and an index built without
+    a GTF still has the file -- with a 0 in it.
+    """
+    gene_info = os.path.join(_index(cfg), GENE_INFO)   # a missing index raises here,
+    try:                                               # rather than being reported as
+        with open(gene_info) as fh:                    # a missing annotation
+            return int((fh.readline() or "0").strip()) > 0
+    except (OSError, ValueError):
+        return False
 
 
 def _align(fastq: str, outdir: str, cfg: Config, *, args: list[str], threads: int,
@@ -362,7 +400,16 @@ def parse_log(star_log: str) -> dict:
     uniq = grab("Uniquely mapped reads number")
     multi = grab("Number of reads mapped to multiple loci") or 0
     toomany = grab("Number of reads mapped to too many loci") or 0
-    out: dict = {"n_input": inp, "n_unique": uniq, "n_multi": multi + toomany}
+    out: dict = {
+        "n_input": inp, "n_unique": uniq, "n_multi": multi + toomany,
+        # The length of the FOOTPRINT reads: STAR's input is the trimmed, contaminant-
+        # filtered FASTQ, so this is the mean length of the reads that are candidate
+        # footprints -- and NOT `mean_len_after_trim`, which still has the rRNA in it and
+        # is therefore a mean over the contaminants (88% of the reads on SRR30357177,
+        # and ~5 nt longer than a real footprint).
+        "avg_input_len": grab("Average input read length", float),
+        "avg_mapped_len": grab("Average mapped length", float),
+    }
     if inp:
         mapped = (uniq + multi + toomany) if uniq is not None else None
         out["frac_mapped"] = mapped / inp if mapped is not None else None

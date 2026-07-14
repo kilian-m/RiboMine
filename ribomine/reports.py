@@ -10,6 +10,11 @@ them.
 A run that never reached a stage still gets a row. A table with 187 rows and 12
 blanks is honest; a table with 175 rows silently hides which runs fell over.
 
+The BAM end point has a second deliverable that is not one row per run:
+`counts/gene_counts.tsv`, the genes x runs read-count matrix. It is a join, not a
+measurement -- STAR counted the reads into genes while it aligned them, and this
+only stacks one run's column next to the next one's.
+
 Where the numbers come from (this matters, and the pipeline is deliberate about
 it -- see docs / PIPELINE.md §13):
 
@@ -20,6 +25,10 @@ it -- see docs / PIPELINE.md §13):
   same permissiveness inflates multimapping, which is why
 * the mapping numbers in `mapping_summary.tsv` come from the **end-to-end**
   alignment of the trimmed reads -- the deliverable BAM.
+* the periodicity columns in `mapping_summary.tsv` are a THIRD measurement, and
+  the only one taken on the finished BAM: trimmed, filtered, deduplicated. QC says
+  whether the library is ribo-seq; this says whether what came out of the pipeline
+  still is. They are allowed to disagree -- when they do, the trim is the suspect.
 """
 from __future__ import annotations
 
@@ -29,6 +38,7 @@ from typing import Any
 
 from .arch.infer import architecture_string
 from .config import Config
+from .process import counts
 from .utils import Sample, nonempty, read_json, read_tsv, write_tsv
 
 LOG = logging.getLogger("ribomine.reports")
@@ -57,12 +67,34 @@ ARCH_COLUMNS = [
 ]
 
 PROCESS_COLUMNS = [
-    "run_accession", "verdict", "architecture", "download_route", "download_mb_per_s",
-    "fastq_bytes", "n_reads_raw", "n_reads_after_trim", "frac_trimmed_out", "frac_no_adapter",
-    "mean_len_before_trim", "mean_len_after_trim", "n_contaminant_removed",
-    "frac_contaminant", "n_reads_into_mapping", "n_uniquely_mapped",
-    "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped", "umi_dedup",
-    "n_reads_after_dedup", "frac_duplicates", "bam", "bam_bytes",
+    # The headline, in the order a reader asks the questions: which run, was it ribo-seq,
+    # what is the read made of, how much of it survived, how long are those reads before
+    # and after they were mapped, and are they periodic. Everything after this is the
+    # evidence behind it, and nobody has to scroll to find out whether the run is usable.
+    "run_accession", "verdict", "architecture",
+    "n_mapped",              # reads in the deliverable BAM: trimmed, filtered, deduped
+    "mean_footprint_len",    # the FOOTPRINTS: trimmed and contaminant-free, as fed to STAR
+    "mean_mapped_len",       # the MAPPINGS: aligned length of what reached the BAM
+    "periodicity_tvd",
+    # --- the rest of the BAM's own measurement
+    "periodicity_inframe", "read_len_mode", "n_cds_reads", "cds_frac_of_genic",
+    "n_reads_scored_periodicity",
+    # --- where the reads came from and what was thrown away on the way
+    "download_route", "download_mb_per_s", "fastq_bytes",
+    "n_reads_raw", "n_reads_after_trim", "frac_trimmed_out", "frac_no_adapter",
+    # mean_len_after_trim is a mean over the trimmed reads INCLUDING the contaminants, so
+    # it is not the footprint length -- mean_footprint_len above is. Kept, because the two
+    # together say how different the contaminants were.
+    "mean_len_before_trim", "mean_len_after_trim",
+    "n_contaminant_removed", "frac_contaminant",
+    "n_reads_into_mapping", "n_uniquely_mapped",
+    "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped",
+    "umi_dedup", "n_reads_after_dedup", "frac_duplicates",
+    # --- STAR's gene counts: taken DURING the alignment, so they precede the pile-up
+    #     filter and any UMI dedup (see ribomine.process.counts)
+    "n_reads_in_genes", "frac_reads_in_genes", "n_genes_detected",
+    "n_ambiguous", "n_no_feature", "sense_over_antisense",
+    "bam", "bam_bytes",
 ]
 
 # region_frac keys as the annotation index emits them -> flat column names
@@ -114,6 +146,32 @@ def process_tsv(cfg: Config, accs: list[str]) -> str:
     n_bam = sum(1 for r in rows if r.get("bam"))
     LOG.info("mapping_summary.tsv: %d runs (%d BAMs) -> %s", len(rows), n_bam, path)
     return path
+
+
+def counts_tsv(cfg: Config, accs: list[str]) -> str:
+    """Write `<workdir>/counts/gene_counts.tsv` -- the genes x runs read-count matrix.
+
+    The columns are STAR's own per-run gene counts (`ReadsPerGene.out.tab`), joined on
+    the gene table of the index STAR aligned against, so the row set and the counts
+    come from the same annotation by construction. Returns "" when there is nothing to
+    join -- an index built without a GTF cannot count, and that is a property of the
+    reference, not a per-run failure, so it is said once rather than 500 times.
+    """
+    if not accs:
+        return ""
+    cols = [(a, counts.path(Sample(a, cfg.workdir).star_final)) for a in accs]
+    have = [(a, p) for a, p in cols if nonempty(p)]
+    if not have:
+        LOG.warning("no run produced gene counts -- no read-count matrix. (STAR only "
+                    "counts reads into genes when its index was built with the GTF: "
+                    "--sjdbGTFfile at genome-generate.)")
+        return ""
+    if len(have) < len(cols):
+        missing = [a for a, p in cols if not nonempty(p)]
+        LOG.warning("read-count matrix: no gene counts for %d run(s) -- they are not "
+                    "columns in it: %s", len(missing), ", ".join(missing[:5]))
+    path = os.path.join(cfg.dir("counts"), "gene_counts.tsv")
+    return counts.matrix(path, cfg.ref("star_index"), have)
 
 
 def summary_line(cfg: Config, accs: list[str]) -> str:
@@ -168,6 +226,7 @@ def _tables(cfg: Config, end: str) -> list[str]:
         out.append(os.path.join(cfg.workdir, "architecture", "architecture.tsv"))
     if end == "bam":
         out.append(os.path.join(cfg.workdir, "mapping_summary.tsv"))
+        out.append(os.path.join(cfg.workdir, "counts", "gene_counts.tsv"))
     return [p for p in out if os.path.exists(p)]
 
 
@@ -335,7 +394,20 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
     if fastq_bytes is None and nonempty(s.full_fastq):
         fastq_bytes = os.path.getsize(s.full_fastq)
 
+    # measured on the deliverable BAM, and on STAR's gene counts
+    per = proc.get("periodicity") or {}
+    ct = proc.get("counts") or {}
+
+    # A BAM that `keep.bam: false` deleted on purpose is not the same thing as a BAM
+    # that was never produced, and a blank cell reads like the second. The stage records
+    # what it kept, so this is read back rather than inferred from the missing file --
+    # a BAM someone deleted by hand is then still an empty cell, which is the truth.
     bam = s.bam if nonempty(s.bam) else ""
+    bam_bytes = os.path.getsize(bam) if bam else proc.get("bam_bytes")
+    bam_cell = _rel(cfg, bam)
+    if not bam and proc.get("keep", {}).get("bam") is False:
+        bam_cell = "deleted (keep.bam=false)"
+
     return {
         "run_accession": acc,
         "verdict": qc.get("verdict", ""),
@@ -365,8 +437,39 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         "umi_dedup": proc.get("umi_dedup") if proc else None,
         "n_reads_after_dedup": dd.get("n_out"),
         "frac_duplicates": frac_dup,
-        "bam": _rel(cfg, bam),
-        "bam_bytes": os.path.getsize(bam) if bam else None,
+        # --- what is actually IN the BAM. The QC table's periodicity is the verdict's:
+        # a sample of the untrimmed reads, locally aligned. This one is the pipeline's
+        # own output measured after every filter, which is the number to trust about
+        # the data you are handed -- and the one that catches a mis-trimmed footprint.
+        "n_mapped": per.get("n_reads_in_bam"),
+        # The FOOTPRINT reads: what STAR was given, i.e. trimmed AND contaminant-filtered.
+        # STAR already means it, so there is nothing to recompute. This is the number to
+        # read as "how long are this library's footprints" -- `mean_len_after_trim` is
+        # NOT, because the contaminants are still in it and they are not footprints
+        # (SRR30357177: 88% rRNA, ~5 nt longer, dragging that mean from 34 nt up to 39).
+        "mean_footprint_len": mp.get("avg_input_len"),
+        # The MAPPINGS: aligned length (soft clips excluded) of the reads that reached the
+        # BAM. Measured on the deliverable itself, so it is after the pile-up filter and
+        # any dedup -- which is why it is our own pass and not STAR's `avg_mapped_len`,
+        # though the two agree to a decimal when nothing is removed after mapping.
+        "mean_mapped_len": per.get("mean_mapped_len"),
+        "read_len_mode": per.get("read_len_mode"),
+        "periodicity_inframe": per.get("periodicity_inframe_frac"),
+        "periodicity_tvd": per.get("periodicity_tvd_uniform"),
+        "n_cds_reads": per.get("n_cds_reads"),
+        "cds_frac_of_genic": per.get("cds_frac_of_genic"),
+        "n_reads_scored_periodicity": per.get("n_reads_scored"),
+        # --- the count matrix's own numbers, per run. `n_reads_in_genes` is the column
+        # this run contributes to counts/gene_counts.tsv; the rest is what it does not
+        # contain (ambiguous between two genes, in no gene at all).
+        "n_reads_in_genes": ct.get("n_in_genes"),
+        "frac_reads_in_genes": ct.get("frac_in_genes"),
+        "n_genes_detected": ct.get("n_genes_detected"),
+        "n_ambiguous": ct.get("n_ambiguous"),
+        "n_no_feature": ct.get("n_no_feature"),
+        "sense_over_antisense": ct.get("sense_over_antisense"),
+        "bam": bam_cell,
+        "bam_bytes": bam_bytes,
     }
 
 

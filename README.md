@@ -110,8 +110,39 @@ SRR12285169    5'-[UMI,2nt]-[footprint,~30nt]-[UMI,5nt]-[barcode,AGCTA]-[TruSeq]
 That row is exactly the documented McGlincy & Ingolia 2017 structure — recovered from
 the reads, with no protocol given to the tool.
 
-**After mapping** — sorted, indexed BAMs, plus a summary of what was thrown away and
-why (contaminants, pile-ups, reads left too short, duplicates).
+**After mapping** — sorted, indexed BAMs; `mapping_summary.tsv`, a summary of what was
+thrown away and why (contaminants, pile-ups, reads left too short, duplicates); and
+`counts/gene_counts.tsv`, the **read-count matrix**:
+
+```
+gene_id          gene_name  SRR12285169  SRR618773  SRR1039508
+ENSG00000000003  TSPAN6             412        380         51
+ENSG00000000005  TNMD                 0          2          0
+ENSG00000000419  DPM1               188        205        177
+```
+
+The counts are STAR's own (`--quantMode GeneCounts`): it counts a read into a gene
+while it aligns it, so the matrix costs nothing beyond the alignment, and there is no
+second gene model to keep in step with the one the reads were aligned to. A read is
+counted if it overlaps one gene's exons and no other's; the sense strand is used,
+because a footprint is a piece of the mRNA. Two things follow, and both are stated on
+the columns of `mapping_summary.tsv` rather than left to be discovered: the counts are
+over the **whole gene**, not the CDS, and STAR takes them **during** the alignment —
+so they precede the pile-up filter and any UMI deduplication. This needs a STAR index
+built with the GTF (`--sjdbGTFfile`); without one RiboMine says so and skips the matrix.
+
+`mapping_summary.tsv` also carries the **periodicity of the finished BAM** — the reads
+you are actually handed, after trimming, filtering and dedup:
+
+```
+run_accession  n_reads_in_bam  periodicity_inframe  periodicity_tvd  n_reads_in_genes
+SRR12285169         14,203,881                 0.61             0.42        11,942,067
+```
+
+That is a different measurement from the QC verdict's periodicity, which is taken on a
+sample of the *untrimmed* reads. QC says whether the library is Ribo-seq; this says
+whether what came out of the pipeline still is. When the two disagree, the trim is the
+first suspect — and there is nowhere else that would show it.
 
 ## How it works
 
@@ -235,6 +266,7 @@ ribomine/
     plot.py         the architecture figure
   process/
     star.py         alignment (local for reading architecture, end-to-end for the BAM)
+    counts.py       STAR's gene counts -> the genes x runs matrix
     dedup.py        optional UMI deduplication
   data/             the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt)
   reports.py        the TSVs

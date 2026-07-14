@@ -344,7 +344,11 @@ reads spanning the absent / partial / error-bearing scaffold cases).
 `reports.py` then assembles the metrics list, taking **periodicity / region
 metrics from the local alignment** (sharpest) and **mapping metrics from the
 trimmed reads re-aligned end-to-end** (the permissive local alignment inflates
-multimapping):
+multimapping). `mapping_summary.tsv` then repeats the periodicity measurement on
+the **finished BAM** — the same arithmetic, on the reads that survived trimming,
+filtering and dedup. The verdict's number says whether the library is Ribo-seq; the
+BAM's number says whether what came out of the trim still is, and a cut made at the
+wrong footprint boundary is visible in the gap between them and nowhere else.
 
 ```
   ribo-seq?                  YES
