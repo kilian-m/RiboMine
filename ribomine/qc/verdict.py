@@ -509,11 +509,12 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             f"{mito_periodicity:.0%} in-frame (TVD {mito_tvd:.2f}) and are not scored")
     if antisense_deposit:
         reasons.append(
-            f"ANTISENSE DEPOSIT -- only {cds_sense_frac:.0%} of the {n_on_cds:,} reads that "
-            f"touch a CDS are on its strand. This deposit looks reverse-complemented. A "
-            f"footprint is a piece of the mRNA, so it is sense; RiboMine scores the sense "
-            f"strand, which means the CDS enrichment and periodicity above were measured on "
-            f"the minority of reads that happen to sit the right way round")
+            f"ANTISENSE to the genes -- only {cds_sense_frac:.0%} of the {n_on_cds:,} reads "
+            f"on a CDS are on its strand. This is a reverse-stranded library; the usual "
+            f"cause is stranded RNA-seq (dUTP), not ribo-seq, whose footprints are pieces of "
+            f"the mRNA and therefore sense. RiboMine scores the sense strand, so the CDS "
+            f"enrichment and periodicity above are of the minority of reads that sit the "
+            f"right way round -- read them as a floor, not a measurement")
     if frac_unique is not None:
         reasons.append(f"unique mapping {'LOW' if low_unique else 'ok'} ({frac_unique:.0%})")
     if contaminant:
@@ -538,12 +539,25 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         if not cds_floor_ok:
             why.append(f"only {cds_of_genic:.0%} of genic reads are in CDS (not translation)")
         if antisense_deposit:
-            # Say this FIRST among the reasons a run was refused: an empty CDS is what a
-            # reverse-complemented deposit looks like, and "no CDS enrichment" would send
-            # the reader looking for a biological answer to a bookkeeping problem.
-            why.insert(0, f"the deposit looks REVERSE-COMPLEMENTED ({cds_sense_frac:.0%} of "
-                          f"the reads on a CDS are on its strand), so the CDS is empty by "
-                          f"construction")
+            msg = (f"the reads are ANTISENSE to the genes ({cds_sense_frac:.0%} of those on a "
+                   f"CDS are on its strand), so the CDS is empty by construction")
+            if len_ok:
+                # The reads ARE footprint-length, so the strand is the whole story and
+                # nothing else about this run can be read until it is settled: an empty CDS
+                # is exactly what a reverse-complemented deposit looks like, and "no CDS
+                # enrichment" would send the reader hunting for a biological answer to a
+                # bookkeeping problem. Lead with it.
+                why.insert(0, msg + " -- a reverse-complemented deposit would look exactly "
+                                     "like this, and its footprints ARE the right length")
+            else:
+                # The reads are the wrong length for a footprint, so this is not ribo-seq
+                # whichever way round it is -- in a random 100-run cohort all 9 antisense
+                # deposits read 66-150 nt, i.e. reverse-stranded RNA-seq that the query's
+                # recall net swept in. Say it, but do NOT lead with it: flipping the strand
+                # would not turn a 150 nt read into a ribosome footprint, and a reader who
+                # starts there has been sent to fix the wrong thing.
+                why.append(msg + " -- but the reads are not footprint-length either, so the "
+                                 "strand is not what disqualifies this run")
         if low_unique:
             why.append(f"only {frac_unique:.0%} of reads map uniquely (non-genomic / "
                        f"multimapping junk)")
