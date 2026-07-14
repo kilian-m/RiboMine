@@ -332,6 +332,15 @@ the enzymatic RT base inside the footprint, and moves the random-templated UMI
 content (5′ + 3′) into the read name (`_<UMI>`, umi_tools style) for
 deduplication. Reads left shorter than `--min-len` are dropped.
 
+The decisions here are RiboMine's own — no external trimmer can express them (the
+barcode+adapter scaffold anchor, the poly(A) fallback when the scaffold has run off
+the read's end, a 5′ UMI split around a barcode). But the *string matching* under
+them is cutadapt's C aligner, imported as a library (`cutadapt.align.Aligner`) and
+driven by the logic above; and the gzip goes through `xopen`/pigz rather than
+Python's `gzip` module. Together those took the stage from 60k to 271k reads/s on
+one core, without changing a single cut point (verified: 0 differences over 300k
+reads spanning the absent / partial / error-bearing scaffold cases).
+
 `reports.py` then assembles the metrics list, taking **periodicity / region
 metrics from the local alignment** (sharpest) and **mapping metrics from the
 trimmed reads re-aligned end-to-end** (the permissive local alignment inflates

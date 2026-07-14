@@ -17,6 +17,11 @@ dependencies = [
     "ncls>=0.0.68",
     "matplotlib>=3.7",
     "requests>=2.31",
+    # cutadapt is a LIBRARY here, not a tool: arch/trim.py drives its C aligner
+    # (cutadapt.align.Aligner) with RiboMine's own trimming logic. That module is
+    # not a stability-guaranteed API and was last reshaped in 5.0 -- hence <6.
+    "cutadapt>=5.0,<6",
+    "xopen>=1.7",
 ]
 
 [project.optional-dependencies]

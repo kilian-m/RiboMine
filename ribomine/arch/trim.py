@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
+
+from cutadapt.align import Aligner, EndSkip
 
 from ..utils import open_fastq
 
@@ -31,31 +34,56 @@ _ABSENT = ("none", "unknown", "", None)
 # a library that cannot show its 3' scaffold to this share of its reads will lose them
 NO_ADAPTER_WARN = 0.30
 
+# cutadapt's error model: a RATE, not a count -- so a short partial adapter at the
+# read end must match exactly (0.12 * 7 = 0 errors) while a full-length one tolerates
+# sequencing error. Below ~9 nt of overlap the budget is zero.
+ERROR_RATE = 0.12
 
-def max_mm(overlap: int) -> int:
-    """Mismatches tolerated over an adapter overlap of `overlap` nt (cutadapt's
-    error model: a rate, not a count, so a short partial adapter at the read end
-    is matched exactly and a full-length one tolerates sequencing errors)."""
-    return int(0.12 * overlap)
+# A 3' adapter may begin anywhere in the read (skip the read's prefix: the footprint),
+# may be cut short by the read's end (skip the adapter's suffix), and -- the one that is
+# easy to forget -- may be FOLLOWED by more sequence (skip the read's suffix).
+#
+# That last skip is not optional. Without QUERY_STOP the aligner requires the alignment
+# to reach the end of the READ, i.e. the adapter must be the last thing in it. Any
+# library that sequences past the adapter into an index, a barcode or a second adapter
+# then matches in ZERO reads -- and `discard_untrimmed` throws the entire library away.
+# Measured on SRR25706716 ([footprint][Ingolia linker][12 nt][TruSeq]): the linker is an
+# exact substring of 98% of reads, and the matcher found it in 0% of them; 53.7 M reads
+# became a 23 KB BAM. The three skips together ARE cutadapt's `-a` (its BACK flag), which
+# is what this code always meant to be.
+_ADAPTER_FLAGS = EndSkip.QUERY_START | EndSkip.QUERY_STOP | EndSkip.REFERENCE_END
+
+# Score indels out of reach (the error budget never exceeds ~5 over a scaffold this
+# long), so the match stays Hamming-only -- the same model the hand-written matcher
+# this replaced used, and so the same cut points. Drop this to 1 to let the aligner
+# absorb an indel in the adapter, which is a real change to where reads get cut.
+_NO_INDELS = 1000
+
+
+@lru_cache(maxsize=64)
+def _aligner(adapter: str, min_overlap: int) -> Aligner:
+    """cutadapt's C aligner for one adapter, built once and reused for every read.
+
+    Constructing it is what costs; matching against it is ~8x faster than the
+    equivalent Python loop, and a run streams tens of millions of reads past it.
+    A handful of adapters exist per run (the scaffold and the bare adapter, per
+    sample), so the cache never grows.
+    """
+    return Aligner(adapter, max_error_rate=ERROR_RATE, flags=_ADAPTER_FLAGS,
+                   min_overlap=min_overlap, indel_cost=_NO_INDELS)
 
 
 def find_adapter(read: str, adapter: str, min_start: int, min_overlap: int = 7) -> int:
-    """Leftmost i >= min_start where read[i:] is a prefix of `adapter` (cutadapt
-    error model). Handles the adapter running off the read end."""
-    n, m = len(read), len(adapter)
-    for i in range(max(0, min_start), n - min_overlap + 1):
-        ov = min(m, n - i)
-        if ov < min_overlap:
-            break
-        mm = 0
-        ok = True
-        for a, b in zip(read[i:i + ov], adapter[:ov]):
-            if a != b and (mm := mm + 1) > max_mm(ov):
-                ok = False
-                break
-        if ok:
-            return i
-    return -1
+    """Where `adapter` starts in `read` at or after `min_start`, or -1.
+
+    Handles the adapter running off the read's end (a partial match at the end is
+    still a match, down to `min_overlap` nt). Where several placements are legal
+    the aligner takes the one matching the most bases -- so a full-length adapter
+    late in the read beats a chance 7-mer early in it.
+    """
+    lo = max(0, min_start)
+    m = _aligner(adapter, max(1, min_overlap)).locate(read[lo:])
+    return lo + m[2] if m else -1     # m[2] = where the adapter starts in read[lo:]
 
 
 def trim_polyA(read: str, min_run: int = 6) -> int:

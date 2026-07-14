@@ -3,6 +3,11 @@
 # Pinned only where a pin is load-bearing:
 #   python >=3.10   -- match statements / X | None annotations
 #   pysam, ncls     -- the QC interval index and BAM reader
+#   cutadapt <6     -- NOT run as a tool: `ribomine.arch.trim` imports its C aligner
+#                      (cutadapt.align.Aligner) and drives it with RiboMine's own
+#                      trimming logic. `cutadapt.align` is not a stability-guaranteed
+#                      API and it was last reshaped in 5.0, hence the bounds.
+#   xopen           -- gzip through pigz/igzip instead of Python's gzip module
 #   sra-tools       -- prefetch/fasterq-dump, the fallback download route
 #   aria2           -- multi-connection HTTPS, the fast route (see docs/DOWNLOAD.md)
 #   umi_tools       -- optional UMI deduplication (off by default)
@@ -26,7 +31,8 @@ dependencies:
   - star>=2.7.10
   - bowtie2>=2.5
   - samtools>=1.19
-  - cutadapt>=4.6
+  - cutadapt>=5.0,<6           # imported as a library (see above), not run as a tool
+  - xopen>=1.7
   - umi_tools>=1.1.4
 
   # --- SRA / ENA download

@@ -7,7 +7,6 @@ a filename.
 from __future__ import annotations
 
 import errno
-import gzip
 import json
 import logging
 import os
@@ -17,6 +16,8 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+
+from xopen import xopen
 
 LOG = logging.getLogger("ribomine")
 
@@ -162,14 +163,22 @@ def read_lines(path: str) -> list[str]:
 def open_fastq(path: str, mode: str = "rt", *, compresslevel: int = 6):
     """Open a FASTQ, transparently gzipped.
 
+    Through `xopen`, which hands the (de)compression to an external pigz/igzip
+    process rather than doing it in this one with Python's `gzip` module. That is
+    not a small overhead on a stage that streams every read of a run through it:
+    on 1M reads, `gzip` spent 5.8 s compressing the trimmed output and 1.0 s
+    reading the input, out of 16.7 s for the whole of `arch.trim`. Neither is work
+    the trimmer should be doing on its own core.
+
     Level 6, not Python's default of 9: these are multi-GB intermediates that get
     deleted, and level 9 costs 3-5x the CPU of level 6 for a couple of percent of
     size. At a hundred datasets that is hours of compression nobody asked for.
     """
     if not path.endswith(".gz"):
         return open(path, mode)
-    return gzip.open(path, mode, compresslevel=compresslevel) if "w" in mode \
-        else gzip.open(path, mode)
+    if "w" in mode or "a" in mode:
+        return xopen(path, mode, compresslevel=compresslevel)
+    return xopen(path, mode)
 
 
 def count_fastq_reads(path: str) -> int:

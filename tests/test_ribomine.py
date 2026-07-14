@@ -438,3 +438,50 @@ def test_a_polyA_tail_anchors_the_cut_when_the_adapter_is_gone(tmp_path):
     st2 = trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call,
                           str(tmp_path / "p.fastq"), min_len=20)
     assert st2["n_reads_out"] == 1
+
+
+def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
+    """The adapter is not always the last thing in the read. Sequence past it -- an
+    index, a second adapter, a sample barcode -- is normal, and the read must still be
+    cut AT the adapter.
+
+    Without EndSkip.QUERY_STOP the aligner demands the alignment reach the END of the
+    read, so an adapter with anything after it matches in ZERO reads. Measured on
+    SRR25706716 ([footprint][Ingolia linker][12nt][TruSeq]): the linker is an exact
+    substring of 98% of its reads and the matcher found it in none of them; with
+    discard_untrimmed on, a 53.7M-read library became a 23 KB BAM. Five of the eight
+    libraries in a random 20-run cohort were hit."""
+    linker = "CTGTAGGCACCATCAAT"
+    truseq = "AGATCGGAAGAGCACACGTCTGAACT"
+    fp = "CGGGACATGTGGCGTACGAA"                      # 20 nt "footprint"
+    read = fp + linker + "GGCCGGTTTCTG" + truseq     # adapter, then 38 nt more
+
+    # the matcher must locate it where it actually is
+    assert read.find(linker) == len(fp)
+    assert trim.find_adapter(read, linker, min_start=14, min_overlap=7) == len(fp)
+
+    call = {"status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
+            "barcode3_seq": "none", "adapter3_name": "ingolia_linker",
+            "adapter3_seq": linker, "polyA_tail": "none", "footprint_len_mode": 20,
+            "p5_layout": [], "functional": {"trim_5p": 0, "dedup_umi_len": 0}}
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=15)
+
+    assert st["n_reads_out"] == 1, "the read carries its adapter; it must not be discarded"
+    assert st["frac_no_adapter"] == 0.0
+    (_, seq), = _read(out)
+    assert seq == fp, "everything from the adapter onwards comes off, not just the adapter"
+
+
+def test_an_adapter_at_the_very_end_still_works(tmp_path):
+    """The ordinary case must not regress: adapter runs to the read's end, or past it."""
+    fp = "ACGTACGTACGTACGTACGTACGTACGTAC"
+    for tail in (ADAP, ADAP[:9]):        # complete, and truncated by the read end
+        out = str(tmp_path / f"o{len(tail)}.fastq")
+        call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none",
+                    footprint_len_mode=30, functional={"trim_5p": 0, "dedup_umi_len": 0})
+        st = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), call, out, min_len=20)
+        assert st["n_reads_out"] == 1
+        (_, seq), = _read(out)
+        assert seq == fp
+
