@@ -97,6 +97,34 @@
     "star_index": "/path/to/price2-expansive/resources/indexes/STAR-index"
   },
 
+  "qc": {
+    "_min_unique_frac": [
+      "0.15 IS RIBOMINE'S OWN DEFAULT. It is written out here, explicitly, because it",
+      "was reviewed against real evidence and DELIBERATELY LEFT ALONE -- so that the",
+      "next person to find that evidence does not read it as an oversight and 'fix' it.",
+      "",
+      "The evidence (pilot, 2026-07-14, 18 runs): two runs were rejected by this gate",
+      "ALONE, with every other signal saying ribosome profiling. SRR26410348 -- 61%",
+      "in-frame, TVD 0.28, 71% of genic reads in CDS, a 30 nt footprint, 99.5% sense,",
+      "and 2.6M projected usable reads -- failed at 13.2% unique against this 15% cut.",
+      "SRR23563665 likewise at 6.7%. That was 2 of the 8 runs that passed the signal",
+      "tests: a quarter of the real ribo-seq in the pilot, and on the order of a",
+      "thousand runs across the 8,904 strong-tier candidates.",
+      "",
+      "The call: keep 0.15. A library that maps at 13% is dirty whatever its",
+      "mappable minority does, and with ~8,900 candidates the cohort can afford",
+      "precision over recall. The gate is doing what it was tuned to do (that cohort:",
+      "median 42% unique, p10 20%, broken libraries <10%).",
+      "",
+      "If you ever want them back, the honest lever is not this number but",
+      "`projected_usable_reads`, which RiboMine already computes: it measures the thing",
+      "the gate is a proxy FOR. And note the cost of changing your mind late -- the",
+      "verdict is cached in qc.json and the BAM behind it is deleted, so re-deciding",
+      "means re-running the whole QC pass over every run."
+    ],
+    "min_unique_frac": 0.15
+  },
+
   "download": {
     "_connections": [
       "PER RUN -- and 28 runs download at once on each of 8 nodes, so the sockets",
