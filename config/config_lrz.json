@@ -1,0 +1,99 @@
+{
+  "_README": [
+    "RiboMine on LRZ CoolMUC-4 (SLURM). Submit from a login node with:",
+    "    slurm/master.sh config/config_lrz.json",
+    "",
+    "This is an ORDINARY RiboMine config -- `ribomine run -c` accepts it as-is.",
+    "The `_slurm` block below is a comment as far as RiboMine is concerned (config.py",
+    "ignores every key starting with '_'); it is read by slurm/master.sh alone. Keeping",
+    "it here means the cluster shape and the pipeline settings cannot drift apart.",
+    "",
+    "BEFORE THE FIRST SUBMIT, check the three `reference` paths below. slurm/prep.sh",
+    "validates them and fails in minutes rather than letting a 24 h job die on a typo."
+  ],
+
+  "_slurm": {
+    "_": "Read by slurm/master.sh only. 2 jobs x 4 nodes x 112 cores = 896 cores.",
+    "_limits": [
+      "cm4_std: 2-4 nodes PER JOB (max 448 cores), 2 jobs running at once, 24 h.",
+      "So 896 cores is not one job -- it is an ARRAY OF 2, each 4 nodes wide.",
+      "cm4 nodes: 112 physical cores, 488 GiB, exclusive on cm4_std."
+    ],
+    "job_prefix": "rm-",
+    "conda_env": "ribomine",
+    "mail_user": "",
+
+    "jobs": 2,
+    "nodes_per_job": 4,
+    "cpus_per_node": 112,
+    "mem_per_node": "480G",
+    "time": "24:00:00",
+
+    "prep_cpus": 28,
+    "prep_time": "12:00:00",
+    "merge_cpus": 28,
+    "merge_time": "04:00:00"
+  },
+
+  "project": {
+    "name": "ribomine-lrz",
+    "_workdir": [
+      "The ROOT. Per-node workdirs are <workdir>/shards/work_NN -- one per node, so",
+      "the eight `ribomine run` processes never write the same file. slurm/merge.sh",
+      "then builds <workdir>/merged/, from which the cohort-wide tables are written.",
+      "Heavy I/O, so DSS (not $HOME): a 500-run cohort moves several TB through here."
+    ],
+    "workdir": "/path/to/dss/ribomine/all",
+    "_jobs": [
+      "28 x 8 = 224 = the node's LOGICAL core count (112 physical + hyperthreads),",
+      "so this is deliberately twice as many samples in flight as there are physical",
+      "cores. It should be: the stage spends much of its time blocked on an ENA",
+      "download, and a sample that is waiting on the network is not using a core --",
+      "the other 27 can. Oversubscription is the point, not an accident.",
+      "It costs memory, though: ~28 GB for the node's one shared STAR genome plus",
+      "roughly 8 GB per sample in flight, so budget ~250 GB of the node's 480 GB.",
+      "If a node starts swapping, this is the number to cut."
+    ],
+    "jobs": 28,
+    "threads": 8
+  },
+
+  "pipeline": {
+    "_end": [
+      "Set to 'qc' for the cheap first pass: it streams a 200k-read sample per run",
+      "instead of downloading anything, so a whole archive-wide screen costs hours",
+      "rather than days, and tells you how many of the hits are real Ribo-seq before",
+      "you spend a cohort's worth of bandwidth on them. Then set it to 'bam' and",
+      "resubmit -- resume reuses every QC verdict."
+    ],
+    "start": "query",
+    "end": "bam"
+  },
+
+  "reference": {
+    "_": "CHECK THESE. The STAR index must have been built with --sjdbGTFfile, or there is no gene-count matrix (prep.sh says so if it was not).",
+    "species": "Homo sapiens",
+    "taxon_id": 9606,
+    "genome_fasta": "/path/to/index_files/homo_sapiens.90.fasta",
+    "gtf": "/path/to/index_files/homo_sapiens.90.gtf",
+    "star_index": "/path/to/index_files/STAR-index"
+  },
+
+  "download": {
+    "_connections": [
+      "PER RUN -- and 28 runs download at once on each of 8 nodes, so the sockets",
+      "open against ENA at peak are 8 nodes * 28 runs * this. At 4 that is ~900,",
+      "already a lot to point at one host; RiboMine's own default of 8 would be",
+      "~1800. Lowering it costs less than it looks: the per-run connection count",
+      "exists to beat ENA's ~12 MB/s per-stream cap, and with 224 runs already in",
+      "flight the link saturates long before any single one of them does.",
+      "If downloads start failing (they show up in failed.tsv and in",
+      "mapping_summary.tsv), this is still the first knob to turn -- downwards."
+    ],
+    "connections": 4
+  },
+
+  "keep": {
+    "bam": true
+  }
+}

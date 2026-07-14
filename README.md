@@ -292,11 +292,32 @@ ribomine/
     dedup.py        optional UMI deduplication
   data/             the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt)
   reports.py        the TSVs
+slurm/            the LRZ CoolMUC-4 job chain (submitter, prep, run, merge)
+scripts/          what wraps RiboMine there: the cohort split, and the merge
 docs/
   DOWNLOAD.md       how to get data out of the SRA fast, with measurements
   ARCHITECTURE.md   how the read-architecture call works
   INTERFACES.md     the internal module contract
+  SLURM.md          896 cores on LRZ, and what you have to do first
 ```
+
+## At scale: LRZ CoolMUC-4
+
+A cohort of hundreds of runs is a multi-day, multi-terabyte job, so on the cluster
+RiboMine runs as a SLURM chain rather than as one `ribomine run`: 8 nodes × 112
+cores, **one RiboMine per node** (they share a node's STAR genome, so a second one
+would pull the index out from under the first), each over its own shard of the
+cohort. `docs/SLURM.md` is the walk-through — including the four things to check
+before the first submit.
+
+```bash
+slurm/master.sh config/config_lrz.json          # prep -> run -> merge
+slurm/master.sh config/config_lrz.json run      # the next round, until status.txt says COMPLETE
+```
+
+Do the `end: "qc"` pass first. It never downloads a run, so screening the whole
+archive costs hours rather than days — and it is what tells you which of the
+thousands of hits are worth the bandwidth.
 
 ## Credits
 
