@@ -6,7 +6,6 @@
     ribomine run -c config.json --from accessions --accessions runs.txt
     ribomine query -c config.json           # just the SRA search -> candidates.tsv
     ribomine setup -c config.json           # build the annotation + contaminant indexes
-    ribomine benchmark SRR12285169          # time every download route, pick the fastest
 
 Everything the CLI can set also lives in the config; the flags exist so a config
 does not have to be edited to move an end point. A flag always wins over the file.
@@ -107,10 +106,6 @@ def main(argv: list[str] | None = None) -> int:
     i = sub.add_parser("init-config", help="write a config file with every default")
     i.add_argument("path", nargs="?", default="config.json")
 
-    # -- benchmark ----------------------------------------------------------
-    b = common(sub.add_parser("benchmark", help="time each SRA download route"))
-    b.add_argument("accession", help="a run accession to benchmark with (a small one is fine)")
-
     a = p.parse_args(argv)
 
     try:
@@ -151,17 +146,6 @@ def _dispatch(a: argparse.Namespace) -> int:
         bundled = not (a.contaminant_fasta or cfg.ref("contaminant_fasta"))
         print(f"contaminant FASTA: {fa}" + ("  (bundled with RiboMine)" if bundled else ""))
         print(f"contaminant index: {contaminants.build_index(fa, cfg)}")
-        return 0
-
-    if a.cmd == "benchmark":
-        from .sra import download
-        rows = download.benchmark(a.accession, cfg)
-        w = max(len(r["route"]) for r in rows)
-        print(f"\n{'route':<{w}}  {'MB/s':>7}  {'seconds':>8}  note")
-        for r in sorted(rows, key=lambda x: -(x.get("mb_per_s") or 0)):
-            mbps = f"{r['mb_per_s']:.1f}" if r.get("mb_per_s") else "—"
-            secs = f"{r['seconds']:.1f}" if r.get("seconds") else "—"
-            print(f"{r['route']:<{w}}  {mbps:>7}  {secs:>8}  {r.get('note', '')}")
         return 0
 
     raise AssertionError(f"unhandled command {a.cmd}")

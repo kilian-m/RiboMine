@@ -1,24 +1,30 @@
 # Getting data out of the SRA, fast
 
-Downloading is the slowest part of mining the SRA, and the route you pick matters
-more than your bandwidth does. This is what RiboMine does and why — all numbers
+Downloading is the slowest part of mining the SRA, and the route matters more than
+your bandwidth does. RiboMine does not make you choose one, and does not offer a
+knob to change it: one route is several times faster than the others everywhere we
+measured, so it is simply *the* route. This is which one and why — all numbers
 measured on the machine RiboMine was developed on (a German university host, July
-2026), not copied from a blog post. Re-measure on your own link with:
-
-```bash
-ribomine benchmark SRR618773 -c config.json
-```
+2026), not copied from a blog post.
 
 ## The short version
 
-| | route | what it does |
-|---|---|---|
-| 1 | **`ena_https`** | ENA's own gzipped FASTQ, pulled with 16 parallel connections |
-| 2 | **`aws_odp`** | SRA's Open Data mirror on S3 (anonymous HTTPS), then `fasterq-dump` |
-| 3 | **`prefetch`** | the SRA toolkit. Always works, never fastest. |
+**RiboMine downloads from ENA over HTTPS with 16 parallel connections.** That is the
+whole policy.
 
-RiboMine walks that chain (`download.routes`) and takes the first route that can
-serve the accession. Do not reorder it without measuring.
+The catch is that ENA does not mirror *every* run, and a run we cannot fetch is a run
+we cannot mine — so two more routes sit behind it, tried in order when the one above
+cannot serve the accession at all:
+
+| | route | when it runs |
+|---|---|---|
+| 1 | **`ena_https`** | always, when ENA has the run — ENA's own gzipped FASTQ |
+| 2 | `aws_odp` | ENA has no mirror. SRA's Open Data bucket on S3 (anonymous HTTPS), then `fasterq-dump` |
+| 3 | `prefetch` | neither of the above. The SRA toolkit: always works, never fastest |
+
+That is a fallback for **availability, not a preference for speed** — 2 and 3 are the
+slow routes, and they run only when route 1 has nothing to give. Do not reorder the
+chain without re-measuring; the ordering is what the rest of this document is about.
 
 ## Measured
 

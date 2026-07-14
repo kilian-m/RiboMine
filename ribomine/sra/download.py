@@ -17,16 +17,21 @@ file decompresses to a prefix of the reads; we simply stop reading.
   slice; that trips a warning, and `qc.scan_reads: 0` reservoir-samples the whole
   run instead.
 
-**The full dataset (processing stage).** Here the route matters, and the routes
-are not equal. See `docs/DOWNLOAD.md` for the measurements; the ranking they
-produced is the default `download.routes` chain:
+**The full dataset (processing stage).** ENA over HTTPS with parallel connections
+wins, and it is not close -- see `docs/DOWNLOAD.md` for the measurements. So there
+is no route to choose and nothing to tune: `ena_https` is simply the route.
 
   1. `ena_https`  -- ENA serves the submitter's own FASTQ directly. No .sra
                      container to convert, and `aria2c -x16` opens 16 ranged
                      connections, which is what actually beats the throttle: a
                      single HTTPS stream is capped server-side, so parallelism
-                     buys far more than bandwidth does. Not every SRA run is
-                     mirrored on ENA, hence the fallbacks.
+                     buys far more than bandwidth does.
+
+The two routes below it exist for *availability*, not speed: ENA does not mirror
+every run (recent releases, dbGaP), and a run we cannot fetch is a run we cannot
+mine. They are tried, in order, only when the one above them cannot serve the
+accession at all. Nobody picks between them.
+
   2. `aws_odp`    -- SRA's Open Data mirror on S3 (`s3://sra-pub-run-odp`),
                      no-sign-request and no egress charge to the downloader.
                      Delivers a .sra that `fasterq-dump` converts locally.
@@ -54,11 +59,18 @@ from . import metadata
 # the read sample
 # ---------------------------------------------------------------------------
 def _open_stream(src: str):
-    """(binary FASTQ text stream, process-or-None). `src` is a URL or a path."""
+    """(binary FASTQ text stream, process-or-None). `src` is a URL or a path.
+
+    NOTE the absence of `--retry`. curl is writing into a PIPE, and a curl retry
+    restarts the transfer from byte 0 -- into that same pipe. The reader would then
+    get the head of the file spliced into the middle of the gzip stream: not a
+    recovered download, a corrupt one. On a pipe the retry has to re-open the whole
+    stream (which is what `sample_reads` does), so curl is told to fail honestly and
+    say why (`--show-error`) instead of trying to fix it here.
+    """
     if src.startswith("http"):
         proc = subprocess.Popen(
-            ["curl", "-sL", "--fail", "--retry", "3", "--retry-delay", "2",
-             "--max-time", "7200", src],
+            ["curl", "-sL", "--fail", "--show-error", "--max-time", "7200", src],
             stdout=subprocess.PIPE)
         return gzip.GzipFile(fileobj=proc.stdout), proc
     if src.endswith(".gz"):
@@ -111,9 +123,46 @@ def _reservoir(stream, scan: float, n: int, rng: random.Random):
     return keep, seen, order
 
 
+def _stream_once(src: str, limit: float, n: int, rng: random.Random):
+    """One attempt: open the stream, reservoir-sample it, and always tear it down.
+
+    Raises EOFError/OSError if the stream breaks -- which, over HTTPS, means the
+    connection dropped and the caller should open a fresh one.
+    """
+    stream, proc = _open_stream(src)
+    try:
+        return _reservoir(stream, limit, n, rng)
+    finally:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001 -- we are already unwinding; the read result
+            pass           # (or the error) is what matters, not the closing of a pipe
+        if proc is not None:
+            if proc.stdout:
+                proc.stdout.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 def sample_reads(source: str, out_fastq: str, *, n: int = 200_000,
-                 scan: int = 1_000_000, seed: int = 20260712) -> dict:
-    """Reservoir-sample `n` reads from an accession (streamed) or a local FASTQ."""
+                 scan: int = 1_000_000, seed: int = 20260712,
+                 tries: int = 4, backoff_s: float = 5.0) -> dict:
+    """Reservoir-sample `n` reads from an accession (streamed) or a local FASTQ.
+
+    A dropped connection re-opens the stream and samples again from the start, up to
+    `tries` times. It has to be re-opened rather than resumed: the sample is a uniform
+    draw over the run's first `scan` reads, and a resume would splice two draws with
+    different denominators together. Re-reading a few tens of MB is cheap; getting the
+    sample subtly wrong is not.
+
+    The retry is here, and not in curl, on purpose -- see `_open_stream`. Without it a
+    single truncated stream permanently fails the run: measured at ~10% of a 20-run
+    batch when four samples stream at once, which is a tenth of a mining cohort lost to
+    a transient.
+    """
     if os.path.exists(source):
         src = source
     else:
@@ -127,23 +176,23 @@ def sample_reads(source: str, out_fastq: str, *, n: int = 200_000,
         LOG.debug("streaming %s", src)
 
     limit = float("inf") if scan <= 0 else scan
-    stream, proc = _open_stream(src)
-    rng = random.Random(seed)
-    try:
-        keep, seen, order = _reservoir(stream, limit, n, rng)
-    finally:
+    local = os.path.exists(src)
+    for attempt in range(1, tries + 1):
+        rng = random.Random(seed)          # the same draw every attempt, by construction
         try:
-            stream.close()
-        except Exception:  # noqa: BLE001
-            pass
-        if proc is not None:
-            if proc.stdout:
-                proc.stdout.close()
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            keep, seen, order = _stream_once(src, limit, n, rng)
+            break
+        except (EOFError, OSError, gzip.BadGzipFile) as exc:
+            # A truncated gzip stream is what a dropped HTTPS connection looks like from
+            # in here. A local file that does this is genuinely corrupt, so it is not
+            # retried -- re-reading it would fail identically, four times.
+            if local or attempt == tries:
+                raise RuntimeError(
+                    f"{source}: could not stream a read sample ({exc})") from exc
+            wait = backoff_s * attempt
+            LOG.warning("[%s] read-sample stream broke (%s); retrying in %.0fs (%d/%d)",
+                        source, exc, wait, attempt, tries - 1)
+            time.sleep(wait)
 
     if not keep:
         raise RuntimeError(f"no reads obtained from {source}")
@@ -382,11 +431,14 @@ def _fasterq(sra: str, acc: str, cfg: Config, log: str = "") -> str:
     raise RuntimeError(f"fasterq-dump produced no FASTQ for {acc}")
 
 
-ROUTES = {
-    "ena_https": route_ena_https,
-    "aws_odp": route_aws_odp,
-    "prefetch": route_prefetch,
-}
+# ENA first because it is the fastest by a wide margin; the other two are the
+# fallback for the runs ENA has not mirrored, tried in order. Not a preference --
+# an availability chain. Do not reorder without re-reading docs/DOWNLOAD.md.
+ROUTES = (
+    ("ena_https", route_ena_https),
+    ("aws_odp", route_aws_odp),
+    ("prefetch", route_prefetch),
+)
 
 
 def download_full(acc: str, out_fastq_gz: str, cfg: Config, *, log: str = "") -> dict:
@@ -396,15 +448,10 @@ def download_full(acc: str, out_fastq_gz: str, cfg: Config, *, log: str = "") ->
         return {"route": "cached", "bytes": os.path.getsize(out_fastq_gz),
                 "seconds": 0.0, "mb_per_s": None, "attempts": 0}
 
-    want = cfg["download.route"]
-    chain = list(cfg["download.routes"]) if want == "auto" else [want]
     os.makedirs(cfg.tmpdir, exist_ok=True)
 
     errors = []
-    for attempt, name in enumerate(chain, 1):
-        fn = ROUTES.get(name)
-        if fn is None:
-            raise ValueError(f"unknown download route {name!r}; known: {sorted(ROUTES)}")
+    for attempt, (name, fn) in enumerate(ROUTES, 1):
         t0 = time.time()
         try:
             info = _with_retries(fn, acc, out_fastq_gz, cfg, log)
@@ -444,31 +491,3 @@ def _with_retries(fn, acc: str, out: str, cfg: Config, log: str):
             LOG.info("[%s] retry %d/%d in %.0fs (%s)", acc, i + 1, tries, wait, exc)
             time.sleep(wait)
     raise last  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# `ribomine benchmark`
-# ---------------------------------------------------------------------------
-def benchmark(acc: str, cfg: Config) -> list[dict]:
-    """Time every route on one run. The numbers depend on the site's link and on
-    what the archives are doing that day, so measure rather than trust a table."""
-    rows = []
-    for name, fn in ROUTES.items():
-        out = os.path.join(cfg.tmpdir, f"bench.{name}.{acc}.fastq.gz")
-        rm(out)
-        t0 = time.time()
-        try:
-            fn(acc, out, cfg, "")
-            dt = time.time() - t0
-            size = os.path.getsize(out)
-            rows.append({"route": name, "seconds": dt, "bytes": size,
-                         "mb_per_s": size / 1e6 / max(dt, 1e-9), "note": ""})
-        except RouteUnavailable as exc:
-            rows.append({"route": name, "seconds": None, "bytes": None,
-                         "mb_per_s": None, "note": f"unavailable: {exc}"})
-        except Exception as exc:  # noqa: BLE001
-            rows.append({"route": name, "seconds": None, "bytes": None,
-                         "mb_per_s": None, "note": f"failed: {str(exc)[:60]}"})
-        finally:
-            rm(out)
-    return rows

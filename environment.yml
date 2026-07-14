@@ -44,6 +44,3 @@ dependencies:
 
   # --- dev
   - pytest>=7.4
-  - pip
-  - pip:
-      - kingfisher>=0.4.1      # multi-route SRA fetcher, used as a last-resort route

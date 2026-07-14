@@ -44,11 +44,10 @@ def sample_reads(source: str, out_fastq: str, *, n: int, scan: int, seed: int) -
     (scan=0 => whole file). Returns {'n_sampled', 'n_scanned', 'sorted_warning', 'source'}."""
 
 def download_full(acc: str, out_fastq_gz: str, cfg: Config, *, log: str = "") -> dict
-    """Full run, fastest working route (see docs/DOWNLOAD.md). Returns
-    {'route', 'bytes', 'seconds', 'mb_per_s', 'attempts'}. Idempotent: returns
-    immediately if out_fastq_gz already exists and is non-empty."""
-
-def benchmark(acc: str, cfg: Config) -> list[dict]   # one row per route, for `ribomine benchmark`
+    """Full run over ENA+aria2c, falling back to the SRA mirrors only for runs ENA
+    has not mirrored (see docs/DOWNLOAD.md). Returns {'route', 'bytes', 'seconds',
+    'mb_per_s', 'attempts'}. Idempotent: returns immediately if out_fastq_gz
+    already exists and is non-empty."""
 ```
 
 ## ribomine.qc.annotation

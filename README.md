@@ -179,22 +179,21 @@ run it on a library whose architecture found no random-templated content.
 
 ## Downloading
 
-Route matters more than bandwidth. Measured on this machine, **ENA over HTTPS with 16
-parallel connections is 7–18× faster than the `prefetch` route most pipelines
-default to**, because a single TCP stream is throttled server-side at ~12 MB/s and
-`prefetch` opens exactly one. RiboMine walks a fallback chain — ENA → AWS Open Data →
-SRA toolkit — and verifies the md5 ENA hands back in the same call as the URL.
+Route matters more than bandwidth, so RiboMine picks the route for you: **ENA over
+HTTPS with 16 parallel connections**, which measured 7–18× faster than the `prefetch`
+route most pipelines default to, because a single TCP stream is throttled server-side
+at ~12 MB/s and `prefetch` opens exactly one. There is no route setting — nothing
+about that ranking is site-specific enough to be worth a knob. The md5 ENA hands back
+in the same call as the URL is verified.
 
-`docs/DOWNLOAD.md` has the numbers, the coverage measurements (published human
-Ribo-seq is 99.97 % mirrored on ENA), and the landmines — including that
-`prefetch --max-size` **exits 0 when it skips an oversized run**, and that SRA Lite
-carries fake quality scores.
+ENA does not mirror quite everything (published human Ribo-seq is 99.97 % covered;
+dbGaP and the last few weeks of releases are not), so runs it does not have fall back
+to AWS Open Data and then the SRA toolkit, automatically. That chain is about
+*availability*, not speed.
 
-Benchmark your own link:
-
-```bash
-ribomine benchmark SRR618773 -c config.json
-```
+`docs/DOWNLOAD.md` has the numbers, the coverage measurements, and the landmines —
+including that `prefetch --max-size` **exits 0 when it skips an oversized run**, and
+that SRA Lite carries fake quality scores.
 
 ## Configuration
 

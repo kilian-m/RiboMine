@@ -96,10 +96,10 @@ DEFAULTS: dict[str, Any] = {
     },
 
     "download": {
-        # route for the FULL-dataset download in the processing stage.
-        # "auto" walks the fallback chain in `routes` order, first one that works.
-        "route": "auto",
-        "routes": ["ena_https", "aws_odp", "prefetch"],
+        # The FULL-dataset download always goes to ENA over HTTPS -- it is several
+        # times faster than any other route (docs/DOWNLOAD.md), so there is nothing
+        # to choose. Runs ENA has not mirrored fall back to the SRA mirrors
+        # automatically; that is availability, not a setting.
         "connections": 8,        # parallel connections per file (aria2c / range-GET)
         "max_retries": 4,
         "retry_backoff_s": 5,

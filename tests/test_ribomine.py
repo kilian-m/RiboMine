@@ -8,6 +8,7 @@ the stage graph, the query's tiered text filter, and the trimming/UMI invariants
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -497,4 +498,67 @@ def test_an_adapter_at_the_very_end_still_works(tmp_path):
         assert st["n_reads_out"] == 1
         (_, seq), = _read(out)
         assert seq == fp
+
+
+# --- the streamed read sample ------------------------------------------------
+def _fake_fastq_bytes(n: int) -> bytes:
+    return b"".join(b"@r%d\nACGTACGTAC\n+\nIIIIIIIIII\n" % i for i in range(n))
+
+
+class _BrokenStream:
+    """What a dropped HTTPS connection looks like from inside gzip."""
+
+    def readline(self):
+        raise EOFError("Compressed file ended before the end-of-stream marker was reached")
+
+    def close(self):
+        pass
+
+
+def test_a_dropped_read_sample_stream_is_retried_not_lost(tmp_path, monkeypatch):
+    """A truncated stream permanently failed the run before this: measured at 2 of 20
+    runs when four samples stream at once. A tenth of a mining cohort is not an
+    acceptable price for a transient, and curl cannot retry it -- it is writing to a
+    pipe, so its retry would splice the head of the file into the middle of the gzip
+    stream rather than recover anything."""
+    import io
+
+    from ribomine.sra import download
+
+    monkeypatch.setattr(download.metadata, "fastq_urls",
+                        lambda acc: ["https://ena.example/x.fastq.gz"])
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        if len(opened) == 1:
+            return _BrokenStream(), None          # the connection drops
+        return io.BytesIO(_fake_fastq_bytes(50)), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    out = str(tmp_path / "s.fastq")
+    st = download.sample_reads("SRRFAKE", out, n=10, scan=1000, seed=1, backoff_s=0)
+
+    assert len(opened) == 2, "the stream must be re-OPENED, not resumed"
+    assert st["n_sampled"] == 10
+    assert os.path.getsize(out) > 0
+
+
+def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
+    """Re-reading a corrupt file on disk fails identically every time. Retrying it is
+    pure latency, and it hides the fact that the file -- not the network -- is broken."""
+    from ribomine.sra import download
+
+    local = tmp_path / "reads.fastq"
+    local.write_bytes(_fake_fastq_bytes(5))
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        return _BrokenStream(), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    with pytest.raises(RuntimeError, match="could not stream a read sample"):
+        download.sample_reads(str(local), str(tmp_path / "o.fastq"), n=10, backoff_s=0)
+    assert len(opened) == 1, "a local file is not a flaky network"
 

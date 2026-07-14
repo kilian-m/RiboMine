@@ -75,12 +75,6 @@
     "ncbi_email": null
   },
   "download": {
-    "route": "auto",
-    "routes": [
-      "ena_https",
-      "aws_odp",
-      "prefetch"
-    ],
     "connections": 8,
     "max_retries": 4,
     "retry_backoff_s": 5,
