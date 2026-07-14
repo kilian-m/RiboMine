@@ -740,3 +740,122 @@ def test_resume_does_not_re_download_a_run_whose_bam_was_deleted_on_purpose(tmp_
     assert is_processed(dropped, s), "a finished sample with no BAM is still done"
     assert not is_processed(kept, s), "but a BAM that was meant to be kept and is not there is a re-run"
 
+
+# --- bowtie2 thread cap ------------------------------------------------------
+def test_bowtie2_is_capped_at_eight_threads_because_un_corrupts(monkeypatch, tmp_path):
+    """bowtie2's `--un` file interleaves its records across worker threads past a
+    handful of them. The result is a corrupt FASTQ, not an error -- and those reads are
+    exactly the reads we go on to map, so the damage is silent and lands in the BAM.
+    project.threads is 24+ on a big box, so this cap is the only thing between a fast
+    machine and quietly wrong data."""
+    from ribomine.qc import contaminants
+
+    seen = {}
+
+    class _Proc:
+        stderr = "100 reads; of these:\n  40 (40.00%) aligned exactly 1 time\n"
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = [str(c) for c in cmd]
+        return _Proc()
+
+    monkeypatch.setattr(contaminants, "run", fake_run)
+    monkeypatch.setattr(contaminants, "_bowtie2_bin", lambda: "bowtie2")
+
+    contaminants._run_bowtie2("in.fq", "idx", str(tmp_path / "un.fq"), threads=24)
+    cmd = seen["cmd"]
+    assert "--un" in cmd, "the cap exists BECAUSE of --un; if it goes, revisit the cap"
+    assert cmd[cmd.index("-p") + 1] == "8", f"24 threads must be capped to 8: {cmd}"
+
+    # ... and a smaller request is honoured, not inflated to the cap
+    contaminants._run_bowtie2("in.fq", "idx", str(tmp_path / "un.fq"), threads=4)
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-p") + 1] == "4"
+
+
+def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, tmp_path):
+    """The counts are an exact integrity check on --un: bowtie2 read N and aligned M, so
+    --un must hold N-M reads. If it does not, the file is corrupt -- and it is the file
+    we map. Silently mapping N-M-k reads would show up as an inexplicable read count ten
+    steps downstream, if anyone noticed at all."""
+    from ribomine.qc import contaminants
+
+    idx = tmp_path / "idx.1.bt2"
+    idx.write_bytes(b"x")
+    (tmp_path / "in.fastq").write_text("@r\nACGT\n+\nIIII\n")
+
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)},
+                             "reference": {"contaminant_index": str(tmp_path / "idx")}})
+
+    # bowtie2 claims 100 reads, 40 aligned -> --un must hold 60 ...
+    monkeypatch.setattr(contaminants, "_run_bowtie2", lambda *a, **k: (100, 40))
+    # ... but the screen only finds 58 records in it: two were lost in the interleave
+    monkeypatch.setattr(contaminants, "_screen",
+                        lambda *a, **k: {"n_in": 58, "n_low_complexity": 0, "n_kept": 58})
+
+    with pytest.raises(RuntimeError, match="--un output is corrupt"):
+        contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "o.fastq"),
+                                  cfg, threads=8)
+
+    # and the honest case passes straight through
+    monkeypatch.setattr(contaminants, "_screen",
+                        lambda *a, **k: {"n_in": 60, "n_low_complexity": 5, "n_kept": 55})
+    st = contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "o.fastq"),
+                                   cfg, threads=8)
+    assert st["n_input"] == 100 and st["n_kept"] == 55
+
+
+# --- the pile-up filter's length-concentration cut ---------------------------
+def _bam(tmp_path, name, reads):
+    """reads = [(chrom, pos, length, n)] -> a tiny coordinate-sorted, indexed BAM."""
+    import pysam
+
+    hdr = {"HD": {"VN": "1.6", "SO": "coordinate"},
+           "SQ": [{"SN": "1", "LN": 1_000_000}]}
+    path = str(tmp_path / name)
+    recs = []
+    for chrom, pos, ln, n in reads:
+        for i in range(n):
+            a = pysam.AlignedSegment()
+            a.query_name = f"{chrom}_{pos}_{ln}_{i}"
+            a.reference_id = 0
+            a.reference_start = pos
+            a.query_sequence = "A" * ln
+            a.query_qualities = pysam.qualitystring_to_array("I" * ln)
+            a.cigarstring = f"{ln}M"
+            a.flag = 0
+            recs.append(a)
+    recs.sort(key=lambda a: a.reference_start)
+    with pysam.AlignmentFile(path, "wb", header=hdr) as out:
+        for a in recs:
+            out.write(a)
+    pysam.index(path)
+    return path
+
+
+def test_a_miRNA_pile_is_removed_but_a_translated_codon_is_not(tmp_path):
+    """A mature miRNA is a ~22nt product that stacks on one 5' base exactly like an
+    adapter dimer -- just a shade less length-concentrated, because Dicer is not perfectly
+    precise. let-7i (SRR25706716) sits at 0.78 and walked straight through the old 0.85
+    cut, keeping 5.4% of that BAM. A translated codon stacks too, but its footprints
+    SPREAD over ~26-34nt -- that spread is the only thing telling the two apart, so the
+    cut must sit between them."""
+    from ribomine.qc import pileups
+
+    # a miRNA-like pile: 800 reads on one base, 78% of them exactly 22nt (lc = 0.78)
+    mirna = [("1", 1000, 22, 624), ("1", 1000, 21, 100), ("1", 1000, 23, 76)]
+    # a translated codon: just as abundant, but its footprints spread across lengths
+    codon = [("1", 5000, 28, 240), ("1", 5000, 29, 200), ("1", 5000, 30, 180),
+             ("1", 5000, 27, 120), ("1", 5000, 31, 60)]
+    # background, so neither pile is a >=10% "dominant" position (a different rule)
+    bg = [("1", 20000 + i * 7, 29, 30) for i in range(300)]
+
+    inp = _bam(tmp_path, "in.bam", mirna + codon + bg)
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)}})
+    st = pileups.filter_bam(inp, str(tmp_path / "out.bam"), cfg, label="t")
+
+    pos = {p["pos"] for p in st["top_pileups"]}
+    assert 1000 in pos, "the miRNA pile (length concentration 0.78) must be removed"
+    assert 5000 not in pos, "a translated codon's footprints spread over lengths -- keep it"
+    assert st["n_reads_removed"] == 800
+

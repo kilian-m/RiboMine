@@ -159,7 +159,18 @@ DEFAULTS: dict[str, Any] = {
         # position pile-up filter (adapter dimers etc; data-driven, no adapter seqs)
         "pileup_min_count": 30,
         "pileup_min_frac": 0.005,
-        "pileup_len_conc": 0.85,
+        # How concentrated on ONE length a position's reads must be before it is called a
+        # fixed contaminant rather than translation. A ribosome footprint pile spreads
+        # over lengths (~26-34 nt); a single molecule does not.
+        #
+        # 0.75, not 0.85: a mature miRNA is a ~22 nt product and piles up exactly like an
+        # adapter dimer, but its length is a shade less concentrated -- let-7i (SRR25706716,
+        # 5.4% of the BAM at one 5' base) sits at 0.78 and walked straight through an 0.85
+        # cut. Measured over the whole cohort, everything in the 0.75-0.85 band is a
+        # contaminant and nothing in it is translation: 2 miRNA loci (let-7i, miR-93) and
+        # RPPH1 (the RNase P RNA) across 10 libraries, and not one CDS or start-codon
+        # position. The 8 clean libraries lose NOTHING at 0.75.
+        "pileup_len_conc": 0.75,
         "pileup_max_frac": 0.10,
     },
 

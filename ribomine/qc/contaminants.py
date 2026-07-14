@@ -49,6 +49,18 @@ BASES = "ACGT"
 GZIP_LEVEL = 6
 FLUSH_RECORDS = 8192          # records buffered per write() -- bounded memory
 
+# bowtie2's `--un` file is written by the worker threads, and past a handful of them
+# their records INTERLEAVE: a FASTQ whose 4-line records are spliced into each other.
+# It is not a crash and not an error code -- it is a corrupt FASTQ that the next step
+# maps without complaint, so the damage surfaces (if at all) as an inexplicable read
+# count or a mangled alignment much later. The reads that survive this filter are the
+# reads we map, so this is the one place in the pipeline where extra threads can
+# silently change the DATA rather than just the speed.
+#
+# 8 is the cap, whatever `project.threads` says. bowtie2 is not the bottleneck of a
+# sample (STAR is), and correctness is not negotiable for throughput.
+BOWTIE2_MAX_THREADS = 8
+
 
 def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                  threads: int = 8, log: str = "") -> dict:
@@ -99,6 +111,21 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
     # a second time just to count its reads (a multi-GB pass in stage 4). bowtie2's
     # own "N reads; of these:" is the cross-check, and the fallback if it moves.
     n_total = n_bowtie_total or (n_contaminant + s["n_in"])
+
+    # ... and that identity is also an exact integrity check on the `--un` file, for
+    # free. bowtie2 says how many reads it read and how many it aligned; every other
+    # read must be in --un. If the file is short, long, or spliced (see
+    # BOWTIE2_MAX_THREADS), the arithmetic stops working -- and these are the reads we
+    # are about to map, so a corrupt one must stop the sample, not quietly become a BAM.
+    if n_bowtie_total:
+        expected = n_bowtie_total - n_contaminant
+        if s["n_in"] != expected:
+            raise RuntimeError(
+                f"{label}: bowtie2's --un output is corrupt -- it read {n_bowtie_total:,} "
+                f"reads and aligned {n_contaminant:,}, so --un must hold {expected:,} "
+                f"reads, but it holds {s['n_in']:,}. These are the reads that would be "
+                f"mapped, so the sample is failed rather than filtered wrongly."
+            )
 
     stats = _stats(label, n_total, n_contaminant=n_contaminant,
                    n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"])
@@ -286,9 +313,15 @@ def _run_bowtie2(fastq: str, index: str, noncontam_fq: str, *, threads: int,
     and RT modifications, without the over-aggressive short-match acceptance that
     a lowered --score-min would bring (which risks removing genuine footprints
     that chance-match a contaminant over ~20 nt).
+
+    Threads are capped at BOWTIE2_MAX_THREADS: `--un` corrupts above that. See there.
     """
     bt2 = _bowtie2_bin()
-    cmd = [bt2, "--local", "--very-sensitive-local", "-p", str(threads),
+    p_threads = max(1, min(int(threads), BOWTIE2_MAX_THREADS))
+    if int(threads) > BOWTIE2_MAX_THREADS:
+        LOG.debug("bowtie2: %d thread(s) requested, using %d (--un corrupts above it)",
+                  int(threads), p_threads)
+    cmd = [bt2, "--local", "--very-sensitive-local", "-p", str(p_threads),
            "-x", index, "-U", fastq, "--un", noncontam_fq, "-S", os.devnull]
     p = run(cmd, log_to=log or None)
     return _parse_bowtie2_summary(p.stderr or "")

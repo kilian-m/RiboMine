@@ -116,7 +116,7 @@
     "max_base_frac": 0.85,
     "pileup_min_count": 30,
     "pileup_min_frac": 0.005,
-    "pileup_len_conc": 0.85,
+    "pileup_len_conc": 0.75,
     "pileup_max_frac": 0.1
   },
   "architecture": {

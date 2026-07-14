@@ -15,6 +15,15 @@ A 5' position is dropped when it is BOTH:
     the reads there (a translated position never is; its footprints vary in
     length).
 
+The same rule catches SMALL RNAs, which is why `pileup_len_conc` is 0.75 and not the
+0.85 it once was. A mature miRNA is a ~22 nt product that stacks on one 5' base exactly
+like an adapter dimer -- but a shade less concentrated in length, because Drosha/Dicer
+processing is not perfectly precise. let-7i in SRR25706716 holds 5.4% of the BAM at a
+length concentration of 0.78 and sailed through an 0.85 cut; so did miR-93 (0.83) and
+RPPH1, the RNase P RNA (0.75). Nothing in the 0.75-0.85 band, across a 10-library
+cohort, was translation: not one CDS or start-codon position, and the 8 libraries with
+no small-RNA problem lose nothing at all.
+
 The fixed-length test misses a pile whose *insert* varies in length: the reads
 then align at 21/22/23 nt from the same 5' base and look length-diverse, even
 though they are one molecule (SRR2096968: 76 % of the library at chr15:56,885,929
