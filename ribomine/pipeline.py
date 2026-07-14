@@ -306,7 +306,12 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         info["dedup"] = proc_dedup.dedup(s.bam, tmp, cfg, log=s.log)
         os.replace(tmp, s.bam)
         rm(s.bam + ".bai", tmp + ".bai")
-        star.index(s.bam, threads=min(threads, 8))   # umi_tools preserves the sort order
+        # Both backends hand back the coordinate order they were given, so this is an
+        # index and not a re-sort -- but it is `ensure_sorted_indexed` rather than
+        # `index` so that the "every BAM RiboMine leaves behind is sorted and indexed"
+        # invariant holds because it is CHECKED, not because a third-party tool is
+        # assumed to have been well behaved.
+        star.ensure_sorted_indexed(s.bam, threads=min(threads, 8))
         LOG.info("[%s] UMI dedup: %s -> %s reads (%.0f%% duplicates)", acc,
                  human(info["dedup"]["n_in"]), human(info["dedup"]["n_out"]),
                  100 * (1 - info["dedup"]["frac_kept"]))

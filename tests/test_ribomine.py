@@ -34,6 +34,19 @@ def test_defaults_are_complete_and_merge():
     assert cfg["process.umi_dedup"] is False      # dedup is OFF by default
 
 
+def test_the_default_dedup_tool_can_run_the_default_dedup_method():
+    """Not every method exists in every backend -- `percentile` is umi_tools-only.
+    Shipping a default pair that cannot run would fail only for the users who turn
+    dedup on, i.e. late, on someone else's cohort."""
+    from ribomine.process.dedup import TOOLS, UMICOLLAPSE_ALGO
+
+    cfg = cfgmod.load(None)
+    tool, method = cfg["process.umi_dedup_tool"], cfg["process.umi_dedup_method"]
+    assert tool in TOOLS
+    if tool == "umicollapse":
+        assert method in UMICOLLAPSE_ALGO
+
+
 def test_every_architecture_threshold_is_wired():
     """A config key nothing reads is a lie to the user. Thresholds must round-trip."""
     from dataclasses import fields

@@ -159,8 +159,11 @@ def parse_log(star_log: str) -> dict    # n_input, n_unique, n_multi, frac_* (un
 
 ```python
 def dedup(bam: str, out_bam: str, cfg: Config, *, log: str = "") -> dict
-    """umi_tools dedup on a coordinate-sorted+indexed BAM whose read names carry
-    `_<UMI>`. OFF by default (process.umi_dedup). Returns {'n_in','n_out','frac_kept'}.
+    """UMI dedup of a coordinate-sorted+indexed BAM whose read names carry `_<UMI>`.
+    Backend is process.umi_dedup_tool: "umicollapse" (default) or "umi_tools" -- same
+    algorithms, same answer, but UMICollapse indexes each position's UMIs instead of
+    comparing every pair, which is what ribo-seq's deep positions need.
+    OFF by default (process.umi_dedup). Returns {'n_in','n_out','frac_kept','method','tool'}.
     Raises a clear error if the reads carry no UMI (architecture found none)."""
 ```
 

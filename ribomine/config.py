@@ -186,8 +186,18 @@ DEFAULTS: dict[str, Any] = {
         # reads and they cannot be trimmed at all (RiboMine warns when that happens).
         # It is a specificity/depth trade: a bad cut corrupts the footprint boundary.
         "adapter_min_overlap": 7,
-        "umi_dedup": False,          # umi_tools dedup on the BAM -- OFF by default
+        "umi_dedup": False,          # UMI dedup of the BAM -- OFF by default
+        # "umicollapse" | "umi_tools". Same algorithms, same `_<UMI>` read-name tag,
+        # same answer -- but UMICollapse indexes each position's UMIs in a BK-tree
+        # instead of comparing every pair, and ribo-seq is where that matters: a
+        # well-translated start codon piles hundreds of distinct UMIs onto one
+        # coordinate, which is umi_tools' worst case. umi_tools is kept for its
+        # `unique` and `percentile` methods, which UMICollapse does not have.
+        "umi_dedup_tool": "umicollapse",
+        # directional | adjacency | cluster (both tools), or unique | percentile
+        # (umi_tools only)
         "umi_dedup_method": "directional",
+        "umi_dedup_mem_gb": 8,       # JVM heap for umicollapse; ignored by umi_tools
         "filter_contaminants": True, # bowtie2 rRNA/tRNA removal before mapping
         "filter_pileups": True,      # data-driven pile-up removal after mapping
         "keep_trimmed_fastq": False,

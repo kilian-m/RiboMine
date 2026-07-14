@@ -144,7 +144,9 @@
     "discard_untrimmed": true,
     "adapter_min_overlap": 7,
     "umi_dedup": false,
+    "umi_dedup_tool": "umicollapse",
     "umi_dedup_method": "directional",
+    "umi_dedup_mem_gb": 8,
     "filter_contaminants": true,
     "filter_pileups": true,
     "keep_trimmed_fastq": false

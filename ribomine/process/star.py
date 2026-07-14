@@ -332,9 +332,9 @@ def ensure_sorted_indexed(bam: str, *, threads: int = 4) -> str:
 def index(bam: str, *, threads: int = 4) -> str:
     """Index an already coordinate-sorted BAM.
 
-    Separate from `sort_index` because `umi_tools dedup` preserves the coordinate
-    order of its input: re-sorting its output would be pure waste, but the old
-    index no longer matches the new file and must be rebuilt.
+    Separate from `sort_index` because a deduplicator preserves the coordinate order
+    of its input: re-sorting its output would be pure waste, but the old index no
+    longer matches the new file and must be rebuilt.
     """
     require_tools("samtools")
     if not nonempty(bam):

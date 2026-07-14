@@ -10,7 +10,8 @@
 #   xopen           -- gzip through pigz/igzip instead of Python's gzip module
 #   sra-tools       -- prefetch/fasterq-dump, the fallback download route
 #   aria2           -- multi-connection HTTPS, the fast route (see docs/DOWNLOAD.md)
-#   umi_tools       -- optional UMI deduplication (off by default)
+#   umicollapse     -- optional UMI deduplication (off by default); umi_tools is the
+#                      alternative backend (process.umi_dedup_tool)
 name: ribomine
 channels:
   - conda-forge
@@ -33,7 +34,8 @@ dependencies:
   - samtools>=1.19
   - cutadapt>=5.0,<6           # imported as a library (see above), not run as a tool
   - xopen>=1.7
-  - umi_tools>=1.1.4
+  - umicollapse>=1.1           # default UMI dedup backend
+  - umi_tools>=1.1.4           # alternative UMI dedup backend
 
   # --- SRA / ENA download
   - sra-tools>=3.0.10          # prefetch + fasterq-dump (fallback route)
