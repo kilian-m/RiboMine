@@ -107,7 +107,7 @@
     "locus_vs_cds": 1.0,
     "locus_min_to_judge": 0.05,
     "min_unique_frac": 0.15,
-    "tiseq_ratio_min": 40,
+    "tiseq_ratio_min": 30,
     "tiseq_min_peak": 200
   },
   "contaminants": {
@@ -116,7 +116,7 @@
     "max_base_frac": 0.85,
     "pileup_min_count": 30,
     "pileup_min_frac": 0.005,
-    "pileup_len_conc": 0.85,
+    "pileup_len_conc": 0.75,
     "pileup_max_frac": 0.1
   },
   "architecture": {

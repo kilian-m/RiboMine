@@ -148,7 +148,15 @@ DEFAULTS: dict[str, Any] = {
         "locus_vs_cds": 1.0,         # one locus holding as many reads as the whole CDS
         "locus_min_to_judge": 0.05,
         "min_unique_frac": 0.15,     # below this the library maps too poorly to use
-        "tiseq_ratio_min": 40,       # start-codon peak / CDS body => TI-seq
+        # start-codon peak / CDS body => TI-seq (initiation drugs freeze the ribosomes
+        # at start codons and elongation runs off, so the peak towers over an empty body).
+        # 30, not the 40 it was: 40 caught NOTHING in a random 100-run cohort while two
+        # runs were plainly initiation-dominated (SRR12790151 at 34, a 968-read peak over
+        # a 28-read body and 9% of reads in 5'UTRs; SRR35630261 at 37, 20% in 5'UTRs).
+        # Elongating ribo-seq tops out around 30 -- the same cohort's third-highest was
+        # 14.9 and its median 4.0 -- so the cut sits at that ceiling, with the gap between
+        # 14.9 and 34 to absorb the error either way.
+        "tiseq_ratio_min": 30,
         "tiseq_min_peak": 200,
     },
 

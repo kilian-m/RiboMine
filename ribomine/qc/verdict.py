@@ -52,6 +52,13 @@ METAGENE_WIN = (-30, 60)          # nt around the start/stop codon, 5'-end based
 # above this share of reads on the mitochondrion, the library is not a cytosolic
 # ribo-seq with mito contamination -- it is (or is dominated by) mitoribosome profiling
 MITO_DOMINANT = 0.30
+# A ribo-seq footprint is a piece of the mRNA, so it is SENSE to the gene: a real library
+# is ~100% sense over CDS (measured: 98-100% across a 100-run cohort). Below this, the
+# deposit is reverse-complemented, and RiboMine -- which scores the sense strand -- would
+# otherwise refuse it for "no CDS enrichment" and never say why. Judged only when enough
+# reads actually touch a CDS to make the fraction mean anything.
+ANTISENSE_SENSE_FRAC = 0.50
+ANTISENSE_MIN_READS = 200
 
 
 # --------------------------------------------------------------------------
@@ -91,10 +98,19 @@ def _overlap_ids(ncls_c, pos: int) -> list[int]:
 
 
 def _classify(idx, ncls, chrom: str, pos: int, strand: int):
-    """Region of a genomic position; and CDS frame when inside a sense CDS.
+    """(region, CDS frame, is a CDS here at all?) for a genomic position.
 
     strand is the read strand (+1/-1); CDS/UTR require a strand match (ribo-seq
     footprints map sense to the transcript).
+
+    The third value is what makes an ANTISENSE deposit visible. A read that lands on a
+    CDS but on the wrong strand fails that match, falls through every other test, and
+    comes out as "intron" -- because a CDS sits inside a gene. So a reverse-complemented
+    deposit does not look like a strand problem: it looks like a library with no CDS
+    enrichment and a great deal of intronic signal, and it is REJECTED for exactly that,
+    with nothing said about the strand. Reporting "a CDS was here, whatever the strand"
+    costs nothing (the overlap has already been computed) and lets `qc` count the reads
+    on each side of it.
     """
     # The mitochondrion is kept as its OWN region, never folded into CDS: in an ordinary
     # cytosolic library its reads are mostly degradation background, and pooling them
@@ -109,6 +125,7 @@ def _classify(idx, ncls, chrom: str, pos: int, strand: int):
     mito = chrom in ("MT", "Mt", "chrM", "M")
     cds = ncls["cds"].get(chrom)
     ids = _overlap_ids(cds, pos)
+    on_cds = bool(ids)                 # a CDS is at this base, on ONE strand or the other
     if ids:
         rec = idx["cds"][chrom]
         for i in ids:
@@ -122,18 +139,18 @@ def _classify(idx, ncls, chrom: str, pos: int, strand: int):
                     frame = (pos - cs - fr) % 3
                 else:
                     frame = (ce - 1 - pos - fr) % 3
-                return ("mito" if mito else "CDS"), frame
+                return ("mito" if mito else "CDS"), frame, on_cds
     if mito:
-        return "mito", None            # on MT, but not inside one of its 13 CDS
+        return "mito", None, on_cds     # on MT, but not inside one of its 13 CDS
     for cat, tag in (("utr5", "5'UTR"), ("utr3", "3'UTR")):
         c = ncls[cat].get(chrom)
         if _overlap_ids(c, pos):
-            return tag, None
+            return tag, None, on_cds
     if _overlap_ids(ncls["exon_nc"].get(chrom), pos):
-        return "ncRNA", None
+        return "ncRNA", None, on_cds
     if _overlap_ids(ncls["gene"].get(chrom), pos):
-        return "intron", None
-    return "intergenic", None
+        return "intron", None, on_cds
+    return "intergenic", None, on_cds
 
 
 def _read_5p(aln):
@@ -197,7 +214,7 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
         n += 1
         chrom, p5, strand, L = _read_5p(aln)
         len_hist[L] += 1
-        region, frame = _classify(idx, ncls, chrom, p5, strand)
+        region, frame, _ = _classify(idx, ncls, chrom, p5, strand)
         region_hist[region] += 1
         if region == "CDS" and frame is not None:
             frame_by_len[L][frame] += 1
@@ -303,6 +320,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     meta = {"start_codon": Counter(), "stop_codon": Counter()}
     loc_hist: Counter = Counter()
     n = 0
+    # reads that land on a coding base, split by whether they are on the gene's strand
+    n_cds_sense = n_cds_anti = 0
 
     for aln in bamf:
         if aln.is_unmapped or aln.is_secondary or aln.is_supplementary:
@@ -319,12 +338,21 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             (aln.reference_start - (aln.cigartuples[0][1] if aln.cigartuples[0][0] == 4 else 0))
         loc_hist[(chrom, aln.is_reverse, anchor)] += 1
 
-        region, frame = _classify(idx, ncls, chrom, p5, strand)
+        region, frame, on_cds = _classify(idx, ncls, chrom, p5, strand)
         region_hist[region] += 1
         if region == "CDS" and frame is not None:
             frame_by_len[L][frame] += 1
         elif region == "mito" and frame is not None:
             mito_frame_by_len[L][frame] += 1        # a separate pool; decides nothing
+        # Which side of a coding gene are the reads on? A footprint is a piece of the
+        # mRNA, so it is SENSE, and every ribo-seq library is ~100% sense here. A read
+        # sitting on a CDS on the wrong strand was counted above as "intron" (a CDS is
+        # inside a gene), so without this it is invisible -- see `_classify`.
+        if on_cds and region != "mito":
+            if region == "CDS":
+                n_cds_sense += 1
+            else:
+                n_cds_anti += 1
 
         for kind in ("start_codon", "stop_codon"):
             arr = codons[kind].get((chrom, strand))
@@ -381,6 +409,18 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     cds_of_genic = region_hist.get("CDS", 0) / genic if genic else 0.0
 
     top5p_locus_frac = loc_hist.most_common(1)[0][1] / n if loc_hist else 0.0
+
+    # ---- which strand of the coding genes is this library on?
+    n_on_cds = n_cds_sense + n_cds_anti
+    cds_sense_frac = n_cds_sense / n_on_cds if n_on_cds else 0.0
+    # An antisense-dominated deposit is reverse-complemented -- some submitters deposit
+    # the RC of what they sequenced. It is not a strand curiosity: RiboMine scores the
+    # SENSE strand, so its CDS enrichment collapses to ~0 and its periodicity is measured
+    # on whatever minority sits the right way round, and the library is then refused for
+    # "no CDS enrichment" with nothing said about why. Measured on SRR5750390: 77% of the
+    # reads that touch a CDS are on the wrong strand.
+    antisense_deposit = (n_on_cds >= ANTISENSE_MIN_READS
+                         and cds_sense_frac < ANTISENSE_SENSE_FRAC)
 
     # ---- footprint length peak
     mode_len = max(len_hist, key=lambda k: len_hist[k])
@@ -467,6 +507,13 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             f"mitoribosome profiling. The verdict above was decided on the {cds_reads:,} "
             f"NUCLEAR CDS reads; the {mito_cds_reads:,} MT-CDS reads are "
             f"{mito_periodicity:.0%} in-frame (TVD {mito_tvd:.2f}) and are not scored")
+    if antisense_deposit:
+        reasons.append(
+            f"ANTISENSE DEPOSIT -- only {cds_sense_frac:.0%} of the {n_on_cds:,} reads that "
+            f"touch a CDS are on its strand. This deposit looks reverse-complemented. A "
+            f"footprint is a piece of the mRNA, so it is sense; RiboMine scores the sense "
+            f"strand, which means the CDS enrichment and periodicity above were measured on "
+            f"the minority of reads that happen to sit the right way round")
     if frac_unique is not None:
         reasons.append(f"unique mapping {'LOW' if low_unique else 'ok'} ({frac_unique:.0%})")
     if contaminant:
@@ -490,6 +537,13 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
                        f"entire CDS ({cds_share:.0%}) — contaminant-dominated")
         if not cds_floor_ok:
             why.append(f"only {cds_of_genic:.0%} of genic reads are in CDS (not translation)")
+        if antisense_deposit:
+            # Say this FIRST among the reasons a run was refused: an empty CDS is what a
+            # reverse-complemented deposit looks like, and "no CDS enrichment" would send
+            # the reader looking for a biological answer to a bookkeeping problem.
+            why.insert(0, f"the deposit looks REVERSE-COMPLEMENTED ({cds_sense_frac:.0%} of "
+                          f"the reads on a CDS are on its strand), so the CDS is empty by "
+                          f"construction")
         if low_unique:
             why.append(f"only {frac_unique:.0%} of reads map uniquely (non-genomic / "
                        f"multimapping junk)")
@@ -513,6 +567,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             "contaminant": contaminant, "low_unique_mapping": low_unique,
             "tiseq": tiseq_like,
             "locus_over_cds": locus_over_cds, "cds_floor_ok": cds_floor_ok,
+            "antisense_deposit": bool(antisense_deposit),
         },
         "start_codon_ratio": round(start_ratio, 1),
         "read_len_mode": mode_len,
@@ -529,6 +584,10 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         "n_mito_cds_reads": mito_cds_reads,
         "mito_dominated": bool(reg_frac.get("mito", 0.0) >= MITO_DOMINANT),
         "cds_frac_of_genic": round(cds_of_genic, 3),
+        # strandedness: a real ribo-seq library is ~100% sense over CDS
+        "cds_sense_frac": round(cds_sense_frac, 3),
+        "n_reads_on_cds": n_on_cds,
+        "antisense_deposit": bool(antisense_deposit),
         "top5p_locus_frac": round(top5p_locus_frac, 3),
         "region_frac": {k: round(v, 4) for k, v in sorted(reg_frac.items(), key=lambda x: -x[1])},
         "read_len_hist": dict(sorted(len_hist.items())),
@@ -602,6 +661,13 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         res["label"], verdict, mode_len, 100 * periodicity_frac, tvd,
         100 * cds_of_genic, start_ratio,
     )
+    if antisense_deposit:
+        LOG.warning(
+            "%s: ANTISENSE DEPOSIT -- only %.0f%% of the %s reads that touch a CDS are on "
+            "its strand. The deposit looks reverse-complemented, and every number above is "
+            "measured on the sense strand, so its CDS enrichment and periodicity are of the "
+            "minority. Re-check before believing this run's verdict either way.",
+            res["label"], 100 * cds_sense_frac, f"{n_on_cds:,}")
     if verdict_reason:
         LOG.info("   reason: %s", verdict_reason)
     for r in reasons:

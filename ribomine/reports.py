@@ -49,6 +49,10 @@ QC_COLUMNS = [
     "n_reads_sampled", "n_reads_scored", "total_run_reads", "projected_usable_reads",
     "read_len_mode", "read_len_peak_frac", "periodicity_inframe", "periodicity_tvd",
     "cds_frac_of_genic", "start_codon_ratio", "top5p_locus_frac",
+    # a ribo-seq footprint is a piece of the mRNA, so it is SENSE to the gene. Well
+    # under 1 here means the deposit is reverse-complemented -- and every other number
+    # in this row was then measured on the minority of reads that sit the right way.
+    "cds_sense_frac", "antisense_deposit",
     "mito_dominated", "mito_periodicity_inframe", "n_mito_cds_reads",
     "frac_rRNA_tRNA_etc", "frac_low_complexity", "frac_position_pileup",
     "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped",
@@ -282,6 +286,8 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
         "periodicity_inframe": qc.get("periodicity_inframe_frac"),
         "periodicity_tvd": qc.get("periodicity_tvd_uniform"),
         "cds_frac_of_genic": qc.get("cds_frac_of_genic"),
+        "cds_sense_frac": qc.get("cds_sense_frac"),
+        "antisense_deposit": qc.get("antisense_deposit"),
         "start_codon_ratio": qc.get("start_codon_ratio"),
         "top5p_locus_frac": qc.get("top5p_locus_frac"),
         # a mitoribosome-profiling library: the numbers above were measured on its

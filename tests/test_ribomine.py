@@ -1051,3 +1051,44 @@ def test_a_long_reason_wraps_instead_of_stretching_the_whole_figure(tmp_path):
     assert wb <= wa + 20, (
         f"a long reason widened the figure from {wa}px to {wb}px -- it must wrap, "
         f"or the panels get squeezed and their titles overlap")
+
+
+# --- strandedness / TI-seq ---------------------------------------------------
+def test_a_read_antisense_to_a_CDS_is_counted_as_antisense_not_just_intron():
+    """This is the whole reason a reverse-complemented deposit was invisible. A read on a
+    CDS but on the wrong strand fails the strand check, falls through every other test,
+    and lands in "intron" -- because a CDS sits inside a gene. So the library looks like
+    one with no CDS enrichment and a lot of intronic signal, and it is refused for exactly
+    that, with nothing said about the strand (SRR5750390: 77% of its CDS reads antisense)."""
+    import numpy as np
+    from ncls import NCLS
+
+    from ribomine.qc.verdict import _classify
+
+    # one + strand CDS, 100..200, inside a gene
+    idx = {"cds": {"1": {"start": np.array([100]), "end": np.array([200]),
+                         "strand": np.array([1], dtype=np.int8),
+                         "frame": np.array([0], dtype=np.int8)}}}
+    one = NCLS(np.array([100], dtype=np.int64), np.array([200], dtype=np.int64),
+               np.array([0], dtype=np.int64))
+    ncls = {"cds": {"1": one}, "utr5": {}, "utr3": {}, "exon_nc": {},
+            "gene": {"1": one}}
+
+    region, frame, on_cds = _classify(idx, ncls, "1", 150, 1)      # SENSE read
+    assert region == "CDS" and frame is not None and on_cds
+
+    region, frame, on_cds = _classify(idx, ncls, "1", 150, -1)     # ANTISENSE read
+    assert region == "intron", "an antisense CDS read still falls through to 'intron'"
+    assert on_cds, "... but the caller must be able to SEE that a CDS was there"
+
+
+def test_the_tiseq_cut_labels_an_initiation_dominated_run():
+    """40 caught NOTHING in a random 100-run cohort while two runs were plainly
+    initiation-dominated: SRR12790151 at 34 (a 968-read start peak over a 28-read CDS
+    body) and SRR35630261 at 37. Elongating ribo-seq tops out around 30 -- that cohort's
+    third-highest was 14.9 and its median 4.0."""
+    cfg = cfgmod.load(None)
+    cut = cfg["qc.tiseq_ratio_min"]
+    assert cut == 30
+    assert 34.1 >= cut, "SRR12790151 is TI-seq and must be called as such"
+    assert 14.9 < cut, "... while the best ELONGATING run in that cohort must not be"
