@@ -149,7 +149,56 @@ RUN_JID=""
 MERGE_JID=""
 
 # ---------------------------------------------------------------- prep ----- #
+# The SRA query runs HERE, on the login node -- not in the prep job.
+#
+# It cannot run on a cm4 compute node. The ENA portal search is a heavy one (11
+# tokens x 4 fields of wildcard text over the whole read_run index) and ENA takes
+# minutes to answer it, during which the TCP connection sits idle -- and something
+# on the compute nodes' outbound path (a stateful NAT, most likely) drops it. The
+# first attempt died on the 180 s read timeout; every retry after that could not
+# open a connection at all (Errno 110). A longer timeout does not fix this, because
+# nothing is timing out at the application layer: the connection is being killed.
+#
+# Note what DOES work from a compute node, because it says what the limit is: the
+# short ENA calls (`filereport`, 60 s) and the multi-GB bulk downloads, all day.
+# It is not reachability. It is holding one connection open and idle for minutes.
+#
+# A login node has no such problem, and master.sh is already on one. So the query
+# happens here, once, before anything is submitted -- and prep then finds
+# meta/candidates.tsv already written and reuses it. (price2-expansive's master.sh
+# populates its stage-1 pool synchronously in the same way, for the same reason.)
+query_on_login_node() {
+    local tsv="${WORK_DIR}/meta/candidates.tsv"
+    if [[ -s "${tsv}" ]]; then
+        echo "==> query      : reusing $(wc -l < "${tsv}") line(s) in ${tsv}"
+        echo "                 (delete it to search the archive again)"
+        return 0
+    fi
+    if [[ "$(cfg pipeline.start query)" != "query" ]]; then
+        return 0        # an accession list: nothing to search for
+    fi
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo "[DRY] ribomine query -c ${CONFIG_ABS}" >&2
+        return 0
+    fi
+    echo "==> query      : searching the archive from this login node (minutes)."
+    echo "                 It cannot be done from a compute node -- see slurm/master.sh."
+    # shellcheck disable=SC1091
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV}"
+    if ! ribomine query -c "${CONFIG_ABS}"; then
+        echo "" >&2
+        echo "The query failed. prep needs ${tsv} before it can split anything." >&2
+        echo "If you already have a candidates.tsv from an earlier search, drop it in:" >&2
+        echo "    mkdir -p ${WORK_DIR}/meta && cp <your>/candidates.tsv ${tsv}" >&2
+        echo "and re-run this. prep reuses it and does not search again." >&2
+        exit 1
+    fi
+}
+
 if [[ "${STEP}" == "all" || "${STEP}" == "prep" ]]; then
+    query_on_login_node
+
     PREP_JID=$(submit "prep" \
         --job-name="${JOB_PREFIX}prep" \
         --cpus-per-task="${PREP_CPUS}" \
