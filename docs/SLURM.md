@@ -31,8 +31,8 @@ DRY_RUN=1 slurm/master.sh config/config_lrz.json    # print the sbatch lines, su
 
 ## What you have to do first
 
-**1. Get RiboMine onto LRZ and build the environment.** In `$HOME`
-(`/path/to/`), not on DSS — DSS is for data.
+**1. Get RiboMine onto LRZ and build the environment.** The repo and the conda env go
+in `$HOME` (`/path/to/`); the data goes in `project.workdir` (step 2).
 
 ```bash
 git clone git@github.com:kilian-m/RiboMine.git && cd RiboMine
@@ -47,7 +47,7 @@ for you and dies in minutes rather than letting a 24 h job die on a typo:
 
 | key | what to check |
 |---|---|
-| `project.workdir` | a DSS path with **several TB** free. The BAMs are the small part; the transient FASTQs are the big one (see *Disk*). |
+| `project.workdir` | `/path/to/data_dir/ribomine/all`. **Run `dssusrinfo all` and check the quota** — the peak need is ~2–3 TB *transient*, and the BAMs that survive are the small part (see *Disk*). |
 | `reference.genome_fasta`, `reference.gtf` | exist, and are the pair the STAR index was built from |
 | `reference.star_index` | exists — **and was built with `--sjdbGTFfile`**, or there is no gene-count matrix. `prep` says which. |
 | `_slurm.mail_user` | currently `` |
@@ -183,9 +183,23 @@ the deep ones sets the wall time.
 
 `keep.bam` is the only thing on by default, so what *survives* is small. What
 *passes through* is not: each run is downloaded (1–10 GB), trimmed, and
-contaminant-filtered, and all three live on DSS at once before the intermediates are
-deleted. At 28 concurrent samples × 8 nodes — 224 runs in flight — that is roughly
-**2–3 TB of transient DSS at peak**, plus the BAMs (~0.5–2 GB each) that stay.
+contaminant-filtered, and all three live in the workdir at once before the
+intermediates are deleted. At 28 concurrent samples × 8 nodes — 224 runs in flight —
+that is roughly **2–3 TB at peak**, plus the BAMs (~0.5–2 GB each) that stay.
+
+**Check the quota before the first full run**, because the workdir is on `dsshome1`:
+
+```bash
+dssusrinfo all
+df -h /path/to/data_dir
+```
+
+If it will not hold the peak, the lever is **`project.jobs`**. Transient space scales
+linearly with the runs in flight, so 28 → 8 turns ~2–3 TB into ~800 GB, at the cost of
+throughput and nothing else — every run still gets processed, just fewer at a time. It
+is not a quality knob. (price2-expansive put its heavy I/O on the `dssfs02` container,
+`/path/to/dss/` — the other place to look
+if `data_dir` is tight.)
 
 The download's temp directory stays on the workdir's filesystem on purpose — it is
 not moved to the node-local NVMe. The ENA route finishes with `os.replace(tmp,
