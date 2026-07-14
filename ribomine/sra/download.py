@@ -71,7 +71,7 @@ def _open_stream(src: str):
     if src.startswith("http"):
         proc = subprocess.Popen(
             ["curl", "-sL", "--fail", "--show-error", "--max-time", "7200", src],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return gzip.GzipFile(fileobj=proc.stdout), proc
     if src.endswith(".gz"):
         return gzip.open(src, "rb"), None
@@ -126,20 +126,41 @@ def _reservoir(stream, scan: float, n: int, rng: random.Random):
 def _stream_once(src: str, limit: float, n: int, rng: random.Random):
     """One attempt: open the stream, reservoir-sample it, and always tear it down.
 
-    Raises EOFError/OSError if the stream breaks -- which, over HTTPS, means the
-    connection dropped and the caller should open a fresh one.
+    Raises OSError if the transfer failed -- which the caller retries on a fresh
+    connection.
+
+    A FAILED TRANSFER DOES NOT LOOK LIKE AN ERROR FROM IN HERE, and that is the whole
+    point of this function. ENA answers a burst of concurrent requests with 403; curl
+    then writes nothing at all, so the gzip stream is simply EMPTY, the reservoir reads
+    zero records and returns perfectly normally. Nothing raises. The sample died as "no
+    reads obtained" and was never retried: 20 of 100 runs, the first time this pipeline
+    asked ENA for 8 samples at once. A mid-transfer SSL error (curl 56) is worse -- the
+    reservoir gets SOME reads and returns them, and a short sample is a BIASED sample
+    that nothing downstream can tell apart from a good one.
+
+    So the transfer is judged by curl's exit status, not by whether bytes arrived. curl
+    still running when we are done means we stopped early, by design; curl already gone
+    with a non-zero status means the reads we just took are not the reads we asked for.
     """
     stream, proc = _open_stream(src)
     try:
-        return _reservoir(stream, limit, n, rng)
+        got = _reservoir(stream, limit, n, rng)
+        rc = proc.poll() if proc is not None else 0
+        if rc:
+            err = (proc.stderr.read() or b"").decode(errors="replace").strip() \
+                if proc.stderr else ""
+            raise OSError(f"the read stream failed: curl exited {rc}"
+                          + (f" ({err[:120]})" if err else ""))
+        return got
     finally:
         try:
             stream.close()
         except Exception:  # noqa: BLE001 -- we are already unwinding; the read result
             pass           # (or the error) is what matters, not the closing of a pipe
         if proc is not None:
-            if proc.stdout:
-                proc.stdout.close()
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    pipe.close()
             proc.terminate()
             try:
                 proc.wait(timeout=30)

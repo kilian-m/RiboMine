@@ -917,3 +917,88 @@ def test_every_mapping_summary_column_is_actually_produced(tmp_path):
     # mean_len_after_trim, which still has the contaminants in it
     assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
     assert row["mean_mapped_len"] == 29.4
+
+
+class _DeadCurl:
+    """curl that already exited non-zero -- ENA answers a burst of requests with 403,
+    and curl then writes NOTHING, so the stream is empty rather than broken."""
+
+    returncode = 22
+
+    def __init__(self):
+        import io
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"curl: (22) The requested URL returned error: 403\n")
+
+    def poll(self):
+        return 22
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 22
+
+
+def test_a_failed_transfer_is_retried_and_never_read_as_an_empty_run(tmp_path, monkeypatch):
+    """A 403 is not an empty file. curl writes nothing, the gzip stream is empty, the
+    reservoir reads zero records and returns NORMALLY -- nothing raises, so the retry
+    never fired and the sample died as 'no reads obtained'. That is 20 of 100 runs, the
+    first time this pipeline asked ENA for 8 samples at once. The transfer has to be
+    judged by curl's exit status, not by whether bytes happened to arrive."""
+    import io
+
+    from ribomine.sra import download
+
+    monkeypatch.setattr(download.metadata, "fastq_urls",
+                        lambda acc: ["https://ena.example/x.fastq.gz"])
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        if len(opened) == 1:
+            p = _DeadCurl()
+            return p.stdout, p                  # empty stream + a curl that failed
+        return io.BytesIO(_fake_fastq_bytes(40)), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    st = download.sample_reads("SRRX", str(tmp_path / "s.fastq"), n=10, scan=100,
+                               seed=1, backoff_s=0)
+    assert len(opened) == 2, "a 403 must be retried, not read as a run with no reads"
+    assert st["n_sampled"] == 10
+
+
+def test_a_transfer_that_dies_MID_stream_is_not_kept_as_a_short_sample(tmp_path, monkeypatch):
+    """Worse than the 403: curl dies partway (an SSL read error), the reservoir gets SOME
+    reads and hands them back. A short sample is a BIASED sample, and nothing downstream
+    can tell it apart from a good one."""
+    import io
+
+    from ribomine.sra import download
+
+    class _HalfCurl(_DeadCurl):
+        returncode = 56
+
+        def __init__(self):
+            self.stdout = io.BytesIO(_fake_fastq_bytes(3))   # a few reads, then death
+            self.stderr = io.BytesIO(b"curl: (56) OpenSSL SSL_read: error\n")
+
+        def poll(self):
+            return 56
+
+    monkeypatch.setattr(download.metadata, "fastq_urls",
+                        lambda acc: ["https://ena.example/x.fastq.gz"])
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        if len(opened) == 1:
+            p = _HalfCurl()
+            return p.stdout, p
+        return io.BytesIO(_fake_fastq_bytes(40)), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    st = download.sample_reads("SRRX", str(tmp_path / "s.fastq"), n=10, scan=100,
+                               seed=1, backoff_s=0)
+    assert len(opened) == 2, "the truncated draw must be thrown away, not sampled from"
+    assert st["n_sampled"] == 10
