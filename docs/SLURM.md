@@ -58,20 +58,38 @@ genome — which is what makes 28 concurrent samples per node affordable. So the
 annotation is either in the index or there is no `counts/gene_counts.tsv`.
 Everything else still works.
 
-**3. Check that a cm4 compute node can reach ENA.** This is the one thing I could
-not verify from here, and the whole pipeline is built on it. `price2-expansive`
-downloads from `rdp.ucc.ie` on cm4_tiny compute nodes, so outbound HTTPS works —
-but confirm the hosts RiboMine actually uses:
+**3. Check that a cm4 COMPUTE node can reach ENA.** The whole pipeline is built on
+it. `price2-expansive` downloads from `rdp.ucc.ie` on cm4_tiny compute nodes, so
+outbound HTTPS works — but confirm the hosts RiboMine actually uses, **from inside
+an allocation**. A login node proves nothing: login nodes have internet whether the
+compute nodes do or not, and the compute nodes are the ones that download.
 
 ```bash
-salloc -M cm4 -p cm4_inter -N 1 -t 00:10:00
-curl -sI https://www.ebi.ac.uk/ena/portal/api/filereport?accession=SRR12285169\&result=read_run\&fields=fastq_ftp | head -1
-curl -sI https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=sra\&term=riboseq | head -1
+salloc -M cm4 -p cm4_inter -N 1 -t 00:10:00       # <- the point. Not a login node.
+
+curl -s -o /dev/null -w 'ENA    %{http_code}\n' \
+  "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=SRR12285169&result=read_run&fields=fastq_ftp"
+curl -s -o /dev/null -w 'NCBI   %{http_code}\n' \
+  "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=sra&term=riboseq&retmax=1"
+
+# the route that actually matters: a real multi-connection transfer from the BULK
+# host, which is a different machine from the metadata API above -- a firewall that
+# allows www.ebi.ac.uk but not ftp.sra.ebi.ac.uk would otherwise surface as every
+# download failing, twenty hours in.
+aria2c -x4 -s4 --max-download-limit=5M -d /tmp -o smoke.gz \
+  https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR122/069/SRR12285169/SRR12285169.fastq.gz &
+sleep 20; kill %1; ls -la /tmp/smoke.gz*
+
 exit
 ```
-Both should be `HTTP/... 200`. If they are not, the compute nodes are behind a
-proxy and `http_proxy`/`https_proxy` need exporting in `slurm/node_worker.sh` and
-`slurm/prep.sh`.
+
+Both `curl`s must print **200**, and `aria2c` must have pulled a few MB. Use a GET,
+not `curl -I`: NCBI answers a HEAD request with `405 Method Not Allowed`, which looks
+like a failure and is not one — it means NCBI received the request and declined the
+*method*, so it proves reachability just as well as a 200 would.
+
+If any of it fails, the nodes are behind a proxy: export `http_proxy`/`https_proxy` at
+the top of `slurm/node_worker.sh` and `slurm/prep.sh`.
 
 **4. Do the cheap pass first.** Set `pipeline.end` to `"qc"` and submit. QC never
 downloads a run — it streams a 200k-read sample — so screening the whole archive
