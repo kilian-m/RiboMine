@@ -57,13 +57,34 @@ def manifest_path(root: str) -> str:
 def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
     """The cohort, and each run's read count (the packing weight).
 
+    Where the cohort comes from is `pipeline.start`, the same as it would be for a
+    plain `ribomine run` -- so a config that names its own `accession_list` (a
+    pilot, a re-run of a curated set) is split as it stands, and is NOT sent to
+    search the archive behind its own back.
+
     A run whose read count ENA does not give gets the cohort median rather than
     zero: an unknown-size run is an average-size run, not a free one.
     """
-    if override:
-        with open(override) as fh:
+    start = cfg["pipeline.start"]
+    if start == "fastq":
+        raise SystemExit(
+            "pipeline.start='fastq' is not supported on the cluster: the split is over "
+            "run accessions, and a directory of local FASTQs has none. Run those with "
+            "`ribomine run --fastq-dir` on a single node instead.")
+
+    if start == "accessions" and not override and not cfg["pipeline.accession_list"]:
+        raise SystemExit("pipeline.start='accessions' needs pipeline.accession_list "
+                         "(or pass --accessions)")
+
+    src = override or (cfg._abs(cfg["pipeline.accession_list"])
+                       if start == "accessions" else None)
+    if src:
+        if not os.path.isfile(src):
+            raise SystemExit(f"accession list not found: {src}")
+        with open(src) as fh:
             accs = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-        print(f"accessions: {len(accs)} from {override}")
+        print(f"accessions: {len(accs)} from {src}  (pipeline.start={start})")
+        # no ENA metadata for a bare list, so every run packs at the same weight
         return accs, {}
 
     tsv = os.path.join(cfg.dir("meta"), "candidates.tsv")

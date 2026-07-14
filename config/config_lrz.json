@@ -71,12 +71,20 @@
   },
 
   "reference": {
-    "_": "CHECK THESE. The STAR index must have been built with --sjdbGTFfile, or there is no gene-count matrix (prep.sh says so if it was not).",
+    "_": [
+      "CHECK THESE -- they are price2-expansive's, reused. prep.sh validates all",
+      "three and dies in minutes rather than letting a 24 h job die on a typo.",
+      "star_index is the one to look at: price2-expansive names it RELATIVE to its",
+      "own repo (resources/indexes/STAR-index), so the absolute path below is an",
+      "inference. It must also have been built with --sjdbGTFfile, or there is no",
+      "gene-count matrix -- the copy on this workstation carries 58,302 genes, so",
+      "the LRZ one almost certainly does too, and prep.sh prints the number it finds."
+    ],
     "species": "Homo sapiens",
     "taxon_id": 9606,
     "genome_fasta": "/path/to/index_files/homo_sapiens.90.fasta",
     "gtf": "/path/to/index_files/homo_sapiens.90.gtf",
-    "star_index": "/path/to/index_files/STAR-index"
+    "star_index": "/path/to/price2-expansive/resources/indexes/STAR-index"
   },
 
   "download": {
