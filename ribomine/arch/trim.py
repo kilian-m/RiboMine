@@ -87,7 +87,12 @@ def find_adapter(read: str, adapter: str, min_start: int, min_overlap: int = 7) 
 
 
 def trim_polyA(read: str, min_run: int = 6) -> int:
-    """Return the index where a 3' poly(A) (or poly(T)) tail starts, or len(read)."""
+    """Index where a poly(A) (or poly(T)) tail ENDING THE READ starts, or len(read).
+
+    Terminal-only, and used where the caller has already cut everything past the tail
+    off (so the tail is the last thing in the string by construction). When the read may
+    still run on into a construct, use `find_polyA`.
+    """
     n = len(read)
     for base in ("A", "T"):
         i = n
@@ -95,6 +100,39 @@ def trim_polyA(read: str, min_run: int = 6) -> int:
             i -= 1
         if n - i >= min_run:
             return i
+    return n
+
+
+def find_polyA(read: str, *, min_start: int = 0, min_run: int = 6) -> int:
+    """Index where the 3'-most poly(A)/poly(T) tail starts, or len(read) if there is none.
+
+    Unlike `trim_polyA`, the tail need NOT end the read. It sits between the footprint
+    and the construct, so a read long enough to sequence *through* the tail carries it in
+    the MIDDLE -- and a terminal-only search then finds nothing and leaves the footprint
+    with the tail AND the construct still attached. That is not a yield question: those
+    reads are no longer genomic, so they simply fail to align. Measured on SRR30214250
+    (an adapter RiboMine's panel cannot name, so there is nothing else to anchor on): 20%
+    of reads kept their whole 3' end, and they mapped at 3% against 14% for the reads that
+    were cut.
+
+    The tail is taken as the RIGHTMOST qualifying run, not the leftmost: a chance A-run
+    inside the footprint lies to the LEFT of the real tail, so scanning from the 3' end
+    walks past the footprint's own sequence rather than cutting into it.
+    """
+    n = len(read)
+    lo = max(0, min_start)
+    for base in ("A", "T"):
+        i = n
+        while i > lo:
+            if read[i - 1] != base:
+                i -= 1
+                continue
+            j = i                                  # walk to the run's start
+            while j > lo and read[j - 1] == base:
+                j -= 1
+            if i - j >= min_run:
+                return j                           # first run met scanning right = 3'-most
+            i = j
     return n
 
 
@@ -225,8 +263,18 @@ def trim_read(seq: str, qual: str, p: dict) -> tuple[str, str, str, bool | None]
             # run of >= 6 A's, which end-to-end alignment would then have to explain.
             if p["polyA"] not in _ABSENT:
                 e3 = trim_polyA(seq[:e3])
-    elif p["polyA"] not in ("none", "", None) or name == "none_visible":
-        e3 = trim_polyA(seq)                   # trim the poly(A) tail (adapter beyond it)
+    elif p["polyA"] not in ("none", "", None):
+        # No adapter to anchor on -- either the library has none, or (SRR30214250) it has
+        # one this panel cannot name. The poly(A) tail anchors itself: it lies between the
+        # footprint and whatever follows, so it marks the 3' boundary WITHOUT us having to
+        # know what follows. `find_polyA`, not `trim_polyA`: the construct beyond the tail
+        # was sequenced in these reads, so the tail is not at the read's end.
+        e3 = find_polyA(seq, min_start=s5)
+        # A read with no tail at all did not sequence through to the end of its molecule:
+        # its 3' end is the read's end, not the footprint's. That is the same thing a
+        # missing adapter means, and it gets the same answer -- see trim_fastq. Keeping
+        # them was the bug: they carry the tail and the construct, and simply do not align.
+        adapter_found = e3 < len(seq)
     else:
         # adapter already trimmed off the deposit; a retained 3' UMI sits at the end
         if p["umi3"]:

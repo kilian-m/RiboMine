@@ -454,115 +454,6 @@ def test_a_polyA_tail_anchors_the_cut_when_the_adapter_is_gone(tmp_path):
     assert st2["n_reads_out"] == 1
 
 
-def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
-    """The adapter is not always the last thing in the read. Sequence past it -- an
-    index, a second adapter, a sample barcode -- is normal, and the read must still be
-    cut AT the adapter.
-
-    Without EndSkip.QUERY_STOP the aligner demands the alignment reach the END of the
-    read, so an adapter with anything after it matches in ZERO reads. Measured on
-    SRR25706716 ([footprint][Ingolia linker][12nt][TruSeq]): the linker is an exact
-    substring of 98% of its reads and the matcher found it in none of them; with
-    discard_untrimmed on, a 53.7M-read library became a 23 KB BAM. Five of the eight
-    libraries in a random 20-run cohort were hit."""
-    linker = "CTGTAGGCACCATCAAT"
-    truseq = "AGATCGGAAGAGCACACGTCTGAACT"
-    fp = "CGGGACATGTGGCGTACGAA"                      # 20 nt "footprint"
-    read = fp + linker + "GGCCGGTTTCTG" + truseq     # adapter, then 38 nt more
-
-    # the matcher must locate it where it actually is
-    assert read.find(linker) == len(fp)
-    assert trim.find_adapter(read, linker, min_start=14, min_overlap=7) == len(fp)
-
-    call = {"status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
-            "barcode3_seq": "none", "adapter3_name": "ingolia_linker",
-            "adapter3_seq": linker, "polyA_tail": "none", "footprint_len_mode": 20,
-            "p5_layout": [], "functional": {"trim_5p": 0, "dedup_umi_len": 0}}
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=15)
-
-    assert st["n_reads_out"] == 1, "the read carries its adapter; it must not be discarded"
-    assert st["frac_no_adapter"] == 0.0
-    (_, seq), = _read(out)
-    assert seq == fp, "everything from the adapter onwards comes off, not just the adapter"
-
-
-def test_an_adapter_at_the_very_end_still_works(tmp_path):
-    """The ordinary case must not regress: adapter runs to the read's end, or past it."""
-    fp = "ACGTACGTACGTACGTACGTACGTACGTAC"
-    for tail in (ADAP, ADAP[:9]):        # complete, and truncated by the read end
-        out = str(tmp_path / f"o{len(tail)}.fastq")
-        call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none",
-                    footprint_len_mode=30, functional={"trim_5p": 0, "dedup_umi_len": 0})
-        st = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), call, out, min_len=20)
-        assert st["n_reads_out"] == 1
-        (_, seq), = _read(out)
-        assert seq == fp
-
-
-# --- the streamed read sample ------------------------------------------------
-def _fake_fastq_bytes(n: int) -> bytes:
-    return b"".join(b"@r%d\nACGTACGTAC\n+\nIIIIIIIIII\n" % i for i in range(n))
-
-
-class _BrokenStream:
-    """What a dropped HTTPS connection looks like from inside gzip."""
-
-    def readline(self):
-        raise EOFError("Compressed file ended before the end-of-stream marker was reached")
-
-    def close(self):
-        pass
-
-
-def test_a_dropped_read_sample_stream_is_retried_not_lost(tmp_path, monkeypatch):
-    """A truncated stream permanently failed the run before this: measured at 2 of 20
-    runs when four samples stream at once. A tenth of a mining cohort is not an
-    acceptable price for a transient, and curl cannot retry it -- it is writing to a
-    pipe, so its retry would splice the head of the file into the middle of the gzip
-    stream rather than recover anything."""
-    import io
-
-    from ribomine.sra import download
-
-    monkeypatch.setattr(download.metadata, "fastq_urls",
-                        lambda acc: ["https://ena.example/x.fastq.gz"])
-    opened = []
-
-    def fake_open(src):
-        opened.append(src)
-        if len(opened) == 1:
-            return _BrokenStream(), None          # the connection drops
-        return io.BytesIO(_fake_fastq_bytes(50)), None
-
-    monkeypatch.setattr(download, "_open_stream", fake_open)
-    out = str(tmp_path / "s.fastq")
-    st = download.sample_reads("SRRFAKE", out, n=10, scan=1000, seed=1, backoff_s=0)
-
-    assert len(opened) == 2, "the stream must be re-OPENED, not resumed"
-    assert st["n_sampled"] == 10
-    assert os.path.getsize(out) > 0
-
-
-def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
-    """Re-reading a corrupt file on disk fails identically every time. Retrying it is
-    pure latency, and it hides the fact that the file -- not the network -- is broken."""
-    from ribomine.sra import download
-
-    local = tmp_path / "reads.fastq"
-    local.write_bytes(_fake_fastq_bytes(5))
-    opened = []
-
-    def fake_open(src):
-        opened.append(src)
-        return _BrokenStream(), None
-
-    monkeypatch.setattr(download, "_open_stream", fake_open)
-    with pytest.raises(RuntimeError, match="could not stream a read sample"):
-        download.sample_reads(str(local), str(tmp_path / "o.fastq"), n=10, backoff_s=0)
-    assert len(opened) == 1, "a local file is not a flaky network"
-
-
 # --- gene counts / the read-count matrix ------------------------------------
 READS_PER_GENE = "\n".join([
     # STAR's four bookkeeping rows, then the genes.
@@ -665,52 +556,6 @@ def test_a_run_with_no_counts_is_left_out_rather_than_left_blank(tmp_path):
     assert rows[0]["SRR1"] == "200"
 
 
-def test_every_mapping_summary_column_is_actually_produced(tmp_path):
-    """A column in the header that no row ever fills is a blank column, and a key a row
-    fills that the header does not list is silently DROPPED by write_tsv. Either way the
-    table lies about what was measured, so the two lists must match exactly."""
-    from ribomine import reports
-    from ribomine.utils import Sample, write_json
-
-    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)}})
-    s = Sample("SRR1", cfg.workdir)
-    # a process record with every block the row builder reads
-    write_json(s.process_json, {
-        "run_accession": "SRR1",
-        "download": {"route": "ena_https", "mb_per_s": 40.0, "bytes": 10},
-        "trim": {"n_reads_in": 100, "n_reads_out": 90, "mean_len_in": 50.0,
-                 "mean_len_out": 30.0, "frac_no_adapter": 0.1},
-        "contaminants": {"n_input": 90, "n_kept": 40, "n_contaminant_rRNA_tRNA_etc": 50},
-        "mapping": {"n_input": 40, "n_unique": 30, "frac_unique": 0.75,
-                    "frac_multimapping": 0.1, "frac_unmapped": 0.15,
-                    "avg_input_len": 31.0, "avg_mapped_len": 29.4},
-        "periodicity": {"n_reads_in_bam": 30, "n_reads_scored": 30, "mean_mapped_len": 29.4,
-                        "read_len_mode": 30, "periodicity_inframe_frac": 0.6,
-                        "periodicity_tvd_uniform": 0.4, "n_cds_reads": 20,
-                        "cds_frac_of_genic": 0.8},
-        "counts": {"n_in_genes": 25, "frac_in_genes": 0.83, "n_genes_detected": 9,
-                   "n_ambiguous": 1, "n_no_feature": 4, "sense_over_antisense": 20.0},
-        "umi_dedup": False, "bam_bytes": 123, "keep": {"bam": True},
-    })
-    row = reports._process_row(cfg, "SRR1")
-
-    missing = [c for c in reports.PROCESS_COLUMNS if c not in row]
-    extra = [k for k in row if k not in reports.PROCESS_COLUMNS]
-    assert not missing, f"columns in the header that no row fills: {missing}"
-    assert not extra, f"row keys write_tsv would silently drop: {extra}"
-
-    # the headline columns the table leads with, in order
-    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS
-    assert reports.PROCESS_COLUMNS[:7] == [
-        "run_accession", "verdict", "architecture", "n_mapped", "mean_footprint_len",
-        "mean_mapped_len", "periodicity_tvd"]
-    assert row["n_mapped"] == 30
-    # the footprint length is STAR's INPUT (trimmed + contaminant-free), never
-    # mean_len_after_trim, which still has the contaminants in it
-    assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
-    assert row["mean_mapped_len"] == 29.4
-
-
 # --- what a run leaves behind ------------------------------------------------
 def test_by_default_only_the_bam_survives():
     """Mining the SRA means hundreds of 1-10 GB runs. Everything except the deliverable
@@ -739,6 +584,69 @@ def test_resume_does_not_re_download_a_run_whose_bam_was_deleted_on_purpose(tmp_
 
     assert is_processed(dropped, s), "a finished sample with no BAM is still done"
     assert not is_processed(kept, s), "but a BAM that was meant to be kept and is not there is a re-run"
+
+
+# --- the streamed read sample ------------------------------------------------
+def _fake_fastq_bytes(n: int) -> bytes:
+    return b"".join(b"@r%d\nACGTACGTAC\n+\nIIIIIIIIII\n" % i for i in range(n))
+
+
+class _BrokenStream:
+    """What a dropped HTTPS connection looks like from inside gzip."""
+
+    def readline(self):
+        raise EOFError("Compressed file ended before the end-of-stream marker was reached")
+
+    def close(self):
+        pass
+
+
+def test_a_dropped_read_sample_stream_is_retried_not_lost(tmp_path, monkeypatch):
+    """A truncated stream permanently failed the run before this: measured at 2 of 20
+    runs when four samples stream at once. A tenth of a mining cohort is not an
+    acceptable price for a transient, and curl cannot retry it -- it is writing to a
+    pipe, so its retry would splice the head of the file into the middle of the gzip
+    stream rather than recover anything."""
+    import io
+
+    from ribomine.sra import download
+
+    monkeypatch.setattr(download.metadata, "fastq_urls",
+                        lambda acc: ["https://ena.example/x.fastq.gz"])
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        if len(opened) == 1:
+            return _BrokenStream(), None          # the connection drops
+        return io.BytesIO(_fake_fastq_bytes(50)), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    out = str(tmp_path / "s.fastq")
+    st = download.sample_reads("SRRFAKE", out, n=10, scan=1000, seed=1, backoff_s=0)
+
+    assert len(opened) == 2, "the stream must be re-OPENED, not resumed"
+    assert st["n_sampled"] == 10
+    assert os.path.getsize(out) > 0
+
+
+def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
+    """Re-reading a corrupt file on disk fails identically every time. Retrying it is
+    pure latency, and it hides the fact that the file -- not the network -- is broken."""
+    from ribomine.sra import download
+
+    local = tmp_path / "reads.fastq"
+    local.write_bytes(_fake_fastq_bytes(5))
+    opened = []
+
+    def fake_open(src):
+        opened.append(src)
+        return _BrokenStream(), None
+
+    monkeypatch.setattr(download, "_open_stream", fake_open)
+    with pytest.raises(RuntimeError, match="could not stream a read sample"):
+        download.sample_reads(str(local), str(tmp_path / "o.fastq"), n=10, backoff_s=0)
+    assert len(opened) == 1, "a local file is not a flaky network"
 
 
 # --- bowtie2 thread cap ------------------------------------------------------
@@ -805,6 +713,111 @@ def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, t
     assert st["n_input"] == 100 and st["n_kept"] == 55
 
 
+def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
+    """The adapter is not always the last thing in the read. Sequence past it -- an
+    index, a second adapter, a sample barcode -- is normal, and the read must still be
+    cut AT the adapter.
+
+    Without EndSkip.QUERY_STOP the aligner demands the alignment reach the END of the
+    read, so an adapter with anything after it matches in ZERO reads. Measured on
+    SRR25706716 ([footprint][Ingolia linker][12nt][TruSeq]): the linker is an exact
+    substring of 98% of its reads and the matcher found it in none of them; with
+    discard_untrimmed on, a 53.7M-read library became a 23 KB BAM. Five of the eight
+    libraries in a random 20-run cohort were hit."""
+    linker = "CTGTAGGCACCATCAAT"
+    truseq = "AGATCGGAAGAGCACACGTCTGAACT"
+    fp = "CGGGACATGTGGCGTACGAA"                      # 20 nt "footprint"
+    read = fp + linker + "GGCCGGTTTCTG" + truseq     # adapter, then 38 nt more
+
+    # the matcher must locate it where it actually is
+    assert read.find(linker) == len(fp)
+    assert trim.find_adapter(read, linker, min_start=14, min_overlap=7) == len(fp)
+
+    call = {"status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
+            "barcode3_seq": "none", "adapter3_name": "ingolia_linker",
+            "adapter3_seq": linker, "polyA_tail": "none", "footprint_len_mode": 20,
+            "p5_layout": [], "functional": {"trim_5p": 0, "dedup_umi_len": 0}}
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=15)
+
+    assert st["n_reads_out"] == 1, "the read carries its adapter; it must not be discarded"
+    assert st["frac_no_adapter"] == 0.0
+    (_, seq), = _read(out)
+    assert seq == fp, "everything from the adapter onwards comes off, not just the adapter"
+
+
+def test_an_adapter_at_the_very_end_still_works(tmp_path):
+    """The ordinary case must not regress: adapter runs to the read's end, or past it."""
+    fp = "ACGTACGTACGTACGTACGTACGTACGTAC"
+    for tail in (ADAP, ADAP[:9]):        # complete, and truncated by the read end
+        out = str(tmp_path / f"o{len(tail)}.fastq")
+        call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none",
+                    footprint_len_mode=30, functional={"trim_5p": 0, "dedup_umi_len": 0})
+        st = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), call, out, min_len=20)
+        assert st["n_reads_out"] == 1
+        (_, seq), = _read(out)
+        assert seq == fp
+
+
+# --- poly(A): the tail is not always the last thing in the read ---------------
+POLYA_CALL = {
+    "status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
+    "barcode3_seq": "none", "adapter3_name": "none_visible",
+    "adapter3_seq": "none_visible", "polyA_tail": "polyA",
+    "footprint_len_mode": 29, "p5_layout": [],
+    "functional": {"trim_5p": 0, "dedup_umi_len": 0},
+}
+
+
+def test_a_polyA_tail_is_cut_even_when_the_read_runs_on_past_it(tmp_path):
+    """The tail sits BETWEEN the footprint and the construct. A read long enough to
+    sequence through it carries the tail in the middle -- and a terminal-only search
+    finds nothing, leaving footprint+tail+construct on the read, which then does not
+    align at all. SRR30214250 (an adapter the panel cannot name, so the tail is the only
+    anchor): 20% of reads kept their entire 3' end and mapped at 3% vs 14%."""
+    # NB the footprint must not END in A: a genomic A abutting the tail is part of the
+    # same run, and no trimmer can say which side of the boundary it came from
+    fp = "ACGTACGTACGTACGTACGTACGTACGTC"          # 28 nt
+    tail = "A" * 14
+    junk = "GAACGGATGCGCACACGTCTGACCTCAGT"        # the unnamed construct beyond the tail
+
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [fp + tail + junk]), POLYA_CALL, out, min_len=20)
+    assert st["n_reads_out"] == 1
+    (_, seq), = _read(out)
+    assert seq == fp, "everything from the tail onwards is not footprint and must go"
+
+    # the tail ENDING the read (nothing sequenced past it) must still work
+    out2 = str(tmp_path / "p.fastq")
+    st2 = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), POLYA_CALL, out2, min_len=20)
+    (_, seq2), = _read(out2)
+    assert seq2 == fp and st2["n_reads_out"] == 1
+
+
+def test_a_read_with_no_polyA_tail_at_all_is_not_a_complete_footprint(tmp_path):
+    """No tail means the read ended before the molecule did: its 3' end is set by the read
+    length, not by the footprint. That is exactly what a missing adapter means elsewhere,
+    and it gets the same treatment -- otherwise these reads reach STAR carrying their
+    construct and simply fail to align."""
+    fp_only = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"     # 40 nt, no tail anywhere
+    out = str(tmp_path / "o.fastq")
+    st = trim.trim_fastq(_fastq(tmp_path, [fp_only]), POLYA_CALL, out, min_len=20)
+    assert st["n_reads_out"] == 0 and st["n_no_adapter"] == 1
+
+
+def test_the_polyA_search_does_not_eat_into_the_footprint(tmp_path):
+    """A chance A-run inside the footprint lies to the LEFT of the real tail, so the
+    search walks in from the 3' end and stops at the tail -- it must not cut at the
+    internal run and truncate a genuine footprint."""
+    fp = "ACGTAAAAAAACGTACGTACGTACGTACG"      # 29 nt, with an internal A7
+    tail = "A" * 12
+    junk = "GAACGGATGCGCACACG"
+    out = str(tmp_path / "o.fastq")
+    trim.trim_fastq(_fastq(tmp_path, [fp + tail + junk]), POLYA_CALL, out, min_len=20)
+    (_, seq), = _read(out)
+    assert seq == fp, f"cut at the internal A-run instead of the tail: {seq!r}"
+
+
 # --- the pile-up filter's length-concentration cut ---------------------------
 def _bam(tmp_path, name, reads):
     """reads = [(chrom, pos, length, n)] -> a tiny coordinate-sorted, indexed BAM."""
@@ -859,3 +872,48 @@ def test_a_miRNA_pile_is_removed_but_a_translated_codon_is_not(tmp_path):
     assert 5000 not in pos, "a translated codon's footprints spread over lengths -- keep it"
     assert st["n_reads_removed"] == 800
 
+
+def test_every_mapping_summary_column_is_actually_produced(tmp_path):
+    """A column in the header that no row ever fills is a blank column, and a key a row
+    fills that the header does not list is silently DROPPED by write_tsv. Either way the
+    table lies about what was measured, so the two lists must match exactly."""
+    from ribomine import reports
+    from ribomine.utils import Sample, write_json
+
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)}})
+    s = Sample("SRR1", cfg.workdir)
+    # a process record with every block the row builder reads
+    write_json(s.process_json, {
+        "run_accession": "SRR1",
+        "download": {"route": "ena_https", "mb_per_s": 40.0, "bytes": 10},
+        "trim": {"n_reads_in": 100, "n_reads_out": 90, "mean_len_in": 50.0,
+                 "mean_len_out": 30.0, "frac_no_adapter": 0.1},
+        "contaminants": {"n_input": 90, "n_kept": 40, "n_contaminant_rRNA_tRNA_etc": 50},
+        "mapping": {"n_input": 40, "n_unique": 30, "frac_unique": 0.75,
+                    "frac_multimapping": 0.1, "frac_unmapped": 0.15,
+                    "avg_input_len": 31.0, "avg_mapped_len": 29.4},
+        "periodicity": {"n_reads_in_bam": 30, "n_reads_scored": 30, "mean_mapped_len": 29.4,
+                        "read_len_mode": 30, "periodicity_inframe_frac": 0.6,
+                        "periodicity_tvd_uniform": 0.4, "n_cds_reads": 20,
+                        "cds_frac_of_genic": 0.8},
+        "counts": {"n_in_genes": 25, "frac_in_genes": 0.83, "n_genes_detected": 9,
+                   "n_ambiguous": 1, "n_no_feature": 4, "sense_over_antisense": 20.0},
+        "umi_dedup": False, "bam_bytes": 123, "keep": {"bam": True},
+    })
+    row = reports._process_row(cfg, "SRR1")
+
+    missing = [c for c in reports.PROCESS_COLUMNS if c not in row]
+    extra = [k for k in row if k not in reports.PROCESS_COLUMNS]
+    assert not missing, f"columns in the header that no row fills: {missing}"
+    assert not extra, f"row keys write_tsv would silently drop: {extra}"
+
+    # the headline columns the table leads with, in order
+    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS
+    assert reports.PROCESS_COLUMNS[:7] == [
+        "run_accession", "verdict", "architecture", "n_mapped", "mean_footprint_len",
+        "mean_mapped_len", "periodicity_tvd"]
+    assert row["n_mapped"] == 30
+    # the footprint length is STAR's INPUT (trimmed + contaminant-free), never
+    # mean_len_after_trim, which still has the contaminants in it
+    assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
+    assert row["mean_mapped_len"] == 29.4
