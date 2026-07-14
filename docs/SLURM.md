@@ -161,10 +161,29 @@ the number to cut if a node starts swapping. `master.sh` only warns past 2×, wh
 there are not even hardware threads left to hold the samples.
 
 `node_worker.sh` also removes any **leaked** STAR segment on the way *in*, not only
-on the way out. A segment leaked by a wall-time SIGKILL holds 28 GB on that node and
+on the way out. A segment leaked by a wall-time SIGKILL holds 30 GB on that node and
 makes the next job's load fail; clearing it at startup is the recovery path that does
 not depend on the previous job having exited politely. It is safe because cm4_std
 allocates nodes exclusively.
+
+**And it loads the genome itself, and refuses to run without it.** RiboMine, left to
+its own devices, warns on a failed shared load and falls back to `NoSharedMemory` —
+every worker then loads its own ~30 GB copy. On a workstation that is a memory bill.
+On a node at `--jobs 28` it is suicide: the fallback asks for 28 × 30 GB = 840 GB and
+the node OOM-kills the whole process in seconds, losing the shard, with `Killed` in
+the log and the real cause one WARNING line further up. So `node_worker.sh` takes the
+decision where it can be fatal on purpose — it runs the `LoadAndExit` itself, and if
+the segment will not load it **stops**, and says why. (It hands the result to RiboMine
+through `RIBOMINE_STAR_GENOME_LOAD`, which `star.genome_load()` reads back, so
+RiboMine's own load *and* its fallback are bypassed entirely.)
+
+If you see that FATAL, the cause is almost always the first one it lists: **the job
+did not ask for enough memory.** Which is also the trap when running RiboMine by hand
+in an `salloc` — LRZ's default is ~2.1 GiB per core, and STAR needs 30 GB:
+
+```bash
+salloc -M inter -p cm4_inter -N 1 --cpus-per-task=112 --mem=300G -t 04:00:00
+```
 
 **Per-node workdirs (`shards/work_NN/`), merged afterwards.** `ribomine run` writes
 its cohort tables (`qc_summary.tsv`, `failed.tsv`, …) at fixed paths under its

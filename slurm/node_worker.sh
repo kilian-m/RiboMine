@@ -94,6 +94,46 @@ trap cleanup EXIT
 # Clear whatever the last job on this node left behind, before we load ours.
 star_genome_remove
 
+# ------------------------------------------------------------------ #
+# Load the shared genome HERE, and refuse to run without it.          #
+# ------------------------------------------------------------------ #
+# RiboMine loads it itself, and if the load fails it warns and falls back to
+# NoSharedMemory -- every worker then loads its OWN ~30 GB copy of the index. On a
+# workstation that is a memory bill. Here it is suicide: RM_JOBS is 28, so the
+# fallback asks the node for 28 x 30 GB = 840 GB, and the node OOM-kills the whole
+# process within seconds. The shard is then lost for the round, and the SLURM log
+# says only "Killed" -- with the actual cause, one WARNING line, scrolled far above.
+#
+# So the decision is taken here instead, where it can be fatal on purpose: load the
+# segment, and if it will not load, STOP. Exporting the result in
+# RIBOMINE_STAR_GENOME_LOAD is what RiboMine reads back (star.genome_load()), so it
+# skips its own load and its own fallback entirely.
+if [[ -n "${STAR_INDEX}" ]]; then
+    echo "[node ${HOST}] loading the STAR genome into shared memory (~30 GB, once for this node)"
+    if STAR --genomeLoad LoadAndExit --genomeDir "${STAR_INDEX}" \
+            --outFileNamePrefix "${TMPDIR}/_star_load." >/dev/null 2>&1; then
+        export RIBOMINE_STAR_GENOME_LOAD=LoadAndKeep
+        echo "[node ${HOST}] STAR shared genome loaded"
+    else
+        cat >&2 <<EOF
+[node ${HOST}] FATAL: the STAR genome would not load into shared memory.
+
+  index : ${STAR_INDEX}
+  needs : ~30 GB resident (the SA file alone is ~25 GB)
+
+Not falling back to NoSharedMemory: with --jobs ${RM_JOBS} that would ask this node
+for ${RM_JOBS} separate copies of the index, and it would be OOM-killed on the spot.
+Refusing outright loses the same shard, and says why.
+
+Usual causes, in order:
+  * the job did not ask for enough memory   -> #SBATCH --mem in slurm/run.sh
+  * a leaked segment from a hard-killed job -> STAR --genomeLoad Remove --genomeDir <index>
+  * SHMALL/SHMMAX too small for a 30 GB segment (ask LRZ)
+EOF
+        exit 1
+    fi
+fi
+
 RM_PID=""
 # SLURM's pre-kill SIGTERM: pass it on and let the EXIT trap release the genome.
 # The sample in flight is simply lost -- it has written no JSON, so next round
