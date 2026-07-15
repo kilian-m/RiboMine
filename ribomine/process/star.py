@@ -126,7 +126,7 @@ def align_local(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
 
 def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
                 log: str = "") -> str:
-    """End-to-end alignment of the TRIMMED reads: the deliverable BAM.
+    """Alignment of the TRIMMED reads: the deliverable BAM.
 
     Parameters come from `cfg['mapping']` -- this alignment is the user's, and
     what "a mapped read" means for their downstream analysis is theirs to set.
@@ -137,9 +137,12 @@ def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
     See `ribomine.process.counts` for what those counts do and do not include.
     """
     args = [
+        # STAR writes UNSORTED, always: its coordinate sorter is incompatible with the
+        # shared-memory genome (LoadAndKeep) the batch runs on, so sort_index() below
+        # coordinate-sorts + indexes the deliverable with samtools afterwards.
         "--outSAMtype", "BAM", "Unsorted",
-        "--outSAMattributes", "NH", "HI", "AS", "nM", "MD",
-        "--alignEndsType", str(cfg.get("mapping.align_ends_type", "EndToEnd")),
+        "--outSAMattributes", "nM", "MD", "NH",
+        "--alignEndsType", str(cfg.get("mapping.align_ends_type", "Local")),
         "--outFilterMultimapNmax", str(int(cfg.get("mapping.multimap_nmax", 1))),
         "--outFilterMismatchNmax", str(int(cfg.get("mapping.mismatch_nmax", 3))),
         "--outFilterMismatchNoverLmax", str(float(cfg.get("mapping.mismatch_noverlmax", 0.1))),

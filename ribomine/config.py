@@ -247,9 +247,11 @@ DEFAULTS: dict[str, Any] = {
     },
 
     "mapping": {
-        # end-to-end alignment of the TRIMMED reads: the real output BAM
-        "align_ends_type": "EndToEnd",
-        "multimap_nmax": 1,          # 1 = unique only; raise to keep multimappers
+        # LOCAL alignment of the TRIMMED reads: the real output BAM. Local soft-clips
+        # residual non-genomic ends rather than throwing the read away for them.
+        "align_ends_type": "Local",
+        "multimap_nmax": 10,         # 1 = unique only; >1 keeps reads mapping to up to
+                                     # N loci (primary + secondary, tagged NH/flagged)
         "mismatch_nmax": 3,
         "mismatch_noverlmax": 0.1,
         "match_nmin_over_lread": 0.9,
