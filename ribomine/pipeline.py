@@ -27,6 +27,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 from . import reports
 from .arch import infer as arch_infer
@@ -411,16 +412,61 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                 failed.append({"run_accession": acc, "stage": stage, "error": str(exc),
                                "traceback": traceback.format_exc(limit=3)})
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futs = {ex.submit(fn, *args): args[0] for args in items}
-            for fut in as_completed(futs):
-                acc = futs[fut]
-                try:
-                    fut.result()
-                    ok.append(acc)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.error("[%s] %s failed: %s", acc, stage, exc)
-                    failed.append({"run_accession": acc, "stage": stage, "error": str(exc)})
+        # A worker that raises is recorded and the pool carries on -- but a worker that
+        # is *killed* (the OOM killer picking one process under the startup memory spike,
+        # a segfault in STAR/samtools) is different: it puts the whole ProcessPoolExecutor
+        # into a broken state, and every future still pending then fails at once with
+        # BrokenProcessPool. Left unhandled that discards the entire rest of the shard --
+        # one dead worker throwing away ~1000 samples. So we treat a broken pool as a
+        # transient event: the futures that had not run yet are retried in a fresh pool at
+        # half the width (a narrower wave is less likely to trip the same OOM), down to 1,
+        # for a bounded number of rounds. Only then is the remainder recorded as failed.
+        remaining = list(items)
+        workers = jobs
+        rounds_at_one = 0
+        while remaining:
+            done: set[str] = set()
+            broke = False
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(fn, *args): args[0] for args in remaining}
+                for fut in as_completed(futs):
+                    acc = futs[fut]
+                    try:
+                        fut.result()
+                        ok.append(acc)
+                        done.add(acc)
+                    except BrokenProcessPool:
+                        # This future never ran (or was the one killed); leave it out of
+                        # `done` so it is retried below. Do not record it as a failure.
+                        broke = True
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.error("[%s] %s failed: %s", acc, stage, exc)
+                        failed.append({"run_accession": acc, "stage": stage, "error": str(exc)})
+                        done.add(acc)
+            remaining = [args for args in remaining if args[0] not in done]
+            if not broke or not remaining:
+                break
+            if workers > 1:
+                workers = max(1, workers // 2)
+                LOG.error("stage %s: a worker was killed (pool broken); retrying %d "
+                          "remaining dataset(s) at %d job(s)", stage, len(remaining), workers)
+                continue
+            # Already down to a single worker and it still died: this is not the memory
+            # wave, it is one dataset that kills its process. Give it one more lone pass to
+            # get past it, then stop looping and record whatever is left as failed rather
+            # than churn forever.
+            rounds_at_one += 1
+            if rounds_at_one >= 2:
+                LOG.error("stage %s: %d dataset(s) still break a single-worker pool; "
+                          "recording them as failed", stage, len(remaining))
+                for args in remaining:
+                    failed.append({"run_accession": args[0], "stage": stage,
+                                   "error": "worker killed repeatedly (pool broken); "
+                                            "likely a crash or OOM on this dataset"})
+                remaining = []
+            else:
+                LOG.error("stage %s: a single-worker pool broke; one more lone pass over "
+                          "%d remaining dataset(s)", stage, len(remaining))
 
     LOG.info("── stage %s done: %d ok, %d failed (%.0fs)",
              stage, len(ok), len(failed), time.time() - t0)

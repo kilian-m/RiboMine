@@ -70,9 +70,13 @@
       "the other 27 can. Oversubscription is the point, not an accident.",
       "It costs memory, though: ~28 GB for the node's one shared STAR genome plus",
       "roughly 8 GB per sample in flight, so budget ~250 GB of the node's 480 GB.",
-      "If a node starts swapping, this is the number to cut."
+      "If a node starts swapping, this is the number to cut. Cut from 28 to 14 after",
+      "the 2026-07-15 run: at 28 the startup wave (LPT packs the deepest runs first,",
+      "so the first batch is the heaviest) OOM-killed a worker, and a killed worker",
+      "used to break the whole pool. pipeline._pool now recovers from that, but 14 is",
+      "the width that stops tripping it in the first place."
     ],
-    "jobs": 28,
+    "jobs": 14,
     "threads": 8
   },
 
