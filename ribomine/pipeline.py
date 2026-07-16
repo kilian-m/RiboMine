@@ -412,18 +412,23 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                 failed.append({"run_accession": acc, "stage": stage, "error": str(exc),
                                "traceback": traceback.format_exc(limit=3)})
     else:
-        # A worker that raises is recorded and the pool carries on -- but a worker that
-        # is *killed* (the OOM killer picking one process under the startup memory spike,
-        # a segfault in STAR/samtools) is different: it puts the whole ProcessPoolExecutor
-        # into a broken state, and every future still pending then fails at once with
-        # BrokenProcessPool. Left unhandled that discards the entire rest of the shard --
-        # one dead worker throwing away ~1000 samples. So we treat a broken pool as a
-        # transient event: the futures that had not run yet are retried in a fresh pool at
-        # half the width (a narrower wave is less likely to trip the same OOM), down to 1,
-        # for a bounded number of rounds. Only then is the remainder recorded as failed.
+        # A worker that RAISES is recorded and the pool carries on -- but a worker that is
+        # *killed* (the OOM killer under the startup memory wave; a segfault in STAR on one
+        # dataset's reads) is different: it breaks the whole ProcessPoolExecutor, and every
+        # future still pending then fails at once with BrokenProcessPool. Unhandled, that
+        # discards the entire rest of the shard -- one dead worker throwing away ~1000
+        # samples. Two distinct causes need two distinct answers, and both are here:
+        #
+        #   * the memory wave (many samples at once spike memory at startup): narrow the
+        #     pool -- halve the width and retry the un-run items. A smaller wave fits.
+        #   * a poison-pill dataset (its reads reproducibly kill STAR/the worker): narrowing
+        #     never helps, because the one dataset kills a pool of any width. So once we are
+        #     down to a single worker and it STILL dies, the dataset it died on is the head
+        #     of the queue (at width 1 the pool runs in submission order and nothing new
+        #     completed). Charge the failure to exactly that one, drop it, and go back to
+        #     full width for the rest. NEVER dump the untried remainder.
         remaining = list(items)
         workers = jobs
-        rounds_at_one = 0
         while remaining:
             done: set[str] = set()
             broke = False
@@ -451,22 +456,19 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                 LOG.error("stage %s: a worker was killed (pool broken); retrying %d "
                           "remaining dataset(s) at %d job(s)", stage, len(remaining), workers)
                 continue
-            # Already down to a single worker and it still died: this is not the memory
-            # wave, it is one dataset that kills its process. Give it one more lone pass to
-            # get past it, then stop looping and record whatever is left as failed rather
-            # than churn forever.
-            rounds_at_one += 1
-            if rounds_at_one >= 2:
-                LOG.error("stage %s: %d dataset(s) still break a single-worker pool; "
-                          "recording them as failed", stage, len(remaining))
-                for args in remaining:
-                    failed.append({"run_accession": args[0], "stage": stage,
-                                   "error": "worker killed repeatedly (pool broken); "
-                                            "likely a crash or OOM on this dataset"})
-                remaining = []
-            else:
-                LOG.error("stage %s: a single-worker pool broke; one more lone pass over "
-                          "%d remaining dataset(s)", stage, len(remaining))
+            # Width 1 and still broke: `remaining[0]` is the dataset that killed the worker
+            # (at width 1 the pool runs in submission order, and nothing new landed in
+            # `done` this round). Fail that one alone and carry on with the rest at full
+            # width -- so a single poison pill costs one dataset, not the whole shard.
+            poison = remaining[0]
+            LOG.error("stage %s: [%s] repeatedly killed its worker process (pool broken); "
+                      "recording it failed and continuing with %d other dataset(s)",
+                      stage, poison[0], len(remaining) - 1)
+            failed.append({"run_accession": poison[0], "stage": stage,
+                           "error": "killed its worker process (pool broken); a crash or "
+                                    "OOM on this dataset's reads"})
+            remaining = remaining[1:]
+            workers = jobs
 
     LOG.info("── stage %s done: %d ok, %d failed (%.0fs)",
              stage, len(ok), len(failed), time.time() - t0)
