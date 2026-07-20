@@ -912,7 +912,8 @@ def test_every_mapping_summary_column_is_actually_produced(tmp_path):
                     "frac_multimapping": 0.1, "frac_unmapped": 0.15,
                     "avg_input_len": 31.0, "avg_mapped_len": 29.4},
         "periodicity": {"n_reads_in_bam": 30, "n_reads_scored": 30, "mean_mapped_len": 29.4,
-                        "read_len_mode": 30, "periodicity_inframe_frac": 0.6,
+                        "mean_mapped_softclip": 0.3, "read_len_mode": 30,
+                        "periodicity_inframe_frac": 0.6,
                         "periodicity_tvd_uniform": 0.4, "n_cds_reads": 20,
                         "cds_frac_of_genic": 0.8},
         "counts": {"n_in_genes": 25, "frac_in_genes": 0.83, "n_genes_detected": 9,
@@ -927,11 +928,13 @@ def test_every_mapping_summary_column_is_actually_produced(tmp_path):
     assert not extra, f"row keys write_tsv would silently drop: {extra}"
 
     # the headline columns the table leads with, in order
-    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS
-    assert reports.PROCESS_COLUMNS[:7] == [
+    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS, then the soft-clip that
+    # tells the two apart
+    assert reports.PROCESS_COLUMNS[:8] == [
         "run_accession", "verdict", "architecture", "n_mapped", "mean_footprint_len",
-        "mean_mapped_len", "periodicity_tvd"]
+        "mean_mapped_len", "mean_mapped_softclip", "periodicity_tvd"]
     assert row["n_mapped"] == 30
+    assert row["mean_mapped_softclip"] == 0.3
     # the footprint length is STAR's INPUT (trimmed + contaminant-free), never
     # mean_len_after_trim, which still has the contaminants in it
     assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]

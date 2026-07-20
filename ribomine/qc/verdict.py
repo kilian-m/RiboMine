@@ -204,7 +204,7 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
     len_hist: Counter = Counter()
     region_hist: Counter = Counter()
     frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
-    seen = n = 0
+    seen = n = softclip = 0
     for aln in bamf:
         if aln.is_unmapped or aln.is_secondary or aln.is_supplementary:
             continue
@@ -214,6 +214,8 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
         n += 1
         chrom, p5, strand, L = _read_5p(aln)
         len_hist[L] += 1
+        ct = aln.cigartuples
+        softclip += sum(ln for op, ln in ct if op == 4) if ct else 0
         region, frame, _ = _classify(idx, ncls, chrom, p5, strand)
         region_hist[region] += 1
         if region == "CDS" and frame is not None:
@@ -252,6 +254,15 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
         # tails cannot move it (SRR25706716 peaks at 28 nt with a median of 26, dragged
         # down by miRNA). The mean is what you want when the whole distribution matters.
         "mean_mapped_len": round(sum(L * c for L, c in len_hist.items()) / n, 1),
+        # Mean soft-clip per mapped read -- the non-genomic bases local alignment shaved
+        # off the trimmed read. This is what makes the mean_footprint_len/mean_mapped_len
+        # gap READABLE: a large gap can mean either residual construct clipped off the
+        # mapped reads (a trim miss, e.g. SRR18113808 pre-fix ~9 nt) OR merely that longer
+        # unmappable read-through inflates mean_footprint_len (an average over ALL input
+        # reads) while the mapped footprints are clean. This tells the two apart -- near 0
+        # is clean (a kept non-templated RT base contributes ~its penetrance); large is
+        # residual the trim missed and STAR clipped rather than aligned.
+        "mean_mapped_softclip": round(softclip / n, 2),
         "read_len_mode": max(len_hist, key=lambda k: len_hist[k]),
         "periodicity_inframe_frac": round(inframe / cds_reads, 3) if cds_reads else 0.0,
         "periodicity_tvd_uniform": round(_tvd_uniform(pooled), 3),

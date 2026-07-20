@@ -79,6 +79,8 @@ PROCESS_COLUMNS = [
     "n_mapped",              # reads in the deliverable BAM: trimmed, filtered, deduped
     "mean_footprint_len",    # the FOOTPRINTS: trimmed and contaminant-free, as fed to STAR
     "mean_mapped_len",       # the MAPPINGS: aligned length of what reached the BAM
+    "mean_mapped_softclip",  # non-genomic nt clipped off the mapped reads: reads the gap
+                             # above -- large = residual the trim missed; ~0 = clean footprints
     "periodicity_tvd",
     # --- the rest of the BAM's own measurement
     "periodicity_inframe", "read_len_mode", "n_cds_reads", "cds_frac_of_genic",
@@ -459,6 +461,7 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         # any dedup -- which is why it is our own pass and not STAR's `avg_mapped_len`,
         # though the two agree to a decimal when nothing is removed after mapping.
         "mean_mapped_len": per.get("mean_mapped_len"),
+        "mean_mapped_softclip": per.get("mean_mapped_softclip"),
         "read_len_mode": per.get("read_len_mode"),
         "periodicity_inframe": per.get("periodicity_inframe_frac"),
         "periodicity_tvd": per.get("periodicity_tvd_uniform"),
