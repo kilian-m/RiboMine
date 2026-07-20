@@ -86,20 +86,44 @@ def find_adapter(read: str, adapter: str, min_start: int, min_overlap: int = 7) 
     return lo + m[2] if m else -1     # m[2] = where the adapter starts in read[lo:]
 
 
-def trim_polyA(read: str, min_run: int = 6) -> int:
+def trim_polyA(read: str, min_run: int = 6, max_gap: int = 1) -> int:
     """Index where a poly(A) (or poly(T)) tail ENDING THE READ starts, or len(read).
 
     Terminal-only, and used where the caller has already cut everything past the tail
     off (so the tail is the last thing in the string by construction). When the read may
     still run on into a construct, use `find_polyA`.
+
+    A conserved base embedded in the tail is stepped over: some poly(A)-primed libraries
+    carry an [A..]-C-[A..] linker before the adapter (SRR18113808: a fixed C between two
+    ~10 nt A-runs), and a terminal-only cut removes only the adapter-proximal run, leaving
+    the footprint-proximal run AND the C on the read -- ~11 nt that STAR then soft-clips,
+    so `mean_mapped_len` falls that far below `mean_footprint_len`. After the terminal run
+    the search hops up to `max_gap` non-run bases, but ONLY when another run of >= min_run
+    of the same base resumes just past the gap. A genomic footprint does not carry a
+    >= min_run A-run abutting the tail, so that boundary is never crossed (the internal-run
+    guard the footprint-protection tests rest on is preserved).
     """
     n = len(read)
     for base in ("A", "T"):
         i = n
         while i > 0 and read[i - 1] == base:
             i -= 1
-        if n - i >= min_run:
-            return i
+        if n - i < min_run:
+            continue                         # no terminal run of this base
+        while True:                          # hop a short gap only if a real run resumes
+            k, g = i, 0
+            while k > 0 and read[k - 1] != base and g < max_gap:
+                k -= 1
+                g += 1
+            if k == 0 or read[k - 1] != base:
+                break                        # nothing but the gap: stop at the run we have
+            j = k
+            while j > 0 and read[j - 1] == base:
+                j -= 1
+            if k - j < min_run:
+                break                        # the stretch past the gap is too short to be tail
+            i = j
+        return i
     return n
 
 

@@ -418,6 +418,25 @@ def test_polyA_tail_is_trimmed_even_when_an_adapter_is_also_present(tmp_path):
     assert seq == fp, "the poly(A) tail must not survive as footprint"
 
 
+def test_an_interrupted_polyA_tail_is_trimmed_whole(tmp_path):
+    """Some poly(A)-primed libraries carry an [A..]-C-[A..] linker before the adapter --
+    a conserved base splitting the tail in two (SRR18113808: a fixed C between a ~10 nt and
+    a ~9 nt A-run before TruSeq). A terminal-only cut removes just the adapter-proximal run
+    and leaves the footprint-proximal run and the C on the read; STAR then soft-clips them,
+    so mean_mapped_len falls ~9 nt below mean_footprint_len. The whole interrupted tail must
+    come off. The [A..]-C-[A..] runs also jitter +-1 nt read to read, so this cannot be
+    named as a fixed adapter/barcode -- it has to be trimmed as the poly(A) it is."""
+    fp = FOOT[:28]
+    assert not fp.endswith("A")
+    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
+                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
+    out = str(tmp_path / "o.fastq")
+    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAA" + "C" + "AAAAAAAAA" + ADAP]),
+                    call, out, min_len=20)
+    (_, seq), = _read(out)
+    assert seq == fp, f"the interrupted poly(A) tail must not survive: {seq!r}"
+
+
 def test_polyA_still_trimmed_when_the_adapter_is_beyond_it(tmp_path):
     """The other poly(A) case -- adapter not visible past the tail -- must keep working."""
     fp = FOOT[:28]
