@@ -61,6 +61,20 @@ FLUSH_RECORDS = 8192          # records buffered per write() -- bounded memory
 # sample (STAR is), and correctness is not negotiable for throughput.
 BOWTIE2_MAX_THREADS = 8
 
+# Reads longer than this are dropped before STAR. STAR is a short-read aligner, and a
+# multi-kilobase read (a long-read/nanopore run mis-caught by the archive query -- some
+# carry a median read length over 1 kb) overflows its input parser: STAR then MISreports
+# the overflow as "FATAL ERROR in reads input: quality string length is not equal to
+# sequence length" -- even when seq and qual match exactly -- and SEGFAULTS (exit 139).
+# Alone that is a caught per-sample failure; under the shared-memory pool the segfault's
+# core-dump of a ~28 GB-mapped process spikes memory, the OOM-killer takes a *worker*,
+# and it surfaces as BrokenProcessPool ("a crash or OOM"), costing the whole batch, not
+# one run. 300 is ~2x the longest plausible footprint read (a ~36 nt footprint plus 5'
+# construct, 3' adapter and UMI is well under 150 nt even untrimmed) and far below the
+# >1 kb reads that trip STAR -- so it drops nothing real and lets QC render a verdict on
+# a long-read run instead of crashing on it.
+MAX_READ_LEN = 300
+
 
 def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                  threads: int = 8, log: str = "") -> dict:
@@ -127,8 +141,21 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                 f"mapped, so the sample is failed rather than filtered wrongly."
             )
 
+    if s.get("n_overlong"):
+        LOG.warning("%s: dropped %s read(s) longer than %d nt -- STAR's short-read parser "
+                    "overflows on them (fatal error + segfault, exit 139). This run looks "
+                    "like long-read data mis-caught by the query; the short reads are "
+                    "filtered and mapped so QC can still judge it.",
+                    label, f"{s['n_overlong']:,}", MAX_READ_LEN)
+    if s.get("n_malformed"):
+        LOG.warning("%s: dropped %s read(s) whose quality string length != the sequence "
+                    "length -- a corrupt FASTQ record that makes STAR fatal-error and "
+                    "segfault (exit 139). The rest of the run is filtered and mapped "
+                    "normally.", label, f"{s['n_malformed']:,}")
+
     stats = _stats(label, n_total, n_contaminant=n_contaminant,
-                   n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"])
+                   n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"],
+                   n_malformed=s.get("n_malformed", 0), n_overlong=s.get("n_overlong", 0))
     LOG.info("%s: %s/%s reads kept (%.0f%%) | removed: rRNA/tRNA/etc %.0f%%, "
              "low-complexity %.0f%%", label, f"{stats['n_kept']:,}", f"{n_total:,}",
              100 * stats["frac_kept"], 100 * stats["frac_contaminant_structured_rna"],
@@ -264,13 +291,27 @@ def low_complexity(seq: str, *, min_entropy: float, max_base_frac: float) -> boo
 
 def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float,
             threads: int = 1) -> dict:
-    """Drop low-complexity / homopolymer reads; keep the rest at FULL length.
+    """Drop over-length, malformed and low-complexity / homopolymer reads; keep the
+    rest at FULL length.
 
     Streams: one record in, one record out, never the file in memory. Input gz-ness
     comes from `fastq`'s suffix, output gz-ness from `out_fq`'s -- the two are
     independent (bowtie2's `--un` temp is plain even when the input was gzipped).
+
+    Two guards protect STAR from a fatal-error-then-SEGFAULT (exit 139) on input it
+    cannot parse -- which under the shared-memory pool cascades from one bad read into
+    a killed worker (BrokenProcessPool, "a crash or OOM") that costs the whole batch:
+
+      * OVER-LENGTH reads (> MAX_READ_LEN) -- the real-world case: a long-read/nanopore
+        run mis-caught by the archive query overflows STAR's short-read parser. See
+        MAX_READ_LEN.
+      * MALFORMED records (len(qual) != len(seq)) -- a genuinely corrupt FASTQ record.
+        Rare, cheap to check, and the same STAR error, so guarded here too.
+
+    Both are counted in `n_in` like a low-complexity drop, so filter_fastq's --un
+    integrity check still balances.
     """
-    n_in = n_lowc = n_kept = 0
+    n_in = n_lowc = n_kept = n_malformed = n_overlong = 0
     # ... and write via a temp so a killed run cannot leave a truncated FASTQ that
     # `resume` (which only asks "is it non-empty?") would then map.
     partial = out_fq + ".partial"
@@ -286,6 +327,12 @@ def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float
                 plus = fh.readline()
                 qual = fh.readline().rstrip("\n")
                 n_in += 1
+                if len(seq) > MAX_READ_LEN:
+                    n_overlong += 1
+                    continue
+                if len(seq) != len(qual):
+                    n_malformed += 1
+                    continue
                 if low_complexity(seq.upper(), min_entropy=min_entropy,
                                   max_base_frac=max_base_frac):
                     n_lowc += 1
@@ -301,7 +348,8 @@ def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float
     finally:
         if os.path.exists(partial):
             os.remove(partial)
-    return {"n_in": n_in, "n_low_complexity": n_lowc, "n_kept": n_kept}
+    return {"n_in": n_in, "n_low_complexity": n_lowc, "n_kept": n_kept,
+            "n_malformed": n_malformed, "n_overlong": n_overlong}
 
 
 def _run_bowtie2(fastq: str, index: str, noncontam_fq: str, *, threads: int,
@@ -507,15 +555,19 @@ def _warn_missing_index(index: str | None) -> None:
 
 
 def _stats(label: str, n_input: int, *, n_contaminant: int, n_low_complexity: int,
-           n_kept: int) -> dict:
+           n_kept: int, n_malformed: int = 0, n_overlong: int = 0) -> dict:
     denom = max(n_input, 1)
     return {
         "label": label,
         "n_input": n_input,
         "n_contaminant_rRNA_tRNA_etc": n_contaminant,
         "n_low_complexity": n_low_complexity,
+        "n_malformed": n_malformed,
+        "n_overlong": n_overlong,
         "n_kept": n_kept,
         "frac_contaminant_structured_rna": round(n_contaminant / denom, 4),
         "frac_low_complexity": round(n_low_complexity / denom, 4),
+        "frac_malformed": round(n_malformed / denom, 4),
+        "frac_overlong": round(n_overlong / denom, 4),
         "frac_kept": round(n_kept / denom, 4),
     }

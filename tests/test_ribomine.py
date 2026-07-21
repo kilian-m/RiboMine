@@ -732,6 +732,36 @@ def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, t
     assert st["n_input"] == 100 and st["n_kept"] == 55
 
 
+def test_screen_drops_overlength_and_malformed_reads_that_crash_star(tmp_path):
+    """STAR fatal-errors and SEGFAULTS (exit 139) on input its short-read parser cannot
+    hold -- and under the shared-memory pool that segfault reads as a killed worker
+    ("crash or OOM"), losing the run and its neighbours. _screen guards STAR from the
+    two cases: an OVER-LENGTH read (a long-read run mis-caught by the query, the
+    real-world cause) and a genuinely MALFORMED record (len(qual) != len(seq)). Both are
+    still counted in n_in, so filter_fastq's --un integrity arithmetic balances, and the
+    good short reads pass through so QC can still render a verdict."""
+    from ribomine.qc import contaminants
+
+    in_fq = tmp_path / "in.fastq"
+    out_fq = tmp_path / "out.fastq"
+    long_seq = "ACGT" * 200                          # 800 nt -- STAR would overflow on it
+    in_fq.write_text(
+        "@good1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n"
+        f"@toolong\n{long_seq}\n+\n{'I' * len(long_seq)}\n"   # well-formed but > MAX_READ_LEN
+        "@malformed\nACGTACGTACGT\n+\nIIIIIIIIIII\n"          # 12 nt seq, 11 nt qual
+        "@good2\nTGCATGCATGCA\n+\nIIIIIIIIIIII\n"
+    )
+    s = contaminants._screen(str(in_fq), str(out_fq), min_entropy=1.1, max_base_frac=0.85)
+
+    assert s["n_overlong"] == 1
+    assert s["n_malformed"] == 1
+    assert s["n_in"] == 4            # every record is read, so the --un check still holds
+    assert s["n_kept"] == 2
+    written = out_fq.read_text()
+    assert "@toolong" not in written and "@malformed" not in written
+    assert "@good1" in written and "@good2" in written
+
+
 def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
     """The adapter is not always the last thing in the read. Sequence past it -- an
     index, a second adapter, a sample barcode -- is normal, and the read must still be
