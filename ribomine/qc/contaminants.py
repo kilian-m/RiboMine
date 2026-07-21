@@ -105,13 +105,34 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
     os.makedirs(os.path.dirname(os.path.abspath(out_fq)) or ".", exist_ok=True)
 
     n_bowtie_total = 0
+    n_nonbase = 0
     with _noncontam_tmp(out_fq) as tmp:
         if _index_exists(index):
             # bowtie2 --un writes plain FASTQ, so this temp is uncompressed. It
             # lives next to the output rather than in /tmp: it is as large as the
             # input, and a 500-sample run would otherwise fill the system tmpfs.
-            n_bowtie_total, n_contaminant = _run_bowtie2(in_fq, index, tmp,
-                                                         threads=threads, log=log)
+            try:
+                n_bowtie_total, n_contaminant = _run_bowtie2(in_fq, index, tmp,
+                                                             threads=threads, log=log)
+            except ToolError as exc:
+                # bowtie2 ABORTS (SIGABRT, core dumped) on a read it cannot parse as
+                # base-space: SOLiD/colour-space reads carry their bases as digits 0-3,
+                # which bowtie2 discards and is then left with "more quality values than
+                # read characters". This happens INSIDE bowtie2, before _screen ever
+                # runs. Solo it is a caught failure; under the pool the abort's core-dump
+                # OOM-kills a worker (BrokenProcessPool, "crash or OOM"). Drop the reads
+                # bowtie2 cannot read and retry once, so the run fails GRACEFULLY -- a
+                # clean verdict on whatever survives (nothing, for a wholly colour-space
+                # run -> "not ribo-seq") -- instead of taking the batch down.
+                if "more quality values than read characters" not in (exc.stderr or ""):
+                    raise
+                with _base_space_tmp(in_fq, out_fq, threads=threads) as (clean_in, n_nonbase):
+                    LOG.warning("%s: bowtie2 aborted -- dropped %s read(s) it could not parse "
+                                "as base-space (non-ACGTN sequence; looks like SOLiD/colour-"
+                                "space data mis-caught by the query) and retried.",
+                                label, f"{n_nonbase:,}")
+                    n_bowtie_total, n_contaminant = _run_bowtie2(clean_in, index, tmp,
+                                                                 threads=threads, log=log)
             src = tmp                       # plain FASTQ, whatever in_fq was
         else:
             _warn_missing_index(index)
@@ -123,8 +144,10 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
     # Every input read is either aligned (contaminant) or written to --un, so the
     # total falls out of the two counters -- no need to decompress the whole input
     # a second time just to count its reads (a multi-GB pass in stage 4). bowtie2's
-    # own "N reads; of these:" is the cross-check, and the fallback if it moves.
-    n_total = n_bowtie_total or (n_contaminant + s["n_in"])
+    # own "N reads; of these:" is the cross-check, and the fallback if it moves. When
+    # a colour-space retry dropped reads before bowtie2, add them back for the input
+    # total (bowtie2 only ever saw the base-space survivors).
+    n_total = (n_bowtie_total + n_nonbase) or (n_contaminant + s["n_in"])
 
     # ... and that identity is also an exact integrity check on the `--un` file, for
     # free. bowtie2 says how many reads it read and how many it aligned; every other
@@ -153,9 +176,13 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                     "segfault (exit 139). The rest of the run is filtered and mapped "
                     "normally.", label, f"{s['n_malformed']:,}")
 
+    # Reads a downstream tool could not parse -- whether bowtie2's abort caught them
+    # (colour-space / non-ACGTN, before the filter) or _screen did (length mismatch on
+    # the no-index path) -- are reported together as "malformed".
     stats = _stats(label, n_total, n_contaminant=n_contaminant,
                    n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"],
-                   n_malformed=s.get("n_malformed", 0), n_overlong=s.get("n_overlong", 0))
+                   n_malformed=s.get("n_malformed", 0) + n_nonbase,
+                   n_overlong=s.get("n_overlong", 0))
     LOG.info("%s: %s/%s reads kept (%.0f%%) | removed: rRNA/tRNA/etc %.0f%%, "
              "low-complexity %.0f%%", label, f"{stats['n_kept']:,}", f"{n_total:,}",
              100 * stats["frac_kept"], 100 * stats["frac_contaminant_structured_rna"],
@@ -441,6 +468,63 @@ def _noncontam_tmp(out_fq: str) -> Iterator[str]:
     os.close(fd)
     try:
         yield tmp
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# Deletes every valid base from a sequence; whatever is LEFT is a character bowtie2
+# cannot parse. SOLiD colour-space encodes each base transition as a digit 0-3 (after
+# a leading primer base), e.g. "T2220001032..." -- bowtie2 discards the digits, is then
+# left with more quality values than read characters, and SIGABRTs. `str.translate`
+# with this table is a C-level test for "is this read base-space at all?".
+_NON_BASE = str.maketrans("", "", "ACGTNacgtn")
+
+
+def _copy_base_space(in_fq: str, out_fq: str) -> int:
+    """Stream `in_fq` -> `out_fq` (plain FASTQ), dropping every record bowtie2 cannot
+    parse: a sequence with characters outside ACGTN (SOLiD colour-space digits), or a
+    quality string whose length != the sequence length. Returns the number dropped.
+
+    Done as a pre-pass ONLY on the retry after bowtie2 has already aborted -- never on
+    the happy path, where it would be a wasted decompress of every multi-GB input.
+    """
+    n_dropped = 0
+    buf: list[str] = []
+    with open_fastq(in_fq, "rt") as fh, open(out_fq, "wt") as out:
+        while True:
+            h = fh.readline()
+            if not h:
+                break
+            seq = fh.readline()
+            plus = fh.readline()
+            qual = fh.readline()
+            s = seq.rstrip("\n")
+            if len(s) != len(qual.rstrip("\n")) or s.translate(_NON_BASE):
+                n_dropped += 1
+                continue
+            buf.append(h + seq + plus + qual)
+            if len(buf) >= FLUSH_RECORDS:
+                out.write("".join(buf))
+                buf.clear()
+        if buf:
+            out.write("".join(buf))
+    return n_dropped
+
+
+@contextlib.contextmanager
+def _base_space_tmp(in_fq: str, out_fq: str, *, threads: int = 1) -> Iterator[tuple[str, int]]:
+    """A copy of `in_fq` with every record bowtie2 cannot parse removed (non-ACGTN
+    sequence, or len(qual) != len(seq)), to feed bowtie2 after it aborted on one.
+    Yields (path, n_dropped); the temp is removed on every exit path. Written next to
+    the output, not /tmp: it is as large as the input (multi-GB in stage 4), the same
+    reason _noncontam_tmp is."""
+    d = os.path.dirname(os.path.abspath(out_fq))
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".basespace.fastq")
+    os.close(fd)
+    try:
+        n_dropped = _copy_base_space(in_fq, tmp)
+        yield tmp, n_dropped
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
