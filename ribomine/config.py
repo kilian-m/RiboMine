@@ -139,6 +139,13 @@ DEFAULTS: dict[str, Any] = {
         "read_len_peak_frac_min": 0.40,
         "cds_enrich_min": 0.20,      # fraction of genic reads in CDS to look ribo-seq
         "cds_strong": 0.55,          # strong CDS enrichment excuses weak periodicity
+        # Specificity floor (HARD gates). RiboMine prefers specificity over sensitivity:
+        # a library that clears everything below but is not CDS-dominated in its region
+        # composition, or is not footprint-length-dominated, is called LOW QUALITY even
+        # when it is strongly periodic. These two hold regardless of periodicity.
+        "cds_region_min": 0.50,      # CDS fraction of ALL reads (region composition); below = low quality
+        "read_len_min_frac": 0.75,   # fraction of reads in the footprint window (25-36 nt); below = low quality
+                                     # (stricter, hard sibling of read_len_peak_frac_min above)
         "periodic_min": 0.42,        # in-frame fraction (chance = 1/3)
         "periodic_strong": 0.50,
         "tvd_min": 0.10,             # TVD of the frame distribution to uniform

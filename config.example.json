@@ -98,6 +98,8 @@
     "read_len_peak_frac_min": 0.4,
     "cds_enrich_min": 0.2,
     "cds_strong": 0.55,
+    "cds_region_min": 0.5,
+    "read_len_min_frac": 0.75,
     "periodic_min": 0.42,
     "periodic_strong": 0.5,
     "tvd_min": 0.1,

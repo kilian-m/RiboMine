@@ -48,6 +48,8 @@ REGION_COLORS = {
 FP_LEN_LO, FP_LEN_HI = 25, 36     # qc.footprint_len_lo / qc.footprint_len_hi
 PERIODIC_MIN = 0.42               # qc.periodic_min      (chance = 1/3)
 PERIODIC_STRONG = 0.50            # qc.periodic_strong
+READ_LEN_MIN_FRAC = 0.75          # qc.read_len_min_frac -- specificity floor (read length)
+CDS_REGION_MIN = 0.50             # qc.cds_region_min    -- specificity floor (region composition)
 
 # metagene window drawn around the codon (nt, 5'-end based)
 META_LO, META_HI = -30, 45
@@ -135,10 +137,14 @@ def _plot_len(ax, qc: dict) -> None:
     ax.set_xlabel("read length (nt)")
     ax.set_ylabel("fraction of reads")
     ax.set_title(title, loc="left", fontsize=10, fontweight="bold")
+    # specificity floor: the fraction inside the window must clear this, or LOW QUALITY
+    rl_floor = _thr(qc, "read_len_min_frac", READ_LEN_MIN_FRAC)
+    peak = qc.get("read_len_peak_frac", 0) or 0
     ax.text(0.98, 0.95,
             f"mode {qc.get('read_len_mode', '?')} nt\n"
-            f"{qc.get('read_len_peak_frac', 0):.0%} in {flo}-{fhi}",
+            f"{peak:.0%} in {flo}-{fhi} (need {rl_floor:.0%})",
             transform=ax.transAxes, ha="right", va="top", fontsize=8,
+            color=C_BAD if peak < rl_floor else "0.15",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7"))
 
 
@@ -196,7 +202,18 @@ def _plot_regions(ax, qc: dict) -> None:
         ax.text(v + 0.01, yi, f"{v:.0%}", va="center", fontsize=8)
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlim(0, max(vals) * 1.18 if vals else 1)
+    # specificity floor: CDS must be at least this share of ALL reads, or LOW QUALITY.
+    # Drawn only across the CDS bar -- it is the CDS share the floor is about, not the
+    # others'.
+    cds_floor = _thr(qc, "cds_region_min", CDS_REGION_MIN)
+    xhi = max((max(vals) if vals else 0.0), cds_floor) * 1.18
+    if "CDS" in labels:
+        cy = int(y[labels.index("CDS")])
+        ax.plot([cds_floor, cds_floor], [cy - 0.45, cy + 0.45],
+                color=C_BAD, lw=1.2, ls="--")
+        ax.text(cds_floor, cy + 0.5, f"floor {cds_floor:.0%}",
+                color=C_BAD, fontsize=7, ha="center", va="bottom")
+    ax.set_xlim(0, xhi if xhi else 1)
     ax.set_xlabel("fraction of reads")
     ax.set_title("E  region composition", loc="left", fontsize=10, fontweight="bold")
 

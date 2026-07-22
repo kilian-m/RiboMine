@@ -17,12 +17,17 @@ ribosome-profiling dataset:
   * mapping stats              -- input / uniquely mapped / multimapping / unmapped
 
 then a three-way verdict -- RIBO-SEQ / TI-SEQ / NOT RIBO-SEQ or LOW QUALITY --
-with the reasons stated. The verdict is deliberately INCLUSIVE so that ribo-seq
-variants are not thrown away: strong periodicity is decisive on its own (it holds
-for TI-seq / QTI-seq, whose initiating ribosomes are still in-frame, and for
-atypically short or long footprints); failing that, footprint-like + CDS-enriched
-reads with any periodicity (or strong CDS enrichment) pass. Only a
-contaminant-dominated or badly-mapping library is refused outright.
+with the reasons stated. The verdict PRIORITIZES SPECIFICITY over sensitivity: two
+hard floors, both measured on ALL reads, gate every pass -- the region composition
+must be CDS-dominated (CDS >= `qc.cds_region_min` of all reads) and the reads must
+be footprint-length (>= `qc.read_len_min_frac` in the 25-36 nt window). These hold
+even for a strongly-periodic library, so a real-but-messy dataset can be refused.
+Above those floors the translating test stays inclusive of ribo-seq variants:
+strong periodicity is decisive on its own (it holds for TI-seq / QTI-seq, whose
+initiating ribosomes are still in-frame, and for atypically short or long
+footprints); failing that, footprint-like + CDS-enriched reads with any periodicity
+(or strong CDS enrichment) pass. A contaminant-dominated or badly-mapping library
+is refused outright.
 
 The QC is measured on the LOCAL alignment because soft-clipping the 5' construct
 / RT base gives a cleaner footprint 5' end -- and hence sharper periodicity --
@@ -291,7 +296,9 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     fp_len_lo = cfg["qc.footprint_len_lo"]
     fp_len_hi = cfg["qc.footprint_len_hi"]
     peak_frac_min = cfg["qc.read_len_peak_frac_min"]
+    read_len_min_frac = cfg["qc.read_len_min_frac"]  # HARD gate: footprint window must dominate
     cds_enrich_min = cfg["qc.cds_enrich_min"]
+    cds_region_min = cfg["qc.cds_region_min"]    # HARD gate: CDS must dominate the region composition
     cds_strong_min = cfg["qc.cds_strong"]        # strong CDS-specific enrichment: ribo-seq
                                                  # even if the (jitter-smeared) periodicity
                                                  # looks weak
@@ -484,14 +491,25 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     start_ratio = peak_h / max(body_mean, 1.0)
     tiseq_like = peak_h >= tiseq_min_peak and start_ratio >= tiseq_ratio_min
 
+    # ---- specificity floor (HARD gates). RiboMine prefers specificity over sensitivity:
+    # a library whose region composition is not CDS-dominated, or whose reads are not
+    # footprint-length-dominated, is LOW QUALITY even when it is strongly periodic. Unlike
+    # `cds_ok` (CDS as a fraction of GENIC reads) and `len_ok` (the softer 40% peak that a
+    # strong periodicity can excuse), these two are measured on ALL reads and cannot be
+    # excused: they gate `usable` directly.
+    cds_region_ok = cds_share >= cds_region_min          # CDS % of the whole region composition
+    read_len_dominant = peak_frac >= read_len_min_frac   # % of reads in the 25-36 nt window
+
     # ---- three-way verdict: RIBO-SEQ / TI-SEQ / NOT RIBO-SEQ or LOW QUALITY.
     # Translating-ribosome data (kept INCLUSIVE for variants) requires periodicity
     # or footprint-like+CDS-enriched reads, and no single-locus contamination; a
     # library that maps poorly (low unique mapping = non-genomic/multimapping junk)
-    # is not usable even if the mappable minority is periodic.
+    # is not usable even if the mappable minority is periodic. On top of that, the two
+    # specificity gates above must hold -- CDS must dominate the region composition and
+    # the reads must be footprint-length -- regardless of how periodic the library looks.
     translating = (not contaminant) and cds_floor_ok and (not locus_over_cds) and (
         periodic_strong or (len_ok and cds_ok and (periodic_weak or strong_cds)))
-    usable = translating and not low_unique
+    usable = translating and not low_unique and cds_region_ok and read_len_dominant
     if not usable:
         verdict = "NOT RIBO-SEQ or LOW QUALITY"
     elif tiseq_like:
@@ -503,7 +521,11 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     reasons = [
         f"footprint length {'ok' if len_ok else 'ATYPICAL'} "
         f"(mode {mode_len} nt, {peak_frac:.0%} in {fp_len_lo}-{fp_len_hi})",
+        f"read-length window {'ok' if read_len_dominant else 'LOW'} "
+        f"({peak_frac:.0%} of reads in {fp_len_lo}-{fp_len_hi} nt, floor {read_len_min_frac:.0%})",
         f"CDS enrichment {'ok' if cds_ok else 'LOW'} ({cds_of_genic:.0%} of genic reads in CDS)",
+        f"region composition {'ok' if cds_region_ok else 'LOW'} "
+        f"({cds_share:.0%} of all reads in CDS, floor {cds_region_min:.0%})",
     ]
     if enough_cds:
         lvl = "STRONG" if periodic_strong else ("weak" if periodic_weak else "ABSENT")
@@ -549,6 +571,13 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
                        f"entire CDS ({cds_share:.0%}) — contaminant-dominated")
         if not cds_floor_ok:
             why.append(f"only {cds_of_genic:.0%} of genic reads are in CDS (not translation)")
+        # specificity floor (measured on ALL reads, cannot be excused by periodicity)
+        if not cds_region_ok:
+            why.append(f"CDS is only {cds_share:.0%} of the region composition "
+                       f"(need {cds_region_min:.0%})")
+        if not read_len_dominant:
+            why.append(f"only {peak_frac:.0%} of reads are footprint-length "
+                       f"({fp_len_lo}-{fp_len_hi} nt; need {read_len_min_frac:.0%})")
         if antisense_deposit:
             msg = (f"the reads are ANTISENSE to the genes ({cds_sense_frac:.0%} of those on a "
                    f"CDS are on its strand), so the CDS is empty by construction")
@@ -593,6 +622,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             "tiseq": tiseq_like,
             "locus_over_cds": locus_over_cds, "cds_floor_ok": cds_floor_ok,
             "antisense_deposit": bool(antisense_deposit),
+            # hard specificity gates (measured on ALL reads)
+            "cds_region_ok": cds_region_ok, "read_len_dominant": read_len_dominant,
         },
         "start_codon_ratio": round(start_ratio, 1),
         "read_len_mode": mode_len,
@@ -633,7 +664,9 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             "footprint_len_lo": fp_len_lo,
             "footprint_len_hi": fp_len_hi,
             "read_len_peak_frac_min": peak_frac_min,
+            "read_len_min_frac": read_len_min_frac,
             "cds_enrich_min": cds_enrich_min,
+            "cds_region_min": cds_region_min,
             "cds_strong": cds_strong_min,
             "periodic_min": periodic_min,
             "periodic_strong": periodic_strong_min,
