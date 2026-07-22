@@ -61,6 +61,20 @@ FLUSH_RECORDS = 8192          # records buffered per write() -- bounded memory
 # sample (STAR is), and correctness is not negotiable for throughput.
 BOWTIE2_MAX_THREADS = 8
 
+# Reads longer than this are dropped before STAR. STAR is a short-read aligner, and a
+# multi-kilobase read (a long-read/nanopore run mis-caught by the archive query -- some
+# carry a median read length over 1 kb) overflows its input parser: STAR then MISreports
+# the overflow as "FATAL ERROR in reads input: quality string length is not equal to
+# sequence length" -- even when seq and qual match exactly -- and SEGFAULTS (exit 139).
+# Alone that is a caught per-sample failure; under the shared-memory pool the segfault's
+# core-dump of a ~28 GB-mapped process spikes memory, the OOM-killer takes a *worker*,
+# and it surfaces as BrokenProcessPool ("a crash or OOM"), costing the whole batch, not
+# one run. 300 is ~2x the longest plausible footprint read (a ~36 nt footprint plus 5'
+# construct, 3' adapter and UMI is well under 150 nt even untrimmed) and far below the
+# >1 kb reads that trip STAR -- so it drops nothing real and lets QC render a verdict on
+# a long-read run instead of crashing on it.
+MAX_READ_LEN = 300
+
 
 def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                  threads: int = 8, log: str = "") -> dict:
@@ -91,13 +105,34 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
     os.makedirs(os.path.dirname(os.path.abspath(out_fq)) or ".", exist_ok=True)
 
     n_bowtie_total = 0
+    n_nonbase = 0
     with _noncontam_tmp(out_fq) as tmp:
         if _index_exists(index):
             # bowtie2 --un writes plain FASTQ, so this temp is uncompressed. It
             # lives next to the output rather than in /tmp: it is as large as the
             # input, and a 500-sample run would otherwise fill the system tmpfs.
-            n_bowtie_total, n_contaminant = _run_bowtie2(in_fq, index, tmp,
-                                                         threads=threads, log=log)
+            try:
+                n_bowtie_total, n_contaminant = _run_bowtie2(in_fq, index, tmp,
+                                                             threads=threads, log=log)
+            except ToolError as exc:
+                # bowtie2 ABORTS (SIGABRT, core dumped) on a read it cannot parse as
+                # base-space: SOLiD/colour-space reads carry their bases as digits 0-3,
+                # which bowtie2 discards and is then left with "more quality values than
+                # read characters". This happens INSIDE bowtie2, before _screen ever
+                # runs. Solo it is a caught failure; under the pool the abort's core-dump
+                # OOM-kills a worker (BrokenProcessPool, "crash or OOM"). Drop the reads
+                # bowtie2 cannot read and retry once, so the run fails GRACEFULLY -- a
+                # clean verdict on whatever survives (nothing, for a wholly colour-space
+                # run -> "not ribo-seq") -- instead of taking the batch down.
+                if "more quality values than read characters" not in (exc.stderr or ""):
+                    raise
+                with _base_space_tmp(in_fq, out_fq, threads=threads) as (clean_in, n_nonbase):
+                    LOG.warning("%s: bowtie2 aborted -- dropped %s read(s) it could not parse "
+                                "as base-space (non-ACGTN sequence; looks like SOLiD/colour-"
+                                "space data mis-caught by the query) and retried.",
+                                label, f"{n_nonbase:,}")
+                    n_bowtie_total, n_contaminant = _run_bowtie2(clean_in, index, tmp,
+                                                                 threads=threads, log=log)
             src = tmp                       # plain FASTQ, whatever in_fq was
         else:
             _warn_missing_index(index)
@@ -109,8 +144,10 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
     # Every input read is either aligned (contaminant) or written to --un, so the
     # total falls out of the two counters -- no need to decompress the whole input
     # a second time just to count its reads (a multi-GB pass in stage 4). bowtie2's
-    # own "N reads; of these:" is the cross-check, and the fallback if it moves.
-    n_total = n_bowtie_total or (n_contaminant + s["n_in"])
+    # own "N reads; of these:" is the cross-check, and the fallback if it moves. When
+    # a colour-space retry dropped reads before bowtie2, add them back for the input
+    # total (bowtie2 only ever saw the base-space survivors).
+    n_total = (n_bowtie_total + n_nonbase) or (n_contaminant + s["n_in"])
 
     # ... and that identity is also an exact integrity check on the `--un` file, for
     # free. bowtie2 says how many reads it read and how many it aligned; every other
@@ -127,8 +164,25 @@ def filter_fastq(in_fq: str, out_fq: str, cfg: Config, *, label: str = "",
                 f"mapped, so the sample is failed rather than filtered wrongly."
             )
 
+    if s.get("n_overlong"):
+        LOG.warning("%s: dropped %s read(s) longer than %d nt -- STAR's short-read parser "
+                    "overflows on them (fatal error + segfault, exit 139). This run looks "
+                    "like long-read data mis-caught by the query; the short reads are "
+                    "filtered and mapped so QC can still judge it.",
+                    label, f"{s['n_overlong']:,}", MAX_READ_LEN)
+    if s.get("n_malformed"):
+        LOG.warning("%s: dropped %s read(s) whose quality string length != the sequence "
+                    "length -- a corrupt FASTQ record that makes STAR fatal-error and "
+                    "segfault (exit 139). The rest of the run is filtered and mapped "
+                    "normally.", label, f"{s['n_malformed']:,}")
+
+    # Reads a downstream tool could not parse -- whether bowtie2's abort caught them
+    # (colour-space / non-ACGTN, before the filter) or _screen did (length mismatch on
+    # the no-index path) -- are reported together as "malformed".
     stats = _stats(label, n_total, n_contaminant=n_contaminant,
-                   n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"])
+                   n_low_complexity=s["n_low_complexity"], n_kept=s["n_kept"],
+                   n_malformed=s.get("n_malformed", 0) + n_nonbase,
+                   n_overlong=s.get("n_overlong", 0))
     LOG.info("%s: %s/%s reads kept (%.0f%%) | removed: rRNA/tRNA/etc %.0f%%, "
              "low-complexity %.0f%%", label, f"{stats['n_kept']:,}", f"{n_total:,}",
              100 * stats["frac_kept"], 100 * stats["frac_contaminant_structured_rna"],
@@ -264,13 +318,27 @@ def low_complexity(seq: str, *, min_entropy: float, max_base_frac: float) -> boo
 
 def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float,
             threads: int = 1) -> dict:
-    """Drop low-complexity / homopolymer reads; keep the rest at FULL length.
+    """Drop over-length, malformed and low-complexity / homopolymer reads; keep the
+    rest at FULL length.
 
     Streams: one record in, one record out, never the file in memory. Input gz-ness
     comes from `fastq`'s suffix, output gz-ness from `out_fq`'s -- the two are
     independent (bowtie2's `--un` temp is plain even when the input was gzipped).
+
+    Two guards protect STAR from a fatal-error-then-SEGFAULT (exit 139) on input it
+    cannot parse -- which under the shared-memory pool cascades from one bad read into
+    a killed worker (BrokenProcessPool, "a crash or OOM") that costs the whole batch:
+
+      * OVER-LENGTH reads (> MAX_READ_LEN) -- the real-world case: a long-read/nanopore
+        run mis-caught by the archive query overflows STAR's short-read parser. See
+        MAX_READ_LEN.
+      * MALFORMED records (len(qual) != len(seq)) -- a genuinely corrupt FASTQ record.
+        Rare, cheap to check, and the same STAR error, so guarded here too.
+
+    Both are counted in `n_in` like a low-complexity drop, so filter_fastq's --un
+    integrity check still balances.
     """
-    n_in = n_lowc = n_kept = 0
+    n_in = n_lowc = n_kept = n_malformed = n_overlong = 0
     # ... and write via a temp so a killed run cannot leave a truncated FASTQ that
     # `resume` (which only asks "is it non-empty?") would then map.
     partial = out_fq + ".partial"
@@ -286,6 +354,12 @@ def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float
                 plus = fh.readline()
                 qual = fh.readline().rstrip("\n")
                 n_in += 1
+                if len(seq) > MAX_READ_LEN:
+                    n_overlong += 1
+                    continue
+                if len(seq) != len(qual):
+                    n_malformed += 1
+                    continue
                 if low_complexity(seq.upper(), min_entropy=min_entropy,
                                   max_base_frac=max_base_frac):
                     n_lowc += 1
@@ -301,7 +375,8 @@ def _screen(fastq: str, out_fq: str, *, min_entropy: float, max_base_frac: float
     finally:
         if os.path.exists(partial):
             os.remove(partial)
-    return {"n_in": n_in, "n_low_complexity": n_lowc, "n_kept": n_kept}
+    return {"n_in": n_in, "n_low_complexity": n_lowc, "n_kept": n_kept,
+            "n_malformed": n_malformed, "n_overlong": n_overlong}
 
 
 def _run_bowtie2(fastq: str, index: str, noncontam_fq: str, *, threads: int,
@@ -393,6 +468,63 @@ def _noncontam_tmp(out_fq: str) -> Iterator[str]:
     os.close(fd)
     try:
         yield tmp
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# Deletes every valid base from a sequence; whatever is LEFT is a character bowtie2
+# cannot parse. SOLiD colour-space encodes each base transition as a digit 0-3 (after
+# a leading primer base), e.g. "T2220001032..." -- bowtie2 discards the digits, is then
+# left with more quality values than read characters, and SIGABRTs. `str.translate`
+# with this table is a C-level test for "is this read base-space at all?".
+_NON_BASE = str.maketrans("", "", "ACGTNacgtn")
+
+
+def _copy_base_space(in_fq: str, out_fq: str) -> int:
+    """Stream `in_fq` -> `out_fq` (plain FASTQ), dropping every record bowtie2 cannot
+    parse: a sequence with characters outside ACGTN (SOLiD colour-space digits), or a
+    quality string whose length != the sequence length. Returns the number dropped.
+
+    Done as a pre-pass ONLY on the retry after bowtie2 has already aborted -- never on
+    the happy path, where it would be a wasted decompress of every multi-GB input.
+    """
+    n_dropped = 0
+    buf: list[str] = []
+    with open_fastq(in_fq, "rt") as fh, open(out_fq, "wt") as out:
+        while True:
+            h = fh.readline()
+            if not h:
+                break
+            seq = fh.readline()
+            plus = fh.readline()
+            qual = fh.readline()
+            s = seq.rstrip("\n")
+            if len(s) != len(qual.rstrip("\n")) or s.translate(_NON_BASE):
+                n_dropped += 1
+                continue
+            buf.append(h + seq + plus + qual)
+            if len(buf) >= FLUSH_RECORDS:
+                out.write("".join(buf))
+                buf.clear()
+        if buf:
+            out.write("".join(buf))
+    return n_dropped
+
+
+@contextlib.contextmanager
+def _base_space_tmp(in_fq: str, out_fq: str, *, threads: int = 1) -> Iterator[tuple[str, int]]:
+    """A copy of `in_fq` with every record bowtie2 cannot parse removed (non-ACGTN
+    sequence, or len(qual) != len(seq)), to feed bowtie2 after it aborted on one.
+    Yields (path, n_dropped); the temp is removed on every exit path. Written next to
+    the output, not /tmp: it is as large as the input (multi-GB in stage 4), the same
+    reason _noncontam_tmp is."""
+    d = os.path.dirname(os.path.abspath(out_fq))
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".basespace.fastq")
+    os.close(fd)
+    try:
+        n_dropped = _copy_base_space(in_fq, tmp)
+        yield tmp, n_dropped
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -507,15 +639,19 @@ def _warn_missing_index(index: str | None) -> None:
 
 
 def _stats(label: str, n_input: int, *, n_contaminant: int, n_low_complexity: int,
-           n_kept: int) -> dict:
+           n_kept: int, n_malformed: int = 0, n_overlong: int = 0) -> dict:
     denom = max(n_input, 1)
     return {
         "label": label,
         "n_input": n_input,
         "n_contaminant_rRNA_tRNA_etc": n_contaminant,
         "n_low_complexity": n_low_complexity,
+        "n_malformed": n_malformed,
+        "n_overlong": n_overlong,
         "n_kept": n_kept,
         "frac_contaminant_structured_rna": round(n_contaminant / denom, 4),
         "frac_low_complexity": round(n_low_complexity / denom, 4),
+        "frac_malformed": round(n_malformed / denom, 4),
+        "frac_overlong": round(n_overlong / denom, 4),
         "frac_kept": round(n_kept / denom, 4),
     }

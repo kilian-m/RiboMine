@@ -732,6 +732,103 @@ def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, t
     assert st["n_input"] == 100 and st["n_kept"] == 55
 
 
+def test_screen_drops_overlength_and_malformed_reads_that_crash_star(tmp_path):
+    """STAR fatal-errors and SEGFAULTS (exit 139) on input its short-read parser cannot
+    hold -- and under the shared-memory pool that segfault reads as a killed worker
+    ("crash or OOM"), losing the run and its neighbours. _screen guards STAR from the
+    two cases: an OVER-LENGTH read (a long-read run mis-caught by the query, the
+    real-world cause) and a genuinely MALFORMED record (len(qual) != len(seq)). Both are
+    still counted in n_in, so filter_fastq's --un integrity arithmetic balances, and the
+    good short reads pass through so QC can still render a verdict."""
+    from ribomine.qc import contaminants
+
+    in_fq = tmp_path / "in.fastq"
+    out_fq = tmp_path / "out.fastq"
+    long_seq = "ACGT" * 200                          # 800 nt -- STAR would overflow on it
+    in_fq.write_text(
+        "@good1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n"
+        f"@toolong\n{long_seq}\n+\n{'I' * len(long_seq)}\n"   # well-formed but > MAX_READ_LEN
+        "@malformed\nACGTACGTACGT\n+\nIIIIIIIIIII\n"          # 12 nt seq, 11 nt qual
+        "@good2\nTGCATGCATGCA\n+\nIIIIIIIIIIII\n"
+    )
+    s = contaminants._screen(str(in_fq), str(out_fq), min_entropy=1.1, max_base_frac=0.85)
+
+    assert s["n_overlong"] == 1
+    assert s["n_malformed"] == 1
+    assert s["n_in"] == 4            # every record is read, so the --un check still holds
+    assert s["n_kept"] == 2
+    written = out_fq.read_text()
+    assert "@toolong" not in written and "@malformed" not in written
+    assert "@good1" in written and "@good2" in written
+
+
+def test_bowtie2_abort_on_solid_colourspace_is_retried_on_base_space_reads(monkeypatch, tmp_path):
+    """bowtie2 SIGABRTs (core dumped) on a SOLiD/colour-space read: its bases are encoded
+    as digits 0-3 after a primer base, bowtie2 discards the digits and is left with "more
+    quality values than read characters". That happens INSIDE bowtie2, before _screen can
+    see the record, and under the pool the abort's core-dump OOM-kills a worker. So
+    filter_fastq catches that specific abort, drops the reads it cannot parse as base-
+    space, and retries -- the run fails gracefully on what survives instead of taking the
+    batch down."""
+    from ribomine.qc import contaminants
+    from ribomine.utils import ToolError
+
+    (tmp_path / "idx.1.bt2").write_bytes(b"x")
+    in_fq = tmp_path / "in.fastq"
+    in_fq.write_text(
+        "@good\nACGTACGT\n+\nIIIIIIII\n"
+        "@solid\nT2220001\n+\nIIIIIIII\n"       # colour-space: equal length, but digit bases
+    )
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)},
+                             "reference": {"contaminant_index": str(tmp_path / "idx")}})
+
+    calls = {"n": 0}
+    def fake_run_bowtie2(fastq, index, noncontam_fq, *, threads, log=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ToolError(["bowtie2"], 134,
+                            "Error: Read x has more quality values than read characters.\n"
+                            "(ERR): bowtie2-align died with signal 6 (ABRT) (core dumped)")
+        # retry: the input must be the base-space copy with the colour-space read gone
+        txt = open(fastq).read()
+        assert "@solid" not in txt and "@good" in txt
+        with open(noncontam_fq, "w") as fh:
+            fh.write("@good\nACGTACGT\n+\nIIIIIIII\n")   # survivor to --un, none aligned
+        return (1, 0)
+
+    monkeypatch.setattr(contaminants, "_run_bowtie2", fake_run_bowtie2)
+
+    out_fq = tmp_path / "out.fastq"
+    st = contaminants.filter_fastq(str(in_fq), str(out_fq), cfg, threads=8)
+
+    assert calls["n"] == 2                       # aborted once, then retried
+    assert st["n_malformed"] == 1                # the colour-space read is accounted for
+    assert st["n_input"] == 2                    # and added back into the input total
+    assert st["n_kept"] == 1
+    assert "@good" in out_fq.read_text() and "@solid" not in out_fq.read_text()
+
+
+def test_bowtie2_error_that_is_not_a_qual_mismatch_is_not_swallowed(monkeypatch, tmp_path):
+    """The retry is ONLY for the quality-length abort. Any other bowtie2 failure must
+    still propagate -- a real error hidden behind a pointless sanitize-and-retry is worse
+    than the error."""
+    from ribomine.qc import contaminants
+    from ribomine.utils import ToolError
+
+    (tmp_path / "idx.1.bt2").write_bytes(b"x")
+    (tmp_path / "in.fastq").write_text("@r\nACGT\n+\nIIII\n")
+    cfg = cfgmod.load(None, {"project": {"workdir": str(tmp_path)},
+                             "reference": {"contaminant_index": str(tmp_path / "idx")}})
+
+    def fake_run_bowtie2(*a, **k):
+        raise ToolError(["bowtie2"], 1, "Error: could not open index files")
+    monkeypatch.setattr(contaminants, "_run_bowtie2", fake_run_bowtie2)
+
+    with pytest.raises(ToolError, match="could not open index"):
+        contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "out.fastq"),
+                                  cfg, threads=8)
+
+
 def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
     """The adapter is not always the last thing in the read. Sequence past it -- an
     index, a second adapter, a sample barcode -- is normal, and the read must still be
