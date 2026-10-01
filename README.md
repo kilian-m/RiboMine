@@ -173,4 +173,4 @@ tests/              pytest suite (no genome needed)
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+GNU General Public License v3.0, see [LICENSE](LICENSE).

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Mine Ribo-seq datasets from the SRA: search, QC, read architecture, download, trim, map."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-only" }
 authors = [{ name = "Kilian Maidhof" }]
 keywords = ["ribo-seq", "ribosome profiling", "SRA", "quality control", "UMI"]
 dependencies = [
