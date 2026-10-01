@@ -1,39 +1,45 @@
-"""Is this a ribo-seq library, and how good is it? -- RiboseQC-style QC.
+"""Ribo-seq QC and verdict for one BAM (RiboseQC-style).
 
-Given a genome BAM (+ the cached annotation index from `ribomine.qc.annotation`,
-+ the STAR Log.final.out for mapping stats), compute the signatures that define a
-ribosome-profiling dataset:
+From a genome BAM, the annotation index (`ribomine.qc.annotation`) and STAR's
+Log.final.out, `qc()` measures:
 
-  * read-length distribution   -- footprints peak tightly at ~28-32 nt
-  * 3-nt periodicity           -- the defining hallmark: P-site (here the read
-                                  5' end) frames cluster in one frame within CDS.
-                                  Reported as the in-frame fraction and the total
-                                  variation distance of the frame distribution to
-                                  uniform (0 = flat/no periodicity, 0.67 = perfect)
-  * region composition         -- CDS / 5'UTR / 3'UTR / ncRNA / intron / intergenic
-                                  / mito; ribo-seq is strongly CDS-enriched
-  * start / stop metagene      -- 5'-end density around annotated start/stop codons
-  * top mapping locus          -- a single over-represented species (contaminant)
-  * mapping stats              -- input / uniquely mapped / multimapping / unmapped
+  read length     share of reads in the footprint window (25-36 nt by default)
+  periodicity     frame of the read 5' end within CDS, each read length shifted to
+                  its own dominant frame and pooled: in-frame fraction (chance 1/3)
+                  and total variation distance to uniform (0 = flat, 2/3 = one frame)
+  regions         CDS / 5'UTR / 3'UTR / ncRNA / intron / intergenic / mito
+  metagene        5'-end density around annotated start and stop codons
+  top 5' locus    share of reads at the most covered 5' position
+  mapping         STAR's unique / multimapping / unmapped fractions
 
-then a three-way verdict -- RIBO-SEQ / TI-SEQ / NOT RIBO-SEQ or LOW QUALITY --
-with the reasons stated. The verdict PRIORITIZES SPECIFICITY over sensitivity: two
-hard floors, both measured on ALL reads, gate every pass -- the region composition
-must be CDS-dominated (CDS >= `qc.cds_region_min` of all reads) and the reads must
-be footprint-length (>= `qc.read_len_min_frac` in the 25-36 nt window). These hold
-even for a strongly-periodic library, so a real-but-messy dataset can be refused.
-Above those floors the translating test stays inclusive of ribo-seq variants:
-strong periodicity is decisive on its own (it holds for TI-seq / QTI-seq, whose
-initiating ribosomes are still in-frame, and for atypically short or long
-footprints); failing that, footprint-like + CDS-enriched reads with any periodicity
-(or strong CDS enrichment) pass. A contaminant-dominated or badly-mapping library
-is refused outright.
+and calls RIBO-SEQ, TI-SEQ or NOT RIBO-SEQ or LOW QUALITY, with reasons. The
+thresholds are `qc.*` config keys; "genic" reads are all but intergenic and mito.
 
-The QC is measured on the LOCAL alignment because soft-clipping the 5' construct
-/ RT base gives a cleaner footprint 5' end -- and hence sharper periodicity --
-than an end-to-end alignment of the trimmed reads.
+  periodic_strong  in-frame >= periodic_strong and TVD >= tvd_strong
+  periodic_weak    in-frame >= periodic_min and TVD >= tvd_min
+                   (both need >= min_cds_reads CDS reads)
+  len_ok           modal length in footprint_len_lo..footprint_len_hi and
+                   >= read_len_peak_frac_min of reads in that window
+  cds_ok           CDS >= cds_enrich_min of genic reads
+  strong_cds       CDS >= cds_strong of genic reads
+  contaminant      top 5' locus > single_locus_max of reads
+  locus_over_cds   top 5' locus >= locus_min_to_judge of reads and
+                   >= locus_vs_cds x the CDS share of all reads
+  low_unique       uniquely mapped fraction < min_unique_frac
+  tiseq_like       start-codon peak >= tiseq_min_peak reads and
+                   >= tiseq_ratio_min x the mean of the CDS body
 
-Every threshold comes from the config (`qc.*`); nothing is hard-coded here.
+  translating = cds_ok and not contaminant and not locus_over_cds and
+                (periodic_strong or (len_ok and (periodic_weak or strong_cds)))
+  usable      = translating and not low_unique and two hard gates on all reads
+                that periodicity cannot excuse: CDS >= cds_region_min of all reads
+                and >= read_len_min_frac of reads in the footprint window
+  verdict     = TI-SEQ if usable and tiseq_like, RIBO-SEQ if usable, otherwise
+                NOT RIBO-SEQ or LOW QUALITY
+
+The verdict favours specificity: a real but messy library can be refused. It is
+measured on a local alignment of untrimmed reads, because soft-clipping the 5'
+construct gives a cleaner footprint 5' end than end-to-end alignment.
 """
 from __future__ import annotations
 
@@ -51,24 +57,21 @@ from ..process.star import parse_log
 
 LOG = logging.getLogger("ribomine.qc.verdict")
 
-# The window the metagene is computed over: a property of the plot/measurement,
-# not a calling threshold, so it is not a config key.
+# Metagene window; a property of the measurement, not a calling threshold.
 METAGENE_WIN = (-30, 60)          # nt around the start/stop codon, 5'-end based
-# above this share of reads on the mitochondrion, the library is not a cytosolic
-# ribo-seq with mito contamination -- it is (or is dominated by) mitoribosome profiling
+# Mito share of reads above which the library is flagged as mitoribosome profiling.
 MITO_DOMINANT = 0.30
-# A ribo-seq footprint is a piece of the mRNA, so it is SENSE to the gene: a real library
-# is ~100% sense over CDS (measured: 98-100% across a 100-run cohort). Below this, the
-# deposit is reverse-complemented, and RiboMine -- which scores the sense strand -- would
-# otherwise refuse it for "no CDS enrichment" and never say why. Judged only when enough
-# reads actually touch a CDS to make the fraction mean anything.
+# Antisense deposit: fewer than this fraction of the reads on a CDS are on its strand
+# (ribo-seq libraries measure 98-100 % sense). Judged only when at least
+# ANTISENSE_MIN_READS reads lie on a CDS.
 ANTISENSE_SENSE_FRAC = 0.50
 ANTISENSE_MIN_READS = 200
 
 
 # --------------------------------------------------------------------------
 def _load_index(path: str):
-    """The pickled annotation index -> NCLS interval indexes + sorted codon arrays."""
+    """Load the annotation index. Returns (index, NCLS interval indexes per category
+    and chromosome, sorted codon positions per (chrom, strand))."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"annotation index not found: {path} (build it with ribomine.qc.annotation)"
@@ -103,50 +106,33 @@ def _overlap_ids(ncls_c, pos: int) -> list[int]:
 
 
 def _classify(idx, ncls, chrom: str, pos: int, strand: int):
-    """(region, CDS frame, is a CDS here at all?) for a genomic position.
+    """(region, CDS frame or None, CDS at this base on either strand?) for a position.
 
-    strand is the read strand (+1/-1); CDS/UTR require a strand match (ribo-seq
-    footprints map sense to the transcript).
-
-    The third value is what makes an ANTISENSE deposit visible. A read that lands on a
-    CDS but on the wrong strand fails that match, falls through every other test, and
-    comes out as "intron" -- because a CDS sits inside a gene. So a reverse-complemented
-    deposit does not look like a strand problem: it looks like a library with no CDS
-    enrichment and a great deal of intronic signal, and it is REJECTED for exactly that,
-    with nothing said about the strand. Reporting "a CDS was here, whatever the strand"
-    costs nothing (the overlap has already been computed) and lets `qc` count the reads
-    on each side of it.
+    `strand` is the read strand (+1/-1); a CDS call requires a strand match. The
+    third value lets `qc` count reads antisense to a CDS, which are otherwise
+    classified as another region (mostly intron).
     """
-    # The mitochondrion is kept as its OWN region, never folded into CDS: in an ordinary
-    # cytosolic library its reads are mostly degradation background, and pooling them
-    # would dilute the nuclear periodicity that the verdict rests on.
-    #
-    # But it still has 13 protein-coding genes and a reading frame, and MITORIBOSOME
-    # profiling exists -- SRR28710935 ("Monitoring mitochondrial translation") is 60%
-    # mito, and its 4,490 MT-CDS reads are 50% in-frame. Returning frame=None there threw
-    # away the entire experiment and left the verdict to be decided by 1,699 nuclear reads
-    # of contamination. So: report the frame, and let the caller keep it in a separate
-    # pool (it does) rather than pretend the mitochondrion does not translate.
+    # The mitochondrion is its own region, so its reads never enter the nuclear
+    # periodicity. The frame is still returned for mito CDS, which the caller pools
+    # separately (mitoribosome profiling).
     mito = chrom in ("MT", "Mt", "chrM", "M")
     cds = ncls["cds"].get(chrom)
     ids = _overlap_ids(cds, pos)
-    on_cds = bool(ids)                 # a CDS is at this base, on ONE strand or the other
+    on_cds = bool(ids)                 # a CDS at this base, on either strand
     if ids:
         rec = idx["cds"][chrom]
         for i in ids:
             if rec["strand"][i] == strand:
                 cs, ce, fr = rec["start"][i], rec["end"][i], int(rec["frame"][i])
-                # Ensembl `frame` = bases to remove from the feature start to reach the
-                # first base of the next codon, so the codon-phase of position x is
-                # (x - featurestart - frame) % 3 (0 = first base of a codon). The
-                # annotation hands us the phase directly -- no per-transcript walk.
+                # GTF `frame` = bases from the feature start to the next codon start,
+                # so the codon phase of x is (x - start - frame) % 3 (0 = first base)
                 if strand == 1:
                     frame = (pos - cs - fr) % 3
                 else:
                     frame = (ce - 1 - pos - fr) % 3
                 return ("mito" if mito else "CDS"), frame, on_cds
     if mito:
-        return "mito", None, on_cds     # on MT, but not inside one of its 13 CDS
+        return "mito", None, on_cds     # on MT, outside its CDS
     for cat, tag in (("utr5", "5'UTR"), ("utr3", "3'UTR")):
         c = ncls[cat].get(chrom)
         if _overlap_ids(c, pos):
@@ -177,29 +163,20 @@ def _tvd_uniform(counts3) -> float:
 
 def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
                 label: str = "") -> dict:
-    """3-nt periodicity of a FINISHED BAM -- measured on the deliverable itself.
+    """3-nt periodicity of the final (deliverable) BAM. Reported only.
 
-    The verdict in `qc()` is decided on the QC stage's own alignment: a 200k-read
-    sample, untrimmed, aligned locally. That is the right measurement to CALL a
-    library with, but it is not a measurement of what came out of the pipeline. This
-    is: the trimmed reads, end-to-end aligned, contaminant- and pile-up-filtered,
-    deduplicated if that was asked for. It decides nothing -- it is the number you
-    look at to see whether the reads you are about to analyse are periodic.
+    `qc()` decides the verdict on a sample of untrimmed, locally aligned reads;
+    this measures the trimmed, filtered reads of the final alignment. The two can
+    differ, e.g. after a wrong trim.
 
-    The two can legitimately disagree (a trim that cut the footprint boundary wrong
-    shows up here and nowhere else), which is the whole reason for measuring twice.
-
-    Reads are taken at a fixed STRIDE through the file, not from its front: the BAM
-    is coordinate-sorted by now, so its first `max_reads` reads are the first
-    chromosome, and periodicity there is not periodicity everywhere. `max_reads <= 0`
+    About `max_reads` reads are scored, taken at a fixed stride through the file,
+    because a coordinate-sorted BAM starts with one chromosome. `max_reads <= 0`
     scores every read.
     """
     idx, ncls, _ = _load_index(index_path)
     bamf = pysam.AlignmentFile(bam, "rb")
-    # The .bai's count is of ALIGNMENTS, not of reads -- with multimappers kept
-    # (mapping.multimap_nmax > 1) one read contributes several. It is exactly what the
-    # stride needs, and NOT what "reads in the BAM" means, so the reads are counted in
-    # the pass below and this is used for nothing else.
+    # The index counts alignments, not reads (a kept multimapper counts several
+    # times); it is used only to set the stride.
     try:
         n_alignments = bamf.mapped
     except ValueError:                   # no index -- score everything
@@ -230,9 +207,8 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
     if n == 0:
         raise ValueError(f"no usable alignments in {bam}")
 
-    # same construction as qc(): align each read length to its own dominant frame
-    # before pooling, so a length whose 5' end sits one base off does not cancel out
-    # a length that is in phase
+    # as in qc(): shift each read length to its own dominant frame before pooling,
+    # so lengths whose 5' ends differ in phase do not cancel
     cds_reads = sum(sum(v) for v in frame_by_len.values())
     inframe = 0
     pooled = [0, 0, 0]
@@ -246,27 +222,14 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
 
     genic = n - region_hist.get("intergenic", 0) - region_hist.get("mito", 0)
     res = {
-        "n_reads_in_bam": seen,          # primary alignments = reads, counted, not inferred
+        "n_reads_in_bam": seen,          # primary alignments, counted
         "n_reads_scored": n,
         "stride": stride,
-        # The ALIGNED length (soft clips excluded), which for the deliverable BAM is the
-        # whole read -- it is aligned end-to-end, so nothing is clipped. It stops being
-        # the whole read the moment someone sets mapping.align_ends_type to Local, and
-        # then the aligned length is the honest one: it is the part that is genomic.
-        #
-        # Reported as BOTH a mean and a mode, because they answer different questions. The
-        # mode is where the footprint PEAK is, and a peak is a mode: contamination in the
-        # tails cannot move it (SRR25706716 peaks at 28 nt with a median of 26, dragged
-        # down by miRNA). The mean is what you want when the whole distribution matters.
+        # Aligned length (soft clips excluded). The mode (read_len_mode) is the
+        # footprint peak and is robust to contamination in the tails.
         "mean_mapped_len": round(sum(L * c for L, c in len_hist.items()) / n, 1),
-        # Mean soft-clip per mapped read -- the non-genomic bases local alignment shaved
-        # off the trimmed read. This is what makes the mean_footprint_len/mean_mapped_len
-        # gap READABLE: a large gap can mean either residual construct clipped off the
-        # mapped reads (a trim miss, e.g. SRR18113808 pre-fix ~9 nt) OR merely that longer
-        # unmappable read-through inflates mean_footprint_len (an average over ALL input
-        # reads) while the mapped footprints are clean. This tells the two apart -- near 0
-        # is clean (a kept non-templated RT base contributes ~its penetrance); large is
-        # residual the trim missed and STAR clipped rather than aligned.
+        # Mean soft-clipped bases per mapped read: near 0 after a clean trim, large
+        # when residual construct was clipped by the aligner instead of trimmed.
         "mean_mapped_softclip": round(softclip / n, 2),
         "read_len_mode": max(len_hist, key=lambda k: len_hist[k]),
         "periodicity_inframe_frac": round(inframe / cds_reads, 3) if cds_reads else 0.0,
@@ -286,22 +249,20 @@ def periodicity(bam: str, index_path: str, *, max_reads: int = 200_000,
 def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str = "",
        contam: dict | None = None, pileup: dict | None = None,
        total_reads: int | None = None) -> dict:
-    """The ribo-seq verdict for one locally-aligned BAM.
+    """The ribo-seq verdict for one locally aligned BAM (see the module docstring).
 
-    `contam` / `pileup` are the stats dicts of the two upstream filters (already
-    parsed); `total_reads` is the read count of the whole run, used to project
-    how many usable footprints the full dataset holds.
+    Scores the first `qc.max_reads_scored` primary alignments. `contam` / `pileup`
+    are the stats dicts of the two upstream filters; `total_reads` is the read
+    count of the whole run, used to project its number of usable reads.
     """
     # ---- thresholds (tuned on a 187-sample human cohort; see config.py)
     fp_len_lo = cfg["qc.footprint_len_lo"]
     fp_len_hi = cfg["qc.footprint_len_hi"]
     peak_frac_min = cfg["qc.read_len_peak_frac_min"]
-    read_len_min_frac = cfg["qc.read_len_min_frac"]  # HARD gate: footprint window must dominate
+    read_len_min_frac = cfg["qc.read_len_min_frac"]  # hard gate: reads in the footprint window
     cds_enrich_min = cfg["qc.cds_enrich_min"]
-    cds_region_min = cfg["qc.cds_region_min"]    # HARD gate: CDS must dominate the region composition
-    cds_strong_min = cfg["qc.cds_strong"]        # strong CDS-specific enrichment: ribo-seq
-                                                 # even if the (jitter-smeared) periodicity
-                                                 # looks weak
+    cds_region_min = cfg["qc.cds_region_min"]    # hard gate: CDS share of all reads
+    cds_strong_min = cfg["qc.cds_strong"]        # strong CDS enrichment excuses weak periodicity
     periodic_min = cfg["qc.periodic_min"]        # in-frame fraction (chance 0.33)
     periodic_strong_min = cfg["qc.periodic_strong"]
     tvd_min = cfg["qc.tvd_min"]
@@ -314,13 +275,9 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     tiseq_ratio_min = cfg["qc.tiseq_ratio_min"]
     tiseq_min_peak = cfg["qc.tiseq_min_peak"]
     max_reads = cfg["qc.max_reads_scored"]
-    # Strong periodicity may excuse an atypical footprint LENGTH (SRR29327151: 22 nt,
-    # but 78% of genic reads in CDS and 65% in-frame), never an empty CDS. Periodicity
-    # is measured on CDS reads alone, so a handful of genuine footprints buried in a
-    # library that is otherwise intron / intergenic / ncRNA still scores "strongly
-    # periodic": it says the ribosomes are real, not that the library is (SRR10513632:
-    # 2% of genic reads in CDS -- 51% intron, 43% intergenic -- yet 62% in-frame;
-    # SRR27534376: 18%, with more ncRNA (35%) than CDS (14%), yet 70% in-frame).
+    # Strong periodicity may excuse an atypical footprint length but not an empty CDS:
+    # periodicity is measured on CDS reads alone, so a few genuine footprints in an
+    # otherwise non-coding library still score as strongly periodic.
     cds_floor = cds_enrich_min
 
     idx, ncls, codons = _load_index(index_path)
@@ -330,9 +287,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     region_hist: Counter = Counter()
     # per-length frame counts within CDS (5'-end frame)
     frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
-    # the same, for the 13 mitochondrial CDS -- kept SEPARATE so it can never dilute the
-    # nuclear periodicity the verdict is decided on, but measured, because in a
-    # mitoribosome-profiling library this is the experiment
+    # the same for the mitochondrial CDS, pooled separately; not used in the verdict
     mito_frame_by_len: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
     # metagene: 5'-end offset (read - codon, translation dir) -> count
     meta = {"start_codon": Counter(), "stop_codon": Counter()}
@@ -349,8 +304,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         n += 1
         chrom, p5, strand, L = _read_5p(aln)
         len_hist[L] += 1
-        # leakage-invariant 5' anchor (`pos - clip5`), as in qc.profile: a chance
-        # match that extends the alignment moves pos and clip5 together
+        # 5' anchor including the soft clip (`pos - clip5`), as in fqdissect.profile:
+        # unchanged when a chance match extends the alignment into the clip
         anchor = (aln.reference_end + (aln.cigartuples[-1][1] if aln.cigartuples[-1][0] == 4 else 0)) \
             if aln.is_reverse else \
             (aln.reference_start - (aln.cigartuples[0][1] if aln.cigartuples[0][0] == 4 else 0))
@@ -361,11 +316,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         if region == "CDS" and frame is not None:
             frame_by_len[L][frame] += 1
         elif region == "mito" and frame is not None:
-            mito_frame_by_len[L][frame] += 1        # a separate pool; decides nothing
-        # Which side of a coding gene are the reads on? A footprint is a piece of the
-        # mRNA, so it is SENSE, and every ribo-seq library is ~100% sense here. A read
-        # sitting on a CDS on the wrong strand was counted above as "intron" (a CDS is
-        # inside a gene), so without this it is invisible -- see `_classify`.
+            mito_frame_by_len[L][frame] += 1
+        # sense or antisense to the CDS at this base (see `_classify`)
         if on_cds and region != "mito":
             if region == "CDS":
                 n_cds_sense += 1
@@ -405,9 +357,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     periodicity_frac = inframe / cds_reads if cds_reads else 0.0
     tvd = _tvd_uniform(pooled)
 
-    # ---- the same measurement on the 13 mitochondrial CDS. Reported, never used in the
-    # verdict: it is a diagnostic that tells a mitoribosome-profiling library apart from
-    # an ordinary one whose mito reads are degradation background.
+    # ---- the same on the mitochondrial CDS; reported only, to recognise
+    # mitoribosome profiling
     mito_cds_reads = sum(sum(v) for v in mito_frame_by_len.values())
     mito_inframe = 0
     mito_pooled = [0, 0, 0]
@@ -421,22 +372,19 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     mito_periodicity = mito_inframe / mito_cds_reads if mito_cds_reads else 0.0
     mito_tvd = _tvd_uniform(mito_pooled)
 
-    # ---- region fractions (gene-body = everything except intergenic, for CDS enrichment)
+    # ---- region fractions (genic = all but intergenic and mito, for CDS enrichment)
     reg_frac = {k: v / n for k, v in region_hist.items()}
     genic = n - region_hist.get("intergenic", 0) - region_hist.get("mito", 0)
     cds_of_genic = region_hist.get("CDS", 0) / genic if genic else 0.0
 
     top5p_locus_frac = loc_hist.most_common(1)[0][1] / n if loc_hist else 0.0
 
-    # ---- which strand of the coding genes is this library on?
+    # ---- strand of the reads on coding genes
     n_on_cds = n_cds_sense + n_cds_anti
     cds_sense_frac = n_cds_sense / n_on_cds if n_on_cds else 0.0
-    # An antisense-dominated deposit is reverse-complemented -- some submitters deposit
-    # the RC of what they sequenced. It is not a strand curiosity: RiboMine scores the
-    # SENSE strand, so its CDS enrichment collapses to ~0 and its periodicity is measured
-    # on whatever minority sits the right way round, and the library is then refused for
-    # "no CDS enrichment" with nothing said about why. Measured on SRR5750390: 77% of the
-    # reads that touch a CDS are on the wrong strand.
+    # Antisense-dominated (reverse-complemented or reverse-stranded) deposit: only the
+    # sense strand is scored, so its CDS enrichment is near zero. Flagged so that the
+    # verdict reason can name the strand.
     antisense_deposit = (n_on_cds >= ANTISENSE_MIN_READS
                          and cds_sense_frac < ANTISENSE_SENSE_FRAC)
 
@@ -456,32 +404,27 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     len_ok = fp_len_lo <= mode_len <= fp_len_hi and peak_frac >= peak_frac_min
     cds_ok = cds_of_genic >= cds_enrich_min
     enough_cds = cds_reads >= min_cds_reads
-    # 3-nt periodicity is the DEFINING hallmark of translating ribosomes.
+    # 3-nt periodicity, the hallmark of translating ribosomes
     periodic_strong = enough_cds and periodicity_frac >= periodic_strong_min and tvd >= tvd_strong_min
     periodic_weak = enough_cds and periodicity_frac >= periodic_min and tvd >= tvd_min
     strong_cds = cds_of_genic >= cds_strong_min
     # a majority at one locus = contaminant, not footprints
     contaminant = top5p_locus_frac > single_locus_max
-    # below this uniquely-mapped fraction the library maps poorly (contaminant /
-    # non-genomic junk) -- a quality red flag even when the mappable minority is
-    # periodic (cohort median 42%, p10 20%; broken libraries < 10%)
+    # poorly mapping library, unusable even if the mappable minority is periodic
+    # (cohort median 42 % unique, 10th percentile 20 %)
     low_unique = frac_unique is not None and frac_unique < min_unique_frac
     cds_floor_ok = cds_of_genic >= cds_floor
-    # One 5' coordinate carrying as many reads as the WHOLE coding transcriptome is
-    # a contaminant-dominated library, even when that fraction is far below the
-    # outright single-locus majority above: the reads went to a single molecule
-    # instead of to translation (SRR27534376: 12% at one locus, 12% in CDS). The
-    # test is scale-free -- it compares the pile to the library's own coding signal
-    # instead of picking an absolute cut-off (good libraries: top locus 0.5% median
-    # against 40-70% of reads in CDS, a ratio of ~100x).
+    # One 5' position holding as many reads as the whole CDS: contaminant-dominated
+    # even below single_locus_max. Relative to the library's own CDS share, so no
+    # absolute cut-off (good libraries: top locus ~100x below the CDS share).
     cds_share = reg_frac.get("CDS", 0.0)
     locus_over_cds = (top5p_locus_frac >= locus_vs_cds * cds_share
                       and top5p_locus_frac >= locus_min_to_judge)
 
-    # TI-seq: initiation drugs (harringtonine/LTM) freeze ribosomes at start codons
-    # and elongation runs off, so the start-codon metagene peak towers over a
-    # near-empty CDS body (start-codon enrichment ratio; GTI-seq SRR618773 ~120 vs
-    # elongating ribo-seq, which tops out ~30).
+    # TI-seq: initiation inhibitors (harringtonine/LTM) hold ribosomes at start codons
+    # while elongating ones run off. Ratio = start-codon peak (5' offset -15..-9) over
+    # the mean of in-frame positions 5-15 codons downstream (floored at 1 read);
+    # elongating ribo-seq reaches ~30.
     msc = meta["start_codon"]
     peak_off = max(range(-15, -8), key=lambda k: msc.get(k, 0)) if msc else -12
     peak_h = msc.get(peak_off, 0)
@@ -491,22 +434,12 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     start_ratio = peak_h / max(body_mean, 1.0)
     tiseq_like = peak_h >= tiseq_min_peak and start_ratio >= tiseq_ratio_min
 
-    # ---- specificity floor (HARD gates). RiboMine prefers specificity over sensitivity:
-    # a library whose region composition is not CDS-dominated, or whose reads are not
-    # footprint-length-dominated, is LOW QUALITY even when it is strongly periodic. Unlike
-    # `cds_ok` (CDS as a fraction of GENIC reads) and `len_ok` (the softer 40% peak that a
-    # strong periodicity can excuse), these two are measured on ALL reads and cannot be
-    # excused: they gate `usable` directly.
-    cds_region_ok = cds_share >= cds_region_min          # CDS % of the whole region composition
-    read_len_dominant = peak_frac >= read_len_min_frac   # % of reads in the 25-36 nt window
+    # ---- hard gates, measured on all reads. Unlike `cds_ok` (a fraction of genic
+    # reads) and `len_ok`, strong periodicity does not excuse them.
+    cds_region_ok = cds_share >= cds_region_min          # CDS share of all reads
+    read_len_dominant = peak_frac >= read_len_min_frac   # share of reads in the footprint window
 
-    # ---- three-way verdict: RIBO-SEQ / TI-SEQ / NOT RIBO-SEQ or LOW QUALITY.
-    # Translating-ribosome data (kept INCLUSIVE for variants) requires periodicity
-    # or footprint-like+CDS-enriched reads, and no single-locus contamination; a
-    # library that maps poorly (low unique mapping = non-genomic/multimapping junk)
-    # is not usable even if the mappable minority is periodic. On top of that, the two
-    # specificity gates above must hold -- CDS must dominate the region composition and
-    # the reads must be footprint-length -- regardless of how periodic the library looks.
+    # ---- verdict (see the module docstring)
     translating = (not contaminant) and cds_floor_ok and (not locus_over_cds) and (
         periodic_strong or (len_ok and cds_ok and (periodic_weak or strong_cds)))
     usable = translating and not low_unique and cds_region_ok and read_len_dominant
@@ -533,8 +466,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     else:
         reasons.append(f"periodicity untested (only {cds_reads} CDS reads)")
     if reg_frac.get("mito", 0.0) >= MITO_DOMINANT:
-        # Say this out loud. Everything above was measured on the NUCLEAR reads, which in
-        # a mitoribosome library are the minority and arguably the contamination.
+        # the signals above come from the nuclear reads only; say so
         reasons.append(
             f"MITOCHONDRIAL-DOMINATED ({reg_frac['mito']:.0%} of reads) -- this looks like "
             f"mitoribosome profiling. The verdict above was decided on the {cds_reads:,} "
@@ -560,7 +492,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
     if tiseq_like:
         reasons.append(f"start-codon enrichment {start_ratio:.0f}x -> TI-seq")
 
-    # a single headline reason for a NOT-RIBO-SEQ-or-LOW-QUALITY call
+    # headline reason for a NOT RIBO-SEQ or LOW QUALITY call
     verdict_reason = ""
     if not usable:
         why = []
@@ -571,7 +503,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
                        f"entire CDS ({cds_share:.0%}) — contaminant-dominated")
         if not cds_floor_ok:
             why.append(f"only {cds_of_genic:.0%} of genic reads are in CDS (not translation)")
-        # specificity floor (measured on ALL reads, cannot be excused by periodicity)
+        # hard gates
         if not cds_region_ok:
             why.append(f"CDS is only {cds_share:.0%} of the region composition "
                        f"(need {cds_region_min:.0%})")
@@ -582,20 +514,12 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             msg = (f"the reads are ANTISENSE to the genes ({cds_sense_frac:.0%} of those on a "
                    f"CDS are on its strand), so the CDS is empty by construction")
             if len_ok:
-                # The reads ARE footprint-length, so the strand is the whole story and
-                # nothing else about this run can be read until it is settled: an empty CDS
-                # is exactly what a reverse-complemented deposit looks like, and "no CDS
-                # enrichment" would send the reader hunting for a biological answer to a
-                # bookkeeping problem. Lead with it.
+                # footprint-length reads: the strand is the likely cause, so lead with it
                 why.insert(0, msg + " -- a reverse-complemented deposit would look exactly "
                                      "like this, and its footprints ARE the right length")
             else:
-                # The reads are the wrong length for a footprint, so this is not ribo-seq
-                # whichever way round it is -- in a random 100-run cohort all 9 antisense
-                # deposits read 66-150 nt, i.e. reverse-stranded RNA-seq that the query's
-                # recall net swept in. Say it, but do NOT lead with it: flipping the strand
-                # would not turn a 150 nt read into a ribosome footprint, and a reader who
-                # starts there has been sent to fix the wrong thing.
+                # not footprint-length either (typically reverse-stranded RNA-seq):
+                # mention the strand, but not first
                 why.append(msg + " -- but the reads are not footprint-length either, so the "
                                  "strand is not what disqualifies this run")
         if low_unique:
@@ -622,7 +546,7 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             "tiseq": tiseq_like,
             "locus_over_cds": locus_over_cds, "cds_floor_ok": cds_floor_ok,
             "antisense_deposit": bool(antisense_deposit),
-            # hard specificity gates (measured on ALL reads)
+            # hard gates (measured on all reads)
             "cds_region_ok": cds_region_ok, "read_len_dominant": read_len_dominant,
         },
         "start_codon_ratio": round(start_ratio, 1),
@@ -631,16 +555,13 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         "periodicity_inframe_frac": round(periodicity_frac, 3),
         "periodicity_tvd_uniform": round(tvd, 3),
         "n_cds_reads": cds_reads,
-        # mitochondrial translation, measured the same way but pooled separately. In an
-        # ordinary cytosolic library these are a handful of degradation reads and mean
-        # nothing; in a MITORIBOSOME-profiling library they are the entire experiment,
-        # and the nuclear numbers above are then measuring the contamination.
+        # mitochondrial CDS, pooled separately; meaningful for mitoribosome profiling
         "mito_periodicity_inframe_frac": round(mito_periodicity, 3),
         "mito_periodicity_tvd_uniform": round(mito_tvd, 3),
         "n_mito_cds_reads": mito_cds_reads,
         "mito_dominated": bool(reg_frac.get("mito", 0.0) >= MITO_DOMINANT),
         "cds_frac_of_genic": round(cds_of_genic, 3),
-        # strandedness: a real ribo-seq library is ~100% sense over CDS
+        # strandedness: a ribo-seq library is ~100% sense over CDS
         "cds_sense_frac": round(cds_sense_frac, 3),
         "n_reads_on_cds": n_on_cds,
         "antisense_deposit": bool(antisense_deposit),
@@ -654,12 +575,9 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
         "metagene_start": {int(k): v for k, v in sorted(meta["start_codon"].items())},
         "metagene_stop": {int(k): v for k, v in sorted(meta["stop_codon"].items())},
         "mapping": mapping,
-        # Record what this verdict was decided against. The QC figure draws these as
-        # its reference lines (the footprint-length window, the periodicity cut-offs),
-        # so it audits the decision that was actually made rather than falling back on
-        # its own module defaults -- a figure captioned with a verdict must not
-        # contradict it. And a qc.json kept on disk stays interpretable after someone
-        # re-tunes the config. Keys are named exactly as config.py names them.
+        # The thresholds this verdict was decided with, named as in config.py. The QC
+        # figure draws them, and a stored qc.json stays interpretable after the
+        # config changes.
         "thresholds": {
             "footprint_len_lo": fp_len_lo,
             "footprint_len_hi": fp_len_hi,
@@ -688,8 +606,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             "frac_low_complexity": contam.get("frac_low_complexity"),
             "n_sampled": contam.get("n_input"),
         }
-        # pile-up removal happens after mapping, so its fraction is of the mapped
-        # reads; express it as a fraction of the sampled reads for one clean total
+        # pile-ups are removed after mapping; express them as a fraction of the
+        # sampled reads, like the other two
         if pileup:
             n_samp = contam.get("n_input") or 1
             c["frac_position_pileup"] = round(pileup.get("n_reads_removed", 0) / n_samp, 4)
@@ -701,8 +619,8 @@ def qc(bam: str, index_path: str, cfg: Config, *, star_log: str = "", label: str
             c["frac_kept"] = contam.get("frac_kept")
         res["contaminants"] = c
 
-    # ---- projected usable reads: the reads that map (contaminant- and pile-up-
-    #      filtered, = n_reads_scored) scaled from the sample to the whole dataset.
+    # ---- projected usable reads: n_reads_scored (mapped, contaminant- and pile-up-
+    #      filtered) as a fraction of the sample, scaled to the whole dataset
     n_sampled = res.get("contaminants", {}).get("n_sampled")
     if total_reads and n_sampled:
         frac = res["n_reads_scored"] / n_sampled

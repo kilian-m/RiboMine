@@ -1,46 +1,27 @@
 # conda env create -f environment.yml && conda activate ribomine && pip install -e .
-#
-# Pinned only where a pin is load-bearing:
-#   python >=3.10   -- match statements / X | None annotations
-#   pysam, ncls     -- the QC interval index and BAM reader
-#   cutadapt <6     -- NOT run as a tool: `ribomine.arch.trim` imports its C aligner
-#                      (cutadapt.align.Aligner) and drives it with RiboMine's own
-#                      trimming logic. `cutadapt.align` is not a stability-guaranteed
-#                      API and it was last reshaped in 5.0, hence the bounds.
-#   xopen           -- gzip through pigz/igzip instead of Python's gzip module
-#   sra-tools       -- prefetch/fasterq-dump, the fallback download route
-#   aria2           -- multi-connection HTTPS, the fast route (see docs/DOWNLOAD.md)
-#   umicollapse     -- optional UMI deduplication (off by default); umi_tools is the
-#                      alternative backend (process.umi_dedup_tool)
 name: ribomine
 channels:
   - conda-forge
   - bioconda
 dependencies:
   - python>=3.10,<3.13
-
-  # --- core scientific stack
   - numpy>=1.24
-  - scipy>=1.10
-  - pandas>=2.0
   - matplotlib-base>=3.7
   - pysam>=0.22
   - ncls>=0.0.68
-  - requests>=2.31
-
-  # --- read processing / alignment
-  - star>=2.7.10
-  - bowtie2>=2.5
-  - samtools>=1.19
-  - cutadapt>=5.0,<6           # imported as a library (see above), not run as a tool
   - xopen>=1.7
-  - umicollapse>=1.1           # default UMI dedup backend
-  - umi_tools>=1.1.4           # alternative UMI dedup backend
 
-  # --- SRA / ENA download
-  - sra-tools>=3.0.10          # prefetch + fasterq-dump (fallback route)
-  - aria2>=1.36                # multi-connection HTTPS from ENA (the fast route)
-  - pigz>=2.7                  # parallel gzip: fasterq-dump writes plain FASTQ
+  # alignment and read processing
+  - star>=2.7.10
+  - bowtie2>=2.5               # contaminant filter
+  - samtools>=1.19
+  - cutadapt>=4.4              # run by fqdissect to trim
+  - pigz>=2.7
+  - umicollapse>=1.1           # UMI deduplication (optional, default backend)
+  - umi_tools>=1.1.4           # UMI deduplication (alternative backend)
 
-  # --- dev
+  # download
+  - aria2>=1.36                # multi-connection HTTPS from ENA
+  - sra-tools>=3.0.10          # prefetch + fasterq-dump, the fallback route
+
   - pytest>=7.4

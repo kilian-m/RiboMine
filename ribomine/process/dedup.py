@@ -1,43 +1,23 @@
-"""UMI deduplication of the mapped reads (UMICollapse, or umi_tools).
+"""UMI deduplication of the mapped reads (UMICollapse or umi_tools).
 
-`arch.trim` moved the random-templated content of the read -- the 5' and 3' UMI
-blocks the architecture found -- into the read name as `_<UMI>`, umi_tools style.
-This stage collapses reads that share a mapping position *and* a UMI: those are
-PCR copies of one molecule.
+Trimming (fqdissect, with cutadapt) writes the UMI into the read name as
+`_<UMI>`. This stage collapses reads that share a mapping position and a UMI,
+i.e. PCR copies of one molecule. It is off by default (`process.umi_dedup`) and
+checks two preconditions:
 
-It is OFF by default (`process.umi_dedup`), and that default is deliberate. The
-CALLER decides whether to deduplicate at all; this module's job is to refuse when
-deduplication would be wrong. Two things have to be true before it is meaningful:
+1. The reads carry a UMI. Without one (`dedup_umi_len == 0`), independent
+   footprints at the same position cannot be told from PCR duplicates and would
+   be collapsed, so `dedup` raises.
+2. The input BAM is coordinate-sorted and indexed, as both tools require.
 
-1. **The reads must actually carry a UMI.** If the architecture found no
-   random-templated content (`dedup_umi_len == 0`), `arch.trim` wrote no `_<UMI>`
-   tag, and there is nothing to distinguish two independent ribosome footprints
-   that start at the same codon from a PCR duplicate pair. Running a deduplicator
-   anyway would silently collapse genuine footprints into one read -- at ribo-seq
-   depth, where a well-expressed CDS has hundreds of reads on the same start,
-   that quietly destroys the signal it is supposed to clean. So: raise.
-2. **The INPUT BAM must be coordinate-sorted and indexed** -- both tools walk it
-   by position, and UMICollapse's `--two-pass` requires it.
+`process.umi_dedup_tool` picks the backend; both implement the directional,
+adjacency and cluster methods. umicollapse (default) indexes the UMIs at a
+position in a BK-tree instead of comparing all pairs, which suits ribo-seq,
+where a start codon can stack hundreds of distinct UMIs on one coordinate.
+umi_tools additionally offers `unique` and `percentile`.
 
-Which tool
-----------
-`process.umi_dedup_tool` picks the backend; both implement the same algorithms
-(directional / adjacency / cluster) over the same `_<UMI>` read-name tag, and on
-a 101k-read test BAM they returned the *same* 81,182 reads.
-
-* **umicollapse** (the default) indexes the UMIs at each position in an n-gram
-  BK-tree rather than comparing every pair, so its cost at a position grows far
-  more gently than umi_tools' all-pairs scan. That is exactly the shape of
-  ribo-seq: a well-translated start codon piles hundreds of distinct UMIs onto
-  one coordinate, which is umi_tools' worst case and UMICollapse's design case.
-* **umi_tools** is kept because it is the reference implementation everyone knows,
-  and because it has methods (`unique`, `percentile`) UMICollapse does not.
-
-What this module does NOT do is index its output: `out_bam` is a temporary the
-caller renames over the final BAM, so a `.bai` built here would be orphaned by
-that rename (and would then be a *stale* index sitting next to the final BAM).
-Indexing the final artefact belongs to whoever owns it -- `pipeline.process_sample`
-sorts and indexes after the rename.
+The output is left unindexed: the caller (`pipeline.process_sample`) renames it
+over the final BAM and indexes that.
 """
 from __future__ import annotations
 
@@ -48,35 +28,29 @@ import pysam
 from ..config import Config
 from ..utils import LOG, nonempty, require_tools, run
 
-# How many reads to look at when asking "do these reads carry a UMI?" -- the tag
-# is written by our own trimmer, so it is either there for (essentially) every
-# read or for none; a head sample settles it.
+# Reads inspected to decide whether a BAM carries UMIs. The trimmer writes the
+# suffix for every read or for none, so the head of the file is enough.
 UMI_HEAD_READS = 10_000
-UMI_TAG_MIN_FRAC = 0.5
+UMI_TAG_MIN_FRAC = 0.5  # minimum fraction of those reads with a UMI suffix
 UMI_BASES = set("ACGTN")
-MAX_UMI_TAG = 24        # longer than any real UMI: a read name that merely happens
-                        # to end in "_<something long>" is not a UMI tag
+MAX_UMI_TAG = 24        # nt; a longer "_<suffix>" is not taken for a UMI
 UMI_SEPARATOR = "_"
 
 TOOLS = ("umicollapse", "umi_tools")
 
-# umi_tools' method names are the vocabulary `process.umi_dedup_method` speaks, in
-# both backends -- the algorithms are the same, only UMICollapse's names for them
-# are shorter. It has no equivalent of `unique` or `percentile`.
+# `process.umi_dedup_method` uses umi_tools' method names for both backends; this
+# maps them to UMICollapse's. UMICollapse has no `unique` or `percentile`.
 UMICOLLAPSE_ALGO = {"directional": "dir", "adjacency": "adj", "cluster": "cc"}
 
 
 def dedup(bam: str, out_bam: str, cfg: Config, *, log: str = "") -> dict:
-    """Deduplicate a coordinate-sorted+indexed BAM whose read names end in `_<UMI>`.
+    """Deduplicate a coordinate-sorted, indexed BAM whose read names end in `_<UMI>`.
 
-    Returns {'n_in', 'n_out', 'frac_kept', 'method', 'tool'}.
+    Returns {'n_in', 'n_out', 'frac_kept', 'method', 'tool'}. `out_bam` keeps the
+    coordinate order and is left unindexed; the caller indexes the final BAM.
 
-    `out_bam` keeps the input's coordinate sort but is left UNINDEXED on purpose:
-    it is the caller's temporary, and the caller indexes the final BAM.
-
-    Raises ValueError if the reads carry no UMI (see the module docstring), if the
-    input BAM is not coordinate-sorted and indexed, or if the configured tool and
-    method are not a pair that exists.
+    Raises ValueError if the reads carry no UMI, if the input BAM is not
+    coordinate-sorted and indexed, or if the tool does not implement the method.
     """
     if not nonempty(bam):
         raise ValueError(f"no BAM to deduplicate: {bam}")
@@ -96,11 +70,8 @@ def dedup(bam: str, out_bam: str, cfg: Config, *, log: str = "") -> dict:
     if not nonempty(out_bam):
         raise RuntimeError(f"{tool} produced no output: {out_bam}")
 
-    # Count both BAMs with samtools rather than scrape the tool's log: the wording is
-    # version-dependent, a scrape breaks silently (and yields a nonsensical
-    # frac_kept), whereas `samtools view -c` is exact.
-    # No `samtools index out_bam` here -- see the module docstring: the caller
-    # renames out_bam over the final BAM and indexes that.
+    # Count with samtools rather than parse the tools' logs, whose wording depends
+    # on the version.
     n_in = _count(bam)
     n_out = _count(out_bam)
     stats = {
@@ -125,10 +96,8 @@ def _umicollapse(bam: str, out_bam: str, method: str, cfg: Config, *, log: str) 
             f"(it implements {', '.join(sorted(UMICOLLAPSE_ALGO))}). Either pick one of "
             f"those, or set process.umi_dedup_tool='umi_tools', which has {method!r}."
         )
-    # --two-pass streams the BAM in coordinate order instead of holding it in memory,
-    # which is what keeps a deep run inside the heap -- and it is why the input has to
-    # be sorted (it is; _require_sorted_indexed just checked). The output comes back in
-    # coordinate order, so the caller does not have to re-sort it.
+    # --two-pass streams the BAM in coordinate order instead of holding it in
+    # memory; it needs sorted input and writes sorted output.
     cmd = [
         "umicollapse", "bam",
         "-i", bam,
@@ -142,16 +111,13 @@ def _umicollapse(bam: str, out_bam: str, method: str, cfg: Config, *, log: str) 
 
 
 def _jvm_env(cfg: Config) -> dict:
-    """The environment UMICollapse has to be run in, because its bioconda launcher
-    will not otherwise do the right thing.
+    """Environment for UMICollapse's bioconda launcher.
 
-    That launcher forwards only `-Xm*` arguments to the JVM, so `-Xss` -- which
-    UMICollapse's BK-tree recursion needs raised, and which its own README passes --
-    cannot be given on the command line at all. `_JAVA_OPTIONS` is the only route in,
-    and setting it also replaces the launcher's fixed 4 GB heap, which a deep BAM
-    outgrows. And if `TEMP` happens to be set, the launcher silently appends `-log`
-    and `-temp_folder` arguments that the jar does not accept and dies on -- so it
-    must not be set for the child.
+    The launcher forwards only `-Xm*` arguments to the JVM, so the larger thread
+    stack (`-Xss`) that the BK-tree recursion needs has to go through
+    `_JAVA_OPTIONS`, which also replaces the launcher's fixed 4 GB heap
+    (`process.umi_dedup_mem_gb`). `TEMP` is unset because the launcher otherwise
+    appends `-log` and `-temp_folder` arguments that the jar rejects.
     """
     mem = int(cfg.get("process.umi_dedup_mem_gb", 8))
     env = dict(os.environ)
@@ -161,7 +127,7 @@ def _jvm_env(cfg: Config) -> dict:
 
 
 def _umi_tools(bam: str, out_bam: str, method: str, *, log: str) -> None:
-    """umi_tools dedup -- the reference implementation, kept as the alternative."""
+    """umi_tools dedup, on a BAM whose read names carry the UMI."""
     require_tools("umi_tools", "samtools")
     cmd = [
         "umi_tools", "dedup",
@@ -190,11 +156,10 @@ def _require_sorted_indexed(bam: str) -> None:
 
 
 def _require_umis(bam: str) -> None:
-    """Refuse to deduplicate reads that carry no UMI.
+    """Raise unless the first reads carry a `_<UMI>` read-name suffix.
 
-    A read name ends in `_<UMI>` only if the architecture found random-templated
-    content; with `dedup_umi_len == 0` there is nothing to deduplicate *on*, and
-    the deduplicator would collapse every read sharing a start position into one.
+    Without a UMI (`dedup_umi_len == 0`) the deduplicator would collapse every
+    read sharing a start position into one.
     """
     n_seen = n_umi = 0
     with pysam.AlignmentFile(bam, "rb") as fh:

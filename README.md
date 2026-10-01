@@ -1,327 +1,176 @@
 # RiboMine
 
-**Mine Ribo-seq datasets out of the SRA.** Search the archive, work out which hits
-are *actually* ribosome profiling, work out how each library was built, then
-download, trim and map the ones worth keeping.
+Mine Ribo-seq datasets out of the SRA: search the archive, decide from the reads
+which hits really are ribosome profiling, work out how each library was built,
+then download, trim and map the ones worth keeping.
 
 ```
-query the SRA ──► sample reads ──► QC & classify ──► read architecture ──► download ──► trim ──► map
-                  (streamed,        RIBO-SEQ /        what each read is       (full)      (UMIs →   (BAM)
-                   nothing           TI-SEQ /          made of                            header)
-                   stored)           reject
+search SRA/ENA ─► sample reads ─► QC verdict ─► read architecture ─► download ─► trim ─► map
+                  (streamed)      RIBO-SEQ /    UMIs, barcode,                  UMIs to   BAM +
+                                  TI-SEQ /      adapter (fqdissect)             read name counts
+                                  rejected
 ```
 
-The point of the middle two stages is that **neither the archive's metadata nor the
-paper can be trusted** for either question.
+Neither question can be answered from metadata. Ribo-seq has no
+`library_strategy` of its own (it is deposited as `RNA-Seq` or `OTHER`), and
+protocol descriptions of adapters and UMIs are often incomplete or wrong. RiboMine
+therefore measures both on a sample of the reads: 3-nt periodicity and CDS
+enrichment for the verdict, and the positions of UMIs, barcodes and adapter for the
+read architecture. When the reads do not support an answer, it says so instead of
+guessing.
 
-*Is it Ribo-seq?* Ribo-seq has no `library_strategy` of its own — submitters deposit
-it as `RNA-Seq` or `OTHER`, the same values a plain RNA-seq run carries. So RiboMine
-does not ask the metadata. It asks the reads: 3-nt periodicity within CDS, CDS
-enrichment, footprint length, the start-codon metagene. Translating ribosomes step
-one codon at a time, and nothing else does.
+RiboMine was built to assemble the Ribo-seq cohort for PRICE 2.
 
-*How was the library built?* The adapter, the UMIs, the barcode, the non-templated
-base the reverse transcriptase adds — published protocol descriptions get these
-wrong often enough that you cannot process a cohort on documentation. RiboMine reads
-the architecture **out of the reads themselves** (§ *How it works*), and refuses to
-answer rather than guess when they cannot support one.
+## Install
 
----
+```bash
+git clone https://github.com/kilian-m/RiboMine.git && cd RiboMine
+conda env create -f environment.yml
+conda activate ribomine
+pip install -e .            # also installs fqdissect
+```
+
+You need a genome FASTA, its GTF (Ensembl-style, with CDS frames), and a STAR index
+built with that GTF (`--sjdbGTFfile`; without it there are no gene counts). The
+human contaminant reference (rRNA, tRNA, snRNA, snoRNA, Mt, 45S pre-rRNA, rDNA
+repeat) is bundled; for another organism set `reference.contaminant_fasta`.
 
 ## Quick start
 
 ```bash
-conda env create -f environment.yml
-conda activate ribomine
-pip install -e .
+ribomine init-config config.json     # every setting, with its default
+$EDITOR config.json                  # set reference.genome_fasta, .gtf, .star_index
+ribomine setup -c config.json        # build the annotation and contaminant indexes
 
-ribomine init-config config.json     # every default, documented, in one file
-$EDITOR config.json                  # point `reference` at your genome/GTF/STAR index
-ribomine setup -c config.json        # build the annotation + contaminant indexes (once)
-
-ribomine run -c config.json          # the whole thing
+ribomine run -c config.json          # search the archive and process the hits
 ```
 
-The **human contaminant reference is bundled** (3,858 sequences: rRNA / tRNA / snRNA /
-snoRNA / Mt, plus the 45S pre-rRNA and the rDNA repeating unit — those two carry the
-transcribed spacers, which are excised during rRNA maturation and so appear in no
-mature sequence), so the only thing you have to supply is the genome, the GTF and a
-STAR index. That matters more than it sounds: a Ribo-seq library that is *not*
-contaminant-filtered looks like ~78 % multimapping junk, because every rRNA has
-hundreds of genomic copies and so every rRNA read maps to "too many loci". For a
-non-human organism, point `reference.contaminant_fasta` at that organism's sequences.
+A run can start and stop at different points:
 
-**Every BAM RiboMine writes is coordinate-sorted and indexed** — the deliverables in
-`bams/` and the QC-stage alignments alike — so when a verdict looks wrong you can open
-the exact alignment it was computed from. There is deliberately no option to turn that
-off.
-
-## Start and end points
-
-You rarely want the whole pipeline. Both ends move:
-
-| start (`pipeline.start`) | |
+| `--from` | input |
 |---|---|
-| `query` | search the SRA/ENA for Ribo-seq runs |
-| `accessions` | take a list of run accessions (`--accessions runs.txt`) |
-| `fastq` | take a directory of local FASTQs (`--fastq-dir reads/`) |
+| `query` | search SRA/ENA for candidate runs (`ribomine query` runs only this) |
+| `accessions` | a list of run accessions: `--accessions runs.txt` |
+| `fastq` | a directory of single-end FASTQs: `--fastq-dir reads/` |
 
-| end (`pipeline.end`) | deliverable |
+| `--to` | output |
 |---|---|
-| `qc` | **`qc/qc_summary.tsv`** + a QC figure per dataset |
-| `architecture` | **`architecture/architecture.tsv`** + an architecture figure per dataset |
-| `bam` | **`bams/*.bam`** + `mapping_summary.tsv` |
+| `qc` | `qc/qc_summary.tsv` and a QC figure per run |
+| `architecture` | `architecture/architecture.tsv` and an architecture figure per run |
+| `bam` | `bams/*.bam`, `mapping_summary.tsv`, `counts/gene_counts.tsv` |
 
 ```bash
-ribomine run -c config.json --to qc                       # just screen the archive
+ribomine run -c config.json --to qc                          # screen only
 ribomine run -c config.json --accessions runs.txt --to architecture
-ribomine run -c config.json --fastq-dir reads/ --to bam --umi-dedup
+ribomine run -c config.json --fastq-dir reads/ --umi-dedup   # local FASTQs to BAMs
 ```
 
-Everything is resumable: a dataset whose stage output already exists is skipped, so
-an interrupted 500-dataset run picks up where it stopped.
+`--to qc` never downloads a full run, so screening is cheap; do it first on a large
+search. Runs are resumable: a sample whose stage output exists is skipped, and a
+failing sample is recorded in `failed.tsv` without stopping the others.
 
-## What comes out
+## Output
 
-**After QC** — one row per dataset, and a figure showing every signal the verdict was
-made on, with the thresholds drawn on top, so the call is auditable rather than
-asserted:
+Everything is written under `project.workdir`.
 
-```
-run_accession  verdict                     periodicity_inframe  cds_frac_of_genic  read_len_mode
-SRR12285169    RIBO-SEQ                    0.46                 0.78               30
-SRR618773      TI-SEQ                      0.73                 0.32               29
-SRR1039508     NOT RIBO-SEQ or LOW QUALITY 0.36                 0.30               63
-```
-
-TI-seq (harringtonine / LTM / QTI- / GTI-seq) is **kept, not discarded** — it is
-Ribo-seq with the ribosomes frozen at start codons, and it is detected as such (the
-start-codon peak towers over an empty CDS body).
-
-**After architecture** — what each read is made of, and the two numbers that drive
-processing (how much to trim off the 5' end, and how many nt of the read are random
-and therefore usable for deduplication):
+**`qc/qc_summary.tsv`**: one row per run, with the verdict, its reason, and the
+measurements behind it. The figure in `qc/plots/` shows the same signals with the
+thresholds drawn in.
 
 ```
-run_accession  architecture                                                    trim_5p  dedup_umi_len
-SRR12285169    5'-[UMI,2nt]-[footprint,~30nt]-[UMI,5nt]-[barcode,AGCTA]-[TruSeq]-3'   2        7
+run_accession  verdict                      read_len_mode  periodicity_inframe  cds_frac_of_genic
+SRR24210493    RIBO-SEQ                     30             0.44                 0.60
+SRR30357177    NOT RIBO-SEQ or LOW QUALITY  32             0.54                 0.64
 ```
 
-That row is exactly the documented McGlincy & Ingolia 2017 structure — recovered from
-the reads, with no protocol given to the tool.
-
-**After mapping** — sorted, indexed BAMs; `mapping_summary.tsv`, a summary of what was
-thrown away and why (contaminants, pile-ups, reads left too short, duplicates); and
-`counts/gene_counts.tsv`, the **read-count matrix**:
+**`architecture/architecture.tsv`**: what each read is made of, how much to trim,
+and how many nt are random and usable for deduplication.
 
 ```
-gene_id          gene_name  SRR12285169  SRR618773  SRR1039508
-ENSG00000000003  TSPAN6             412        380         51
-ENSG00000000005  TNMD                 0          2          0
-ENSG00000000419  DPM1               188        205        177
+run_accession  architecture                                                                        trim_5p  dedup_umi_len
+SRR24210493    5'-[UMI,2nt]-[footprint,~30nt]-[UMI,5nt]-[barcode,TAGAC]-[TruSeq,AGATCGGAAGAG…]-3'  2        7
 ```
 
-The counts are STAR's own (`--quantMode GeneCounts`): it counts a read into a gene
-while it aligns it, so the matrix costs nothing beyond the alignment, and there is no
-second gene model to keep in step with the one the reads were aligned to. A read is
-counted if it overlaps one gene's exons and no other's; the sense strand is used,
-because a footprint is a piece of the mRNA. Two things follow, and both are stated on
-the columns of `mapping_summary.tsv` rather than left to be discovered: the counts are
-over the **whole gene**, not the CDS, and STAR takes them **during** the alignment —
-so they precede the pile-up filter and any UMI deduplication. This needs a STAR index
-built with the GTF (`--sjdbGTFfile`); without one RiboMine says so and skips the matrix.
+**`bams/`**: coordinate-sorted, indexed BAMs of the trimmed, contaminant-filtered
+reads, with UMIs in the read name (`@name_UMI`).
 
-`mapping_summary.tsv` also carries the **periodicity of the finished BAM** — the reads
-you are actually handed, after trimming, filtering and dedup:
+**`mapping_summary.tsv`**: per run, what was removed at each step (trimming,
+contaminants, pile-ups, duplicates), the mapping rates, and the periodicity of the
+finished BAM. That periodicity is measured independently of the QC verdict; if it
+is clearly worse than the QC value, suspect the trim.
 
-```
-run_accession  n_reads_in_bam  periodicity_inframe  periodicity_tvd  n_reads_in_genes
-SRR12285169         14,203,881                 0.61             0.42        11,942,067
-```
+**`counts/gene_counts.tsv`**: genes × runs matrix of STAR's gene counts
+(`--quantMode GeneCounts`, sense strand, whole gene). They are taken during
+alignment, so before pile-up removal and deduplication.
 
-That is a different measurement from the QC verdict's periodicity, which is taken on a
-sample of the *untrimmed* reads. QC says whether the library is Ribo-seq; this says
-whether what came out of the pipeline still is. When the two disagree, the trim is the
-first suspect — and there is nowhere else that would show it.
-
-## What is kept
-
-Mining the SRA means hundreds of runs at 1–10 GB each, so **by default only the BAMs
-survive** (`keep` in the config):
-
-| | kept | |
-|---|---|---|
-| `keep.bam` | **yes** | the deliverable: trimmed, filtered, mapped reads |
-| `keep.fastq` | no | the raw run FASTQ, as downloaded |
-| `keep.trimmed_fastq` | no | after the architecture-driven trim |
-| `keep.clean_fastq` | no | after contaminant removal — the reads that were mapped |
-| `keep.qc_fastq` / `keep.qc_bam` | no | the QC/architecture working data: the 200k-read sample and its two local alignments |
-| `keep.sra` | no | the `.sra` container (only the SRA fallback routes make one) |
-
-Nothing that is deleted is needed to *read* the results: every number and every call is
-already in the JSONs, the TSVs and the plots, and those are always kept. Turning
-`keep.qc_bam` on gets you back the BAM a verdict was computed on, for when a call looks
-wrong and you want to open it in a browser. `keep.bam: false` is legitimate too — the
-count matrix and the periodicity are measured before the BAM goes, so a counts-only run
-is a real thing to want, and resume knows the difference between a BAM that was deleted
-on purpose and one that was never made.
+By default only the BAMs, tables, figures and per-sample JSONs are kept; FASTQs and
+the QC alignments are deleted. The `keep` block of the config changes that.
 
 ## How it works
 
-### Is it Ribo-seq? (`qc`)
+**QC verdict.** 200,000 reads are sampled from the first million (streamed from
+ENA, nothing stored), filtered against the contaminant reference with bowtie2, and
+aligned untrimmed with STAR in local mode. The verdict rests on the reading frame
+of the read 5′ ends within annotated CDS, supported by CDS enrichment, read length,
+the start-codon profile and the unique-mapping rate. TI-seq (harringtonine,
+lactimidomycin) is recognised by its start-codon peak and kept. Details and
+thresholds: [docs/QC.md](docs/QC.md).
 
-The reads are streamed from ENA — never downloaded in full — contaminant-filtered,
-and aligned. Then six signatures decide, of which one is the hallmark: the **frame of
-the footprint's 5' end within the CDS**. Translating ribosomes advance one codon at a
-time, so their footprints pile into one frame; RNA-seq is flat. Everything else (CDS
-enrichment, footprint length ~28–32 nt, the start/stop metagene, region composition,
-unique-mapping rate) supports it.
+**Read architecture.** The same local alignment is passed to
+[fqdissect](https://github.com/kilian-m/fqdissect). Non-genomic sequence ends up in
+the soft clips, so the position at which read bases start and stop matching the
+genome gives the boundaries of the footprint; base composition on either side tells
+UMI from barcode from adapter. The adapter is found de novo. A library that cannot
+be read is reported as `undetermined` with a reason and is not processed further.
+The method is described in fqdissect's
+[METHOD.md](https://github.com/kilian-m/fqdissect/blob/main/docs/METHOD.md).
 
-The verdict is deliberately **inclusive** — strong periodicity alone is decisive — so
-that Ribo-seq variants with odd footprint lengths or unusual chemistry survive. Only
-libraries that are contaminant-dominated, non-periodic, or map too poorly to use are
-rejected, and each rejection states its reason.
-
-### What is the read made of? (`architecture`)
-
-A Ribo-seq read is a footprint wrapped in scaffolding, any part of which may be
-absent:
-
-```
-[5' UMI][RT nt][=========== footprint ===========][3' UMI][barcode][adapter]
-  random  A/T        genomic, variable-length        random   fixed    fixed
-```
-
-**Nothing is trimmed before aligning.** The raw read is aligned with
-`STAR --alignEndsType Local`, so everything non-genomic is pushed into the soft
-clips instead of preventing the alignment. The adapter is an *output* of this
-pipeline, not an input.
-
-The one idea the whole thing rests on: STAR's clip boundary is **not** where the
-footprint starts. If the last base of a 5' UMI happens to match the genome base
-beside the footprint — probability ¼ — STAR extends the alignment and the clip
-shrinks. *Clip lengths leak.* What does not leak is the genomic coordinate the
-alignment implies for **read position 0**: extending leftwards decrements `pos` and
-`clip5` together, so `pos - clip5` is invariant. Anchor there, and every read position
-maps to a fixed genome base. Then ask the only question that matters:
-
-> does read base *p* match the genome base implied for it?
-
-Footprint bases match ~97 % of the time. UMI, adapter and barcode bases are not
-genomic, so they match ~25 % by chance. **The transition between those two regimes is
-the architecture.** `docs/ARCHITECTURE.md` is the full walk-through — including how a
-non-templated RT base (present in only a *fraction* of molecules) is told apart from a
-UMI, and why a lone non-genomic 5' base is never a 1-nt UMI.
-
-When the reads cannot support a call — too few alignments, no genomic plateau, a
-single-length footprint spike (adapter dimers), a majority of reads at one locus — the
-answer is `undetermined` **with a reason**, never a guess.
-
-### Then: download, trim, map (`bam`)
-
-The full run is downloaded by the fastest route that can serve it, trimmed with the
-architecture that was just inferred (the RT base is *kept* — it is part of the
-molecule; the UMI content goes into the read name), contaminant-filtered, and aligned
-end-to-end.
-
-**UMI deduplication is off by default** (`--umi-dedup` / `process.umi_dedup`). It is
-only meaningful if the library actually carries a UMI, and on a library that does not,
-it silently collapses genuine duplicate footprints — which in Ribo-seq are real
-signal, since a heavily translated codon *is* covered many times. RiboMine refuses to
-run it on a library whose architecture found no random-templated content.
-
-## Downloading
-
-Route matters more than bandwidth, so RiboMine picks the route for you: **ENA over
-HTTPS with 16 parallel connections**, which measured 7–18× faster than the `prefetch`
-route most pipelines default to, because a single TCP stream is throttled server-side
-at ~12 MB/s and `prefetch` opens exactly one. There is no route setting — nothing
-about that ranking is site-specific enough to be worth a knob. The md5 ENA hands back
-in the same call as the URL is verified.
-
-ENA does not mirror quite everything (published human Ribo-seq is 99.97 % covered;
-dbGaP and the last few weeks of releases are not), so runs it does not have fall back
-to AWS Open Data and then the SRA toolkit, automatically. That chain is about
-*availability*, not speed.
-
-`docs/DOWNLOAD.md` has the numbers, the coverage measurements, and the landmines —
-including that `prefetch --max-size` **exits 0 when it skips an oversized run**, and
-that SRA Lite carries fake quality scores.
+**Processing.** The full run is downloaded from ENA
+([docs/DOWNLOAD.md](docs/DOWNLOAD.md)), trimmed with cutadapt according to the
+architecture, filtered for contaminants, aligned with STAR, and cleared of
+single-position pile-ups (adapter dimers, miRNAs). UMI deduplication is off by
+default and refused for libraries without a UMI, because identical footprints are
+then real signal (`--umi-dedup`, UMICollapse or umi_tools).
 
 ## Configuration
 
-One JSON file describes a run; `ribomine init-config` writes it with every default.
-CLI flags override it. `config.py` *is* the schema — an unknown key is an error, not a
-silent no-op, because a typo'd threshold that gets ignored is worse than a crash.
+One JSON file describes a run; command-line flags override it.
+`ribomine init-config` writes every key with its default, and
+[`ribomine/config.py`](ribomine/config.py) documents them. An unknown key is an
+error. Keys starting with `_` are comments.
 
-**`null` means "work it out for me", not "off".** JSON has no way to say that, so the
-generated config carries a `_null_means` block spelling out each one (keys starting
-with `_` are comments and are ignored). The one that catches people:
-`reference.contaminant_fasta: null` selects the **bundled human reference** — it does
-*not* disable contaminant filtering. To actually disable it, set
-`contaminants.enabled: false`. Either way the run log says which reference it used.
+`null` usually means "use the default", not "off": for example
+`reference.contaminant_fasta: null` selects the bundled human reference. The
+generated config explains each such key in its `_null_means` block.
 
-RiboMine is human-first but not human-only: the `reference` block (genome FASTA, GTF,
-STAR index, contaminant index, taxon) is all that ties it to a species.
+## Running a cohort on SLURM
 
-## Layout
+`slurm/` contains the job chain used for the full cohort on LRZ CoolMUC-4
+(search and split, one RiboMine per node, merge). See
+[docs/SLURM.md](docs/SLURM.md).
+
+```bash
+slurm/master.sh config/config_lrz.json
+```
+
+## Repository layout
 
 ```
 ribomine/
-  cli.py            the command line
-  config.py         the schema, the defaults, and their documentation
-  pipeline.py       stage orchestration, the process pool, resume
-  sra/
-    query.py        find Ribo-seq runs (and why that takes three steps)
-    metadata.py     ENA portal records
-    download.py     read sampling (streamed) + the full-run route chain
-  qc/
-    annotation.py   GTF -> cached interval index
-    contaminants.py rRNA/tRNA/snRNA/Mt (bowtie2) + low-complexity removal
-    profile.py      the positional match/composition statistics
-    verdict.py      is it Ribo-seq?
-    pileups.py      data-driven pile-up removal (no adapter sequences)
-    plot.py         the QC figure
-  arch/
-    infer.py        the architecture caller (every threshold lives here)
-    trim.py         apply the architecture; UMIs -> read name
-    plot.py         the architecture figure
-  process/
-    star.py         alignment (local for reading architecture, end-to-end for the BAM)
-    counts.py       STAR's gene counts -> the genes x runs matrix
-    dedup.py        optional UMI deduplication
-  data/             the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt)
-  reports.py        the TSVs
-slurm/            the LRZ CoolMUC-4 job chain (submitter, prep, run, merge)
-scripts/          what wraps RiboMine there: the cohort split, and the merge
-docs/
-  DOWNLOAD.md       how to get data out of the SRA fast, with measurements
-  ARCHITECTURE.md   how the read-architecture call works
-  INTERFACES.md     the internal module contract
-  SLURM.md          896 cores on LRZ, and what you have to do first
+  cli.py            command line
+  config.py         settings and defaults
+  pipeline.py       stages, process pool, resume
+  architecture.py   hand-off to fqdissect (profile, call, figure, trim)
+  reports.py        the TSV tables
+  sra/              archive search, metadata, read sampling, download
+  qc/               annotation index, contaminant filter, pile-up filter, verdict, figure
+  process/          STAR alignment, gene counts, UMI deduplication
+  data/             bundled human contaminant reference
+slurm/, scripts/    SLURM job chain; cohort split and merge
+docs/               QC.md, DOWNLOAD.md, SLURM.md
+tests/              pytest suite (no genome needed)
 ```
 
-## At scale: LRZ CoolMUC-4
+## License
 
-A cohort of hundreds of runs is a multi-day, multi-terabyte job, so on the cluster
-RiboMine runs as a SLURM chain rather than as one `ribomine run`: 8 nodes × 112
-cores, **one RiboMine per node** (they share a node's STAR genome, so a second one
-would pull the index out from under the first), each over its own shard of the
-cohort. `docs/SLURM.md` is the walk-through — including the four things to check
-before the first submit.
-
-```bash
-slurm/master.sh config/config_lrz.json          # prep -> run -> merge
-slurm/master.sh config/config_lrz.json run      # the next round, until status.txt says COMPLETE
-```
-
-Do the `end: "qc"` pass first. It never downloads a run, so screening the whole
-archive costs hours rather than days — and it is what tells you which of the
-thousands of hits are worth the bandwidth.
-
-## Credits
-
-The QC and read-architecture methods are ported from the `read_architecture`
-pipeline developed for PRICE2, where they were validated against 186 curated human
-Ribo-seq studies (91 % exact full-architecture recovery). The ports are verified
-bit-for-bit against those reference implementations.
+MIT, see [LICENSE](LICENSE).

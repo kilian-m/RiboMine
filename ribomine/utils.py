@@ -1,8 +1,7 @@
-"""Shared plumbing: logging, subprocess, atomic IO, TSV, and the sample layout.
+"""Shared helpers: logging, subprocess, atomic IO, TSV, and the sample layout.
 
 Every stage writes into one per-sample directory and reads the previous stage's
-JSON out of it. `Sample` is that layout, in one place, so no stage has to guess
-a filename.
+JSON from it; `Sample` defines those paths in one place.
 """
 from __future__ import annotations
 
@@ -51,8 +50,7 @@ class ToolError(RuntimeError):
 def run(cmd, *, check=True, capture=True, stdout=None, cwd=None, env=None, log_to=None):
     """Run a command. Returns CompletedProcess; raises ToolError on failure.
 
-    `log_to` appends the command's stderr to a per-sample log file, which is how
-    a 500-sample run stays debuggable without drowning the console.
+    `log_to` appends the command's stderr to that (per-sample) log file.
     """
     cmd = [str(c) for c in cmd]
     LOG.debug("run: %s", " ".join(cmd))
@@ -95,8 +93,8 @@ def read_json(path: str, default=None):
 
 
 def write_json(path: str, obj) -> str:
-    """Write JSON atomically -- a killed run must not leave a half-written file
-    that `resume` would then treat as complete."""
+    """Write JSON atomically, so a killed run cannot leave a half-written file
+    that `resume` would treat as complete."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), suffix=".tmp")
     try:
@@ -163,16 +161,10 @@ def read_lines(path: str) -> list[str]:
 def open_fastq(path: str, mode: str = "rt", *, compresslevel: int = 6):
     """Open a FASTQ, transparently gzipped.
 
-    Through `xopen`, which hands the (de)compression to an external pigz/igzip
-    process rather than doing it in this one with Python's `gzip` module. That is
-    not a small overhead on a stage that streams every read of a run through it:
-    on 1M reads, `gzip` spent 5.8 s compressing the trimmed output and 1.0 s
-    reading the input, out of 16.7 s for the whole of `arch.trim`. Neither is work
-    the trimmer should be doing on its own core.
-
-    Level 6, not Python's default of 9: these are multi-GB intermediates that get
-    deleted, and level 9 costs 3-5x the CPU of level 6 for a couple of percent of
-    size. At a hundred datasets that is hours of compression nobody asked for.
+    Uses `xopen`, which hands (de)compression to an external pigz/igzip process
+    instead of Python's slower in-process `gzip`. Writes default to level 6
+    rather than gzip's 9: the files are intermediates, and level 9 costs 3-5x
+    the CPU for a few percent of size.
     """
     if not path.endswith(".gz"):
         return open(path, mode)
@@ -199,11 +191,6 @@ def human(n) -> str:
     return f"{n:.1f}P"
 
 
-def free_bytes(path: str) -> int:
-    st = os.statvfs(path)
-    return st.f_bavail * st.f_frsize
-
-
 def rm(*paths: str) -> None:
     for p in paths:
         try:
@@ -223,11 +210,9 @@ def nonempty(path: str | None) -> bool:
 # --- the per-sample layout -------------------------------------------------
 @dataclass
 class Sample:
-    """Where every artefact of one run lives.
+    """The paths of every artefact of one run, from the accession and the workdir.
 
-    One object, constructed from the accession and the workdir, so that no stage
-    has to reconstruct a path -- and `resume` can ask "does this exist?" without
-    knowing which stage produced it.
+    Stages and `resume` use these properties instead of building paths themselves.
     """
 
     acc: str

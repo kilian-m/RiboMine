@@ -1,312 +1,126 @@
 # RiboMine on LRZ CoolMUC-4
 
-Mining the archive is a multi-day, multi-terabyte job, so it runs as a SLURM chain
-rather than as one `ribomine run`. Three jobs:
+A large cohort is processed as a chain of three SLURM jobs. The scripts target
+CoolMUC-4; on another cluster, adapt the `#SBATCH` headers in `slurm/*.sh` and the
+`_slurm` block of the config.
 
 ```
-prep            cm4_tiny, 1 node    query the SRA -> candidates.tsv
-                                    build the GTF + contaminant indexes (once)
-                                    split the cohort: one accession list + one
-                                    workdir per node
-   |  afterok
-   v
-run             cm4_std, ARRAY OF 2 x 4 NODES = 896 cores
-                                    each of the 8 nodes runs one `ribomine run`
-                                    over its own shard
-   |  afterany
-   v
-merge           cm4_tiny, 1 node    symlink the 8 workdirs into one, write the
-                                    cohort tables, and say in logs/status.txt
-                                    whether anything is left
+prep    cm4_tiny, 1 node    check the reference, build the GTF and contaminant
+   |                        indexes, split the cohort into one accession list
+   | afterok                and one workdir per node
+run     cm4_std, array of `jobs` x `nodes_per_job` nodes
+   |                        each node runs one `ribomine run` over its shard
+   | afterany
+merge   cm4_tiny, 1 node    link the per-node workdirs into merged/, write the
+                            cohort tables and logs/status.txt
 ```
 
 ```bash
-# from an LRZ login node
-slurm/master.sh config/config_lrz.json          # the whole chain
-slurm/master.sh config/config_lrz.json run      # another round (see "The loop")
-DRY_RUN=1 slurm/master.sh config/config_lrz.json    # print the sbatch lines, submit nothing
+# on a login node, from the repository root
+slurm/master.sh config/config_lrz.json            # prep -> run -> merge
+slurm/master.sh config/config_lrz.json run        # another round: run -> merge
+slurm/master.sh config/config_lrz.json prep       # query + prep only
+slurm/master.sh config/config_lrz.json merge      # merge only
+DRY_RUN=1 slurm/master.sh config/config_lrz.json  # print the sbatch lines, submit nothing
 ```
 
----
+With `pipeline.start: "query"`, `master.sh` first runs `ribomine query` on the login
+node (the compute nodes drop the long-idle connection of the ENA search), unless
+`<workdir>/meta/candidates.tsv` exists. Delete that file to search again.
 
-## What you have to do first
+## Before the first submit
 
-**1. Get RiboMine onto LRZ and build the environment.** The repo and the conda env go
-in `$HOME` (`/path/to/`); the data goes in `project.workdir` (step 2).
+**1. Install** in `$HOME`. `master.sh` also uses the environment on the login node.
 
 ```bash
-git clone git@github.com:kilian-m/RiboMine.git && cd RiboMine
+git clone https://github.com/kilian-m/RiboMine.git && cd RiboMine
 conda env create -f environment.yml
 conda activate ribomine
 pip install -e .
-ribomine --version          # it should print
 ```
 
-**2. Edit `config/config_lrz.json`.** Four things, and `prep` checks three of them
-for you and dies in minutes rather than letting a 24 h job die on a typo:
+**2. Edit the config:** `project.workdir` (e.g. `<your-dss-path>/ribomine/all`), the
+three `reference` paths and `_slurm.mail_user` (`""` for no mail). `prep` stops if a
+reference path is missing, and warns if the STAR index was built without
+`--sjdbGTFfile`, in which case no `counts/gene_counts.tsv` is written.
 
-| key | what to check |
-|---|---|
-| `project.workdir` | `/path/to/data_dir/ribomine/all`. **Run `dssusrinfo all` and check the quota** — the peak need is ~2–3 TB *transient*, and the BAMs that survive are the small part (see *Disk*). |
-| `reference.genome_fasta`, `reference.gtf` | exist, and are the pair the STAR index was built from |
-| `reference.star_index` | exists — **and was built with `--sjdbGTFfile`**, or there is no gene-count matrix. `prep` says which. |
-| `_slurm.mail_user` | currently `` |
-
-The STAR-index requirement is not a nicety: STAR counts reads into genes *while* it
-aligns them, and it will not insert junctions on the fly against a shared-memory
-genome — which is what makes 28 concurrent samples per node affordable. So the
-annotation is either in the index or there is no `counts/gene_counts.tsv`.
-Everything else still works.
-
-**3. Check that a cm4 COMPUTE node can reach ENA.** The whole pipeline is built on
-it. `price2-expansive` downloads from `rdp.ucc.ie` on cm4_tiny compute nodes, so
-outbound HTTPS works — but confirm the hosts RiboMine actually uses, **from inside
-an allocation**. A login node proves nothing: login nodes have internet whether the
-compute nodes do or not, and the compute nodes are the ones that download.
+**3. Check that a compute node reaches ENA and NCBI**, inside an allocation:
 
 ```bash
-# -M inter, NOT -M cm4: the interactive partitions live on the `inter` cluster even
-# though cm4_inter runs on CoolMUC-4 hardware. And an allocation, not a login node --
-# that is the whole point of the check.
 salloc -M inter -p cm4_inter -N 1 -t 00:10:00
-# "Job prolog failed" is a broken node, not your command: the allocation itself
-# succeeded. Just retry -- SLURM usually lands you elsewhere. If the same node keeps
-# coming back, --exclude=<nodename> it.
-
-curl -s -o /dev/null -w 'ENA    %{http_code}\n' \
+curl -s -o /dev/null -w 'ENA  %{http_code}\n' \
   "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=SRR12285169&result=read_run&fields=fastq_ftp"
-curl -s -o /dev/null -w 'NCBI   %{http_code}\n' \
+curl -s -o /dev/null -w 'NCBI %{http_code}\n' \
   "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=sra&term=riboseq&retmax=1"
-
-# the route that actually matters: a real multi-connection transfer from the BULK
-# host, which is a different machine from the metadata API above -- a firewall that
-# allows www.ebi.ac.uk but not ftp.sra.ebi.ac.uk would otherwise surface as every
-# download failing, twenty hours in.
-aria2c -x4 -s4 --max-download-limit=5M -d /tmp -o smoke.gz \
-  https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR122/069/SRR12285169/SRR12285169.fastq.gz &
-sleep 20; kill %1; ls -la /tmp/smoke.gz*
-
-exit
+timeout 20 aria2c -x4 -s4 --max-download-limit=5M -d /tmp -o smoke.gz \
+  https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR122/069/SRR12285169/SRR12285169.fastq.gz; ls -la /tmp/smoke.gz*
 ```
 
-Both `curl`s must print **200**, and `aria2c` must have pulled a few MB. Use a GET,
-not `curl -I`: NCBI answers a HEAD request with `405 Method Not Allowed`, which looks
-like a failure and is not one — it means NCBI received the request and declined the
-*method*, so it proves reachability just as well as a 200 would.
+Both `curl`s must print 200 and `aria2c` must have fetched data. If not, export
+`http_proxy` / `https_proxy` at the top of `slurm/node_worker.sh` and `slurm/prep.sh`.
 
-If any of it fails, the nodes are behind a proxy: export `http_proxy`/`https_proxy` at
-the top of `slurm/node_worker.sh` and `slurm/prep.sh`.
+**4. Run the pilot.** `slurm/master.sh config/config_pilot.json` runs the same chain
+on the 18 runs in `config/pilot_runs.txt` (1 job x 2 nodes, 4 h); set its paths as
+well. Expect COMPLETE in `logs/status.txt` and BAMs in `merged/bams/`.
 
-**4. Do the cheap pass first.** Set `pipeline.end` to `"qc"` and submit. QC never
-downloads a run — it streams a 200k-read sample — so screening the whole archive
-costs hours instead of days, and `merged/qc/qc_summary.tsv` then tells you how many
-of the hits are actually Ribo-seq **before** you spend a cohort's worth of bandwidth
-on them. Then set it back to `"bam"` and `slurm/master.sh <config> run`: every QC
-verdict is reused, nothing is recomputed.
+**5. Screen with QC first.** The default query is broad and returns thousands of
+candidates. With `pipeline.end: "qc"` each run is judged from a streamed sample of
+200k reads ([QC.md](QC.md)) and nothing is downloaded. Then set `"bam"` and submit
+`run`; the verdicts are reused. `query.max_runs` caps the cohort.
 
-This matters more than it sounds. The default query is deliberately a wide net
-(`query.terms` is the recall net; precision comes later), so it can return
-*thousands* of candidates, most of them Ribo-Zero RNA-seq. At 1–10 GB each, an
-unscreened `end: "bam"` run is tens of terabytes. Either do the QC pass first, or
-set `query.max_runs`.
+## The `_slurm` block
 
----
-
-## The loop
-
-The run has a **24 h ceiling** and a real cohort does not fit in it. That is
-expected, not a failure:
-
-1. `merge` runs `afterany`, so it runs however the array ended — cleanly, out of
-   wall time, or with a node dead. It works out what finished from the per-sample
-   JSONs, never from exit codes, so those three cases need no telling apart.
-2. It writes `<workdir>/logs/status.txt`: **COMPLETE**, or **RESUBMIT NEEDED** with
-   the command.
-3. You run `slurm/master.sh config/config_lrz.json run` from a login node. Finished
-   runs are skipped, so each round is shorter than the last.
-
-**Why you and not a job:** a cm4 compute node is not permitted to `sbatch` (LRZ
-rejects it with *"Access/permission denied"*), so no job in the chain can launch the
-next one — and a long-running driver on a login node is also not allowed. This is
-the same hard-won conclusion `price2-expansive` reached; do not try to automate it
-back.
-
----
-
-## The shape, and why
-
-**896 cores is an array of two 4-node jobs, not one 8-node job.** `cm4_std` caps a
-single job at **4 nodes / 448 cores**, but runs **2 jobs at once**. So:
-
-```
-_slurm.jobs = 2  x  _slurm.nodes_per_job = 4  x  112 cores  =  896
-```
-
-and each node's shard is its global index across the array,
-`SLURM_ARRAY_TASK_ID * 4 + SLURM_PROCID` → 0…7.
-
-**One `ribomine run` per node — not two, and not one per core.** Each node loads the
-~28 GB STAR index into its own shared memory once, and all 28 of its concurrent
-samples attach to that single copy; without that a node would need 28 × 28 GB. A
-second RiboMine on the same node would race it: whichever finished first would call
-`STAR --genomeLoad Remove` and pull the index out from under the other.
-
-**28 samples × 8 threads = 224 on a 112-core node, deliberately.** That is the node's
-*logical* core count (112 physical + hyperthreads), so it is twice as many samples in
-flight as there are real cores — and it should be: this stage spends much of its time
-blocked on an ENA download, and a sample waiting on the network is not using a core.
-What it costs is memory: ~28 GB for the node's one shared STAR genome plus roughly
-8 GB per sample in flight, so budget ~250 GB of the node's 480 GB. `project.jobs` is
-the number to cut if a node starts swapping. `master.sh` only warns past 2×, where
-there are not even hardware threads left to hold the samples.
-
-`node_worker.sh` also removes any **leaked** STAR segment on the way *in*, not only
-on the way out. A segment leaked by a wall-time SIGKILL holds 30 GB on that node and
-makes the next job's load fail; clearing it at startup is the recovery path that does
-not depend on the previous job having exited politely. It is safe because cm4_std
-allocates nodes exclusively.
-
-**And it loads the genome itself, and refuses to run without it.** RiboMine, left to
-its own devices, warns on a failed shared load and falls back to `NoSharedMemory` —
-every worker then loads its own ~30 GB copy. On a workstation that is a memory bill.
-On a node at `--jobs 28` it is suicide: the fallback asks for 28 × 30 GB = 840 GB and
-the node OOM-kills the whole process in seconds, losing the shard, with `Killed` in
-the log and the real cause one WARNING line further up. So `node_worker.sh` takes the
-decision where it can be fatal on purpose — it runs the `LoadAndExit` itself, and if
-the segment will not load it **stops**, and says why. (It hands the result to RiboMine
-through `RIBOMINE_STAR_GENOME_LOAD`, which `star.genome_load()` reads back, so
-RiboMine's own load *and* its fallback are bypassed entirely.)
-
-If you see that FATAL, the cause is almost always the first one it lists: **the job
-did not ask for enough memory.** Which is also the trap when running RiboMine by hand
-in an `salloc` — LRZ's default is ~2.1 GiB per core, and STAR needs 30 GB:
-
-```bash
-salloc -M inter -p cm4_inter -N 1 --cpus-per-task=112 --mem=300G -t 04:00:00
-```
-
-### The stuck segment
-
-A STAR killed **part-way through** loading the genome — an OOM kill, a wall-time
-SIGKILL — leaves its shared segment flagged *load in progress*, with nobody loading
-it. Every STAR afterwards then waits on that flag **forever**:
-
-```
-Another job is still loading the genome, sleeping for 1 min
-Another job is still loading the genome, sleeping for 1 min
-...
-```
-
-This is the failure mode to fear, because it does not fail. It *hangs* — and a hang
-burns the whole 24 h wall clock, on every node, in silence, and produces nothing,
-whereas a crash costs one round and tells you why. `--genomeLoad Remove` does not
-reliably clear it.
-
-`node_worker.sh` handles it in three ways, and they are all there on purpose:
-
-1. it `ipcrm`s stale segments before loading — anything over 1 GiB owned by this user,
-   which takes out a genome and spares everything small (and cm4_std nodes are
-   exclusive, so there is no other job of ours to hurt);
-2. it wraps the load in `timeout 900`, so a stuck segment produces an **error** rather
-   than a wait — without a clock there is no failure to detect;
-3. on that timeout it purges and retries exactly once, then gives up loudly.
-
-By hand, **on the affected node** (shared memory is node-local):
-
-```bash
-ipcs -m                 # the ~30 GB segment owned by you
-ipcrm -m <shmid>
-```
-
-**Per-node workdirs (`shards/work_NN/`), merged afterwards.** `ribomine run` writes
-its cohort tables (`qc_summary.tsv`, `failed.tsv`, …) at fixed paths under its
-workdir, so eight nodes sharing one workdir would each overwrite the other seven.
-They get one each; `merge` then symlinks all eight into `merged/` and calls
-RiboMine's *own* report writers over the whole cohort — so the tables come from the
-code that would have produced them on one machine, not from a bespoke concatenator
-that would drift from the columns. What the nodes *do* share, read-only, is
-`refs/` (the GTF index, the bowtie2 contaminant index) and `meta/candidates.tsv`,
-symlinked in by `prep`.
-
-**The split is pinned.** Re-running `prep` after the query has grown does not
-reshuffle: an accession that already has a shard keeps it, and only new ones are
-packed. Moving a finished accession to another node would strand its results in a
-workdir nobody reads any more, and it would be downloaded and mapped a second time.
-Packing is longest-first by `read_count` — a run is 1–10 GB, and the node that draws
-the deep ones sets the wall time.
-
----
-
-## Disk
-
-Measured on the 2026-07-14 pilot, not guessed. Per run: **2.08 GB downloaded, 298 MB
-of BAM kept, 4.85 GB alive on disk while it runs.** For the ~3,300 runs expected to
-survive QC out of 9,266 candidates:
-
-| | | |
+| key | default | meaning |
 |---|---|---|
-| **the BAMs** | **~1.0 TB** | accumulates to the end. **A floor** — no knob shrinks it (short of `keep.bam: false`) |
-| downloaded | ~6.9 TB | passes **through**: each FASTQ is deleted the moment its BAM exists, so it is never all resident |
-| transient high-water | ~1.1 TB | 224 runs in flight × 4.85 GB. **This is the lever** — it scales with `project.jobs` |
-| | **≈ 2.1 TB free needed** | against **4.9 TB** in the container (2026-07-14) |
+| `jobs` | 2 | array size. `cm4_std` runs 2 jobs at once; further tasks queue |
+| `nodes_per_job` | 4 | nodes per array task; `cm4_std` takes 2-4 |
+| `cpus_per_node`, `mem_per_node` | 112, `480G` | cores and memory per node for `run` |
+| `time` | `24:00:00` | wall time of `run` (the `cm4_std` maximum) |
+| `prep_cpus`, `prep_time` / `merge_cpus`, `merge_time` | 28, `12:00:00` / 28, `04:00:00` | the `prep` and `merge` jobs |
+| `conda_env` | `ribomine` | environment activated in every job |
+| `job_prefix` | `rm-` | job names: `<prefix>prep`, `<prefix>run`, `<prefix>merge` |
+| `mail_user` | none | address for begin/end/fail mails |
 
-`project.workdir` looks like it is under `$HOME` and **is not**: `data_dir` is a
-symlink into the `dssfs02` container (`DSS-CONTAINER`), which is the whole reason
-this fits. Do not "simplify" it to a real home path — the DSS home is 100 GB and the
-run wants 2.1 TB.
+The block is read only by `slurm/master.sh`; RiboMine ignores keys starting with
+`_`. There are `jobs x nodes_per_job` shards, one per node. Each node runs
+`project.jobs` samples at once with `project.threads` threads each. The product may
+exceed the physical cores, because a sample waiting on a download uses no core;
+`master.sh` warns above twice `cpus_per_node`. `download.connections` is per run, so
+ENA sees nodes x `project.jobs` x `download.connections` connections; lower it first
+if downloads fail.
 
-```bash
-dssusrinfo all                                  # the container: 10 TB cap, what is used
-df -h /path/to/data_dir         # says dssfs02, which is the tell
-```
+## Rounds and `logs/status.txt`
 
-The container is **shared with the project**. If space runs out, the lever is
-`project.jobs`: transient space scales linearly with the runs in flight, so 28 → 8
-turns ~1.1 TB into ~0.3 TB, at the cost of throughput and *nothing else* — every run
-is still processed, just fewer at a time. It is not a quality knob.
+`run` is limited to 24 h, so a large cohort needs several rounds. `merge` decides
+from the per-sample JSONs what is finished and writes `<workdir>/logs/status.txt`.
+Its first line is `COMPLETE` or `RESUBMIT NEEDED`; in the second case run
+`slurm/master.sh <config> run` from a login node (compute nodes cannot call `sbatch`).
 
-**A QC-only pass costs almost no disk at all** (a 200k-read sample per run, deleted
-after), so `end: "qc"` can always be run first to size the cohort before committing to
-the downloads.
+- Finished samples are skipped; an interrupted sample has no JSON and is redone.
+- The split is pinned: an accession keeps its shard across rounds and re-runs of
+  `prep`. Do not reduce the number of shards once results exist.
+- `still to do` is what the next round will process. `dropped by QC` and `dropped,
+  no arch` are finished. `tried and failed` lists runs with an entry in
+  `merged/failed.tsv`; they do not cause another round on their own.
+- Results are in `<workdir>/merged/` (`qc/qc_summary.tsv`, `mapping_summary.tsv`,
+  `counts/gene_counts.tsv`, `bams/`, ...), SLURM logs in `<workdir>/logs/slurm/`.
 
-The download's temp directory stays on the workdir's filesystem on purpose — it is
-not moved to the node-local NVMe. The ENA route finishes with `os.replace(tmp,
-out.fastq.gz)`, which is a rename and **fails across devices**; keeping it on DSS
-makes that rename free, whereas `/tmp` → DSS would be a multi-GB copy of every run.
-(Node-local `$TMPDIR` *is* used, for tool scratch.)
+## Memory and disk
 
----
+Each node loads the STAR index into shared memory once (about 30 GB) and all of its
+samples attach to it; add roughly 8 GB per sample in flight. If a node runs out of
+memory, lower `project.jobs` (`config_lrz.json` uses 14). `node_worker.sh` loads the
+genome itself and exits with an error if that fails, because RiboMine's fallback
+(one index copy per sample) would exceed the node's memory. At startup it removes
+the user's stale shared-memory segments over 1 GiB; a load that hangs for 900 s is
+purged and retried once. By hand, on the node: `ipcs -m`, then `ipcrm -m <shmid>`.
 
-## Things to watch
+Per run, measured on the pilot: 2.08 GB downloaded, 298 MB of BAM kept, 4.85 GB on
+disk while it is processed. FASTQs are deleted once the BAM exists. BAMs accumulate
+to about 1.0 TB for 3,300 runs (unless `keep.bam: false`). Transient space is
+4.85 GB x runs in flight (nodes x `project.jobs`): about 0.55 TB for 8 x 14, 1.1 TB
+for 8 x 28. A QC-only pass needs almost no disk.
 
-**ENA throttling.** `download.connections` is *per run*, and 28 runs download at once
-on each of 8 nodes — so it is multiplied by 224. It is set to **4** here, not
-RiboMine's own default of 8: that is still ~900 sockets against one host at peak,
-and 8 would be ~1,800. It costs less than it looks. The per-run connection count
-exists to beat ENA's ~12 MB/s per-stream cap, and with 224 runs already in flight the
-link saturates long before any single one of them does — the concurrency that matters
-here is across runs, not within one.
-
-If downloads start failing (they show up in `failed.tsv` and `mapping_summary.tsv`),
-this is still the first knob to turn — downwards.
-
-The cohort is bandwidth-bound long before it is core-bound, which is also the honest
-answer to "do I need 896 cores?" — for `end: "bam"`, probably not; for `end: "qc"`,
-the cores are the point.
-
-**A run that fails every round.** `status.txt` separates *still to do* from *tried
-and failed*, and lists the latter. They do not retry themselves into eternity —
-read `merged/failed.tsv` and decide.
-
-**Files**
-
-| | |
-|---|---|
-| `slurm/master.sh` | the submitter. Login node only. |
-| `slurm/prep.sh` | validate + `ribomine setup` + query + split |
-| `slurm/run.sh` | the cm4_std array |
-| `slurm/node_worker.sh` | one node: its shard, and its STAR shared memory |
-| `slurm/merge.sh` | the cohort tables + `status.txt` |
-| `scripts/prepare_run.py` | the split (pinned, LPT-packed by read count) |
-| `scripts/merge_results.py` | the merged view, the tables, the verdict |
-| `config/config_lrz.json` | one file: RiboMine's settings *and* the cluster shape (`_slurm`, which RiboMine ignores) |
+`project.workdir` must be on a project filesystem (a DSS container), not in the home
+quota; check with `dssusrinfo all` and `df -h <your-dss-path>`. Leave the download
+tmpdir on the workdir's filesystem (the default): a download ends with a rename.

@@ -1,45 +1,20 @@
-"""Getting reads out of the archive -- the slow part, so it is the measured part.
+"""Getting reads out of the archive: the QC read sample and the full run.
 
-Two very different jobs live here.
+Read sample (QC stage): the first `scan` reads are streamed off ENA's gzipped
+FASTQ, `n` of them are reservoir-sampled, and the connection is dropped; nothing
+is stored. ENA stores reads in spot order, so the prefix is representative
+unless the deposit is sorted or collapsed, which raises a warning
+(`qc.scan_reads: 0` then samples the whole run).
 
-**The read sample (QC stage).** Architecture and periodicity are properties of
-*every* read, so screening a run does not need the run. We stream the first
-`scan` reads straight off ENA's gzipped FASTQ over HTTPS, reservoir-sample `n`
-of them, and drop the connection -- nothing is stored, and a 20 GB run costs a
-few seconds and ~50 MB of transfer. gzip is a stream format, so a prefix of the
-file decompresses to a prefix of the reads; we simply stop reading.
+Full run (processing stage): three routes, each tried only when the one before
+cannot serve the accession (measurements in docs/DOWNLOAD.md):
 
-  What the sample *is*: a uniform random sample of the reads it scanned (the
-  kept records are shuffled), but only over the run's first `scan` reads. ENA
-  stores FASTQ in spot order -- the order reads came off the sequencer, which is
-  random with respect to content -- so that prefix is representative. The
-  exception is a **sorted or collapsed** deposit, where the prefix is a biased
-  slice; that trips a warning, and `qc.scan_reads: 0` reservoir-samples the whole
-  run instead.
+  1. `ena_https` -- ENA's FASTQ over `download.connections` parallel connections;
+                    a single stream is capped server-side.
+  2. `aws_odp`   -- .sra from SRA's Open Data mirror on S3, then `fasterq-dump`.
+  3. `prefetch`  -- the SRA toolkit. Slowest, but always available.
 
-**The full dataset (processing stage).** ENA over HTTPS with parallel connections
-wins, and it is not close -- see `docs/DOWNLOAD.md` for the measurements. So there
-is no route to choose and nothing to tune: `ena_https` is simply the route.
-
-  1. `ena_https`  -- ENA serves the submitter's own FASTQ directly. No .sra
-                     container to convert, and `aria2c -x16` opens 16 ranged
-                     connections, which is what actually beats the throttle: a
-                     single HTTPS stream is capped server-side, so parallelism
-                     buys far more than bandwidth does.
-
-The two routes below it exist for *availability*, not speed: ENA does not mirror
-every run (recent releases, dbGaP), and a run we cannot fetch is a run we cannot
-mine. They are tried, in order, only when the one above them cannot serve the
-accession at all. Nobody picks between them.
-
-  2. `aws_odp`    -- SRA's Open Data mirror on S3 (`s3://sra-pub-run-odp`),
-                     no-sign-request and no egress charge to the downloader.
-                     Delivers a .sra that `fasterq-dump` converts locally.
-  3. `prefetch`   -- the SRA toolkit itself. Slowest and the most fragile, but it
-                     is the only route that always exists.
-
-Every route ends at the same artefact: one gzipped single-end FASTQ at
-`out_fastq_gz`, so the caller never has to care which one ran.
+Every route produces one gzipped single-end FASTQ.
 """
 from __future__ import annotations
 
@@ -55,18 +30,12 @@ from ..config import Config
 from ..utils import LOG, ToolError, have, nonempty, rm, run
 from . import metadata
 
-# ---------------------------------------------------------------------------
-# the read sample
-# ---------------------------------------------------------------------------
+# --- the read sample ---
 def _open_stream(src: str):
-    """(binary FASTQ text stream, process-or-None). `src` is a URL or a path.
+    """(binary FASTQ stream, process-or-None). `src` is a URL or a path.
 
-    NOTE the absence of `--retry`. curl is writing into a PIPE, and a curl retry
-    restarts the transfer from byte 0 -- into that same pipe. The reader would then
-    get the head of the file spliced into the middle of the gzip stream: not a
-    recovered download, a corrupt one. On a pipe the retry has to re-open the whole
-    stream (which is what `sample_reads` does), so curl is told to fail honestly and
-    say why (`--show-error`) instead of trying to fix it here.
+    curl gets no `--retry`: restarting from byte 0 into the same pipe would
+    corrupt the gzip stream. `sample_reads` re-opens the stream instead.
     """
     if src.startswith("http"):
         proc = subprocess.Popen(
@@ -81,16 +50,15 @@ def _open_stream(src: str):
 def _reservoir(stream, scan: float, n: int, rng: random.Random):
     """Uniform sample of n records over the first `scan` reads.
 
-    Also watches whether consecutive reads are monotone in their leading 8-mer or
-    in length -- the signature of a sequence-sorted or collapsed deposit, whose
-    *prefix* would not represent the run.
+    Returns (records, reads scanned, order statistics). The statistics say how
+    monotone consecutive reads are in leading 8-mer and in length, which reveals
+    a sorted or collapsed deposit.
     """
     keep: list[list[bytes]] = []
     seen = 0
     prev_lead = prev_len = None
     mono_seq = cmp_n = 0
-    len_up = len_down = 0        # strict transitions only; ties (a constant read
-                                 # length, the common raw case) are not evidence
+    len_up = len_down = 0        # strict transitions only; equal lengths are not evidence
     while seen < scan:
         rec = [stream.readline() for _ in range(4)]
         if not rec[0]:
@@ -126,21 +94,9 @@ def _reservoir(stream, scan: float, n: int, rng: random.Random):
 def _stream_once(src: str, limit: float, n: int, rng: random.Random):
     """One attempt: open the stream, reservoir-sample it, and always tear it down.
 
-    Raises OSError if the transfer failed -- which the caller retries on a fresh
-    connection.
-
-    A FAILED TRANSFER DOES NOT LOOK LIKE AN ERROR FROM IN HERE, and that is the whole
-    point of this function. ENA answers a burst of concurrent requests with 403; curl
-    then writes nothing at all, so the gzip stream is simply EMPTY, the reservoir reads
-    zero records and returns perfectly normally. Nothing raises. The sample died as "no
-    reads obtained" and was never retried: 20 of 100 runs, the first time this pipeline
-    asked ENA for 8 samples at once. A mid-transfer SSL error (curl 56) is worse -- the
-    reservoir gets SOME reads and returns them, and a short sample is a BIASED sample
-    that nothing downstream can tell apart from a good one.
-
-    So the transfer is judged by curl's exit status, not by whether bytes arrived. curl
-    still running when we are done means we stopped early, by design; curl already gone
-    with a non-zero status means the reads we just took are not the reads we asked for.
+    Raises OSError if curl exited non-zero. The exit status is the only reliable
+    sign of failure: a refused request (ENA answers request bursts with 403) gives
+    an empty stream, and a mid-transfer error a short, biased sample.
     """
     stream, proc = _open_stream(src)
     try:
@@ -155,8 +111,8 @@ def _stream_once(src: str, limit: float, n: int, rng: random.Random):
     finally:
         try:
             stream.close()
-        except Exception:  # noqa: BLE001 -- we are already unwinding; the read result
-            pass           # (or the error) is what matters, not the closing of a pipe
+        except Exception:  # noqa: BLE001 -- a failed close must not mask the result
+            pass
         if proc is not None:
             for pipe in (proc.stdout, proc.stderr):
                 if pipe:
@@ -171,27 +127,18 @@ def _stream_once(src: str, limit: float, n: int, rng: random.Random):
 def sample_reads(source: str, out_fastq: str, *, n: int = 200_000,
                  scan: int = 1_000_000, seed: int = 20260712,
                  tries: int = 4, backoff_s: float = 5.0) -> dict:
-    """Reservoir-sample `n` reads from an accession (streamed) or a local FASTQ.
+    """Reservoir-sample `n` of the first `scan` reads (<= 0: all reads) of an
+    accession (streamed) or a local FASTQ.
 
-    A dropped connection re-opens the stream and samples again from the start, up to
-    `tries` times. It has to be re-opened rather than resumed: the sample is a uniform
-    draw over the run's first `scan` reads, and a resume would splice two draws with
-    different denominators together. Re-reading a few tens of MB is cheap; getting the
-    sample subtly wrong is not.
-
-    The retry is here, and not in curl, on purpose -- see `_open_stream`. Without it a
-    single truncated stream permanently fails the run: measured at ~10% of a 20-run
-    batch when four samples stream at once, which is a tenth of a mining cohort lost to
-    a transient.
+    A broken stream is re-opened and sampled again from the start, up to `tries`
+    times; resuming would splice two draws with different denominators.
     """
     if os.path.exists(source):
         src = source
     else:
         urls = metadata.fastq_urls(source)
         if not urls:
-            # No ENA mirror. fastq-dump can stream a bounded slice straight from
-            # NCBI without materialising the run, which is the only other way to
-            # get a read sample cheaply.
+            # No ENA mirror: fastq-dump streams a bounded slice from NCBI instead.
             return _sample_via_sra(source, out_fastq, n=n)
         src = urls[0]
         LOG.debug("streaming %s", src)
@@ -199,14 +146,12 @@ def sample_reads(source: str, out_fastq: str, *, n: int = 200_000,
     limit = float("inf") if scan <= 0 else scan
     local = os.path.exists(src)
     for attempt in range(1, tries + 1):
-        rng = random.Random(seed)          # the same draw every attempt, by construction
+        rng = random.Random(seed)          # the same draw on every attempt
         try:
             keep, seen, order = _stream_once(src, limit, n, rng)
             break
         except (EOFError, OSError, gzip.BadGzipFile) as exc:
-            # A truncated gzip stream is what a dropped HTTPS connection looks like from
-            # in here. A local file that does this is genuinely corrupt, so it is not
-            # retried -- re-reading it would fail identically, four times.
+            # a local file that fails this way is corrupt, so it is not retried
             if local or attempt == tries:
                 raise RuntimeError(
                     f"{source}: could not stream a read sample ({exc})") from exc
@@ -236,10 +181,8 @@ def sample_reads(source: str, out_fastq: str, *, n: int = 200_000,
 
 
 def _sample_via_sra(acc: str, out_fastq: str, *, n: int) -> dict:
-    """No ENA fastq mirror: pull a bounded slice through the SRA toolkit instead.
-
-    `fastq-dump -X n` stops after n spots, so this stays cheap even for a huge run.
-    """
+    """No ENA FASTQ mirror: take the run's first n spots with `fastq-dump -X n`,
+    which stops early and so stays cheap for a large run."""
     if not have("fastq-dump"):
         raise RuntimeError(
             f"{acc} has no ENA FASTQ mirror and fastq-dump is not installed; "
@@ -258,17 +201,14 @@ def _sample_via_sra(acc: str, out_fastq: str, *, n: int) -> dict:
     return {"source": f"sra:{acc}", "n_sampled": got, "n_scanned": got, "sorted_warning": ""}
 
 
-# ---------------------------------------------------------------------------
-# the full dataset: one function per route, all landing on the same artefact
-# ---------------------------------------------------------------------------
+# --- the full run: one function per route, all producing the same file ---
 class RouteUnavailable(RuntimeError):
     """This route cannot serve this accession (no mirror, tool missing). Try the next."""
 
 
 def _scratch(sra: str, fallback: str) -> str:
-    """fasterq-dump wants ~10x the .sra size in temp space. /dev/shm is RAM and by
-    far the fastest, but only if the run actually fits -- filling it would take the
-    machine down, so fall back to the workdir when it does not."""
+    """Scratch directory for fasterq-dump, which needs ~10x the .sra size: /dev/shm
+    (RAM) when the run fits with room to spare, otherwise `fallback`."""
     need = os.path.getsize(sra) * 12
     shm = "/dev/shm"
     try:
@@ -284,7 +224,7 @@ def _scratch(sra: str, fallback: str) -> str:
 
 
 def _finalise(src_fastq: str, out_gz: str, *, threads: int = 4) -> None:
-    """gzip a plain FASTQ into place (pigz when available -- it is ~4x faster)."""
+    """gzip a plain FASTQ into place (pigz when available) and delete the source."""
     os.makedirs(os.path.dirname(os.path.abspath(out_gz)) or ".", exist_ok=True)
     tmp = out_gz + ".part"
     if have("pigz"):
@@ -298,20 +238,17 @@ def _finalise(src_fastq: str, out_gz: str, *, threads: int = 4) -> None:
 
 
 def route_ena_https(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
-    """ENA's own gzipped FASTQ, pulled with N ranged connections.
+    """ENA's gzipped FASTQ over `download.connections` ranged connections, md5-checked.
 
-    ENA hosts what the submitter uploaded, so there is no .sra to convert -- the
-    bytes on the wire are the bytes we want. The win comes from `-x/-s`: a single
-    HTTPS stream is throttled server-side, so opening 16 of them multiplies the
-    throughput almost linearly until the link saturates.
+    A single HTTPS stream is throttled server-side, so parallel connections raise
+    throughput until the link saturates.
     """
     row = metadata.filereport(acc, ["fastq_ftp", "fastq_md5"])
     paths = [p for p in (row.get("fastq_ftp") or "").split(";") if p]
     md5s = [m for m in (row.get("fastq_md5") or "").split(";") if m]
     if not paths:
         raise RouteUnavailable(f"{acc}: no ENA FASTQ mirror")
-    # a paired deposit lists _1 and _2; the footprint read is R1. md5 is positionally
-    # aligned with the url list, so pick the checksum by the same index.
+    # a paired deposit lists _1 and _2; the footprint read is R1 (md5s in URL order)
     i = 0
     if len(paths) > 1:
         i = next((j for j, p in enumerate(paths) if p.endswith("_1.fastq.gz")), 0)
@@ -334,9 +271,7 @@ def route_ena_https(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
 
     if not nonempty(tmp):
         raise RouteUnavailable(f"{acc}: ENA download produced nothing")
-    # ENA hands us the checksum in the same call as the URL, so there is no excuse for
-    # not checking it. A truncated download otherwise surfaces as a mangled read count
-    # ten steps later, where nobody would suspect the transfer.
+    # a truncated download would otherwise only show up later as a wrong read count
     if want_md5:
         got = _md5(tmp)
         if got != want_md5:
@@ -362,19 +297,10 @@ AWS_ODP = "https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
 
 
 def route_aws_odp(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
-    """SRA's Open Data mirror on S3.
+    """SRA's Open Data mirror on S3: an anonymous HTTPS URL, so aria2c works here too.
 
-    The bucket is public, so it needs no AWS account, no credentials and no `aws`
-    CLI -- it is a plain anonymous HTTPS URL, which means the same multi-connection
-    `aria2c` that makes the ENA route fast works here too. (`prefetch` resolves to
-    this very URL and then fetches it over a single throttled stream, which is why
-    it is the slowest route and not the first.)
-
-    Two things to know. The mirror serves a `.sra` container, so `fasterq-dump` has
-    to convert it locally -- that cost is CPU and scratch disk, not network. And it
-    is the *full-quality* copy: SRA Lite (`.sralite`) substitutes a flat fake
-    quality score for every base, which would quietly destroy any quality-aware
-    step downstream. This route never touches it.
+    It serves the full-quality `.sra` (not SRA Lite, whose quality scores are
+    placeholders), which `fasterq-dump` converts locally.
     """
     if not have("fasterq-dump"):
         raise RouteUnavailable("fasterq-dump not installed (needed to convert the .sra)")
@@ -403,7 +329,10 @@ def route_aws_odp(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
 
 
 def route_prefetch(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
-    """The SRA toolkit. Always available, never the fastest."""
+    """The SRA toolkit: the slowest route, but always available.
+
+    `--max-size u` because prefetch skips runs above 20 GB by default and exits 0.
+    """
     if not have("prefetch") or not have("fasterq-dump"):
         raise RouteUnavailable("sra-tools (prefetch/fasterq-dump) not installed")
     d = cfg.tmpdir
@@ -420,22 +349,13 @@ def route_prefetch(acc: str, out_gz: str, cfg: Config, log: str = "") -> dict:
     return {"url": f"sra:{acc}"}
 
 
-# fasterq-dump is I/O-bound writing an uncompressed FASTQ, not CPU-bound: measured,
-# -e1 8.6s -> -e4 6.7s -> -e16 6.6s. Threads past ~4-6 buy nothing and just take
-# cores away from the other samples in the pool.
+# fasterq-dump is I/O-bound: measured -e1 8.6 s, -e4 6.7 s, -e16 6.6 s
 FASTERQ_THREADS = 6
 
 
 def _fasterq(sra: str, acc: str, cfg: Config, log: str = "") -> str:
-    """.sra -> a single FASTQ of the biological read.
-
-    `--split-3` writes _1/_2 for a paired run and a bare file for a single-end
-    one; ribo-seq is single-end, but a paired deposit (an RNA-seq control, or a
-    UMI split into R2) must still resolve to the footprint read, which is R1.
-
-    fasterq-dump needs roughly 10x the .sra size in scratch, so `-t` wants fast
-    storage; /dev/shm is ideal when the run fits in it.
-    """
+    """.sra -> a single FASTQ of the biological read (R1 of a paired run, which
+    `--split-3` writes as _1/_2)."""
     d = cfg.tmpdir
     scratch = _scratch(sra, d)
     threads = min(int(cfg["project.threads"]), FASTERQ_THREADS)
@@ -452,9 +372,8 @@ def _fasterq(sra: str, acc: str, cfg: Config, log: str = "") -> str:
     raise RuntimeError(f"fasterq-dump produced no FASTQ for {acc}")
 
 
-# ENA first because it is the fastest by a wide margin; the other two are the
-# fallback for the runs ENA has not mirrored, tried in order. Not a preference --
-# an availability chain. Do not reorder without re-reading docs/DOWNLOAD.md.
+# Tried in order: ENA is the fastest, the others serve runs ENA has not mirrored
+# (docs/DOWNLOAD.md).
 ROUTES = (
     ("ena_https", route_ena_https),
     ("aws_odp", route_aws_odp),
@@ -495,7 +414,7 @@ def download_full(acc: str, out_fastq_gz: str, cfg: Config, *, log: str = "") ->
 
 
 def _with_retries(fn, acc: str, out: str, cfg: Config, log: str):
-    """Transient network failures are the norm at this scale, not the exception."""
+    """Call a route, retrying transient failures with exponential backoff."""
     tries = int(cfg["download.max_retries"])
     backoff = float(cfg["download.retry_backoff_s"])
     last: Exception | None = None
@@ -503,7 +422,7 @@ def _with_retries(fn, acc: str, out: str, cfg: Config, log: str):
         try:
             return fn(acc, out, cfg, log)
         except RouteUnavailable:
-            raise                       # a missing mirror will not fix itself
+            raise                       # a missing mirror is not transient
         except Exception as exc:        # noqa: BLE001
             last = exc
             if i == tries - 1:

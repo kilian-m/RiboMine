@@ -1,27 +1,23 @@
-"""Tests for the parts where a silent wrong answer is possible.
-
-The scientific core (profile / verdict / infer) is verified against its reference
-implementation on real BAMs, which no unit test can substitute for. What is tested
-here is the machinery that would corrupt a run *quietly*: the config typo guard,
-the stage graph, the query's tiered text filter, and the trimming/UMI invariants.
+"""Tests for the machinery that could corrupt a run quietly: the config guard, the
+stage graph, the query's text filter, the hand-off to fqdissect, and the filters.
+(The read-structure caller itself is tested in fqdissect.)
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 
 from ribomine import config as cfgmod
-from ribomine.arch import infer, trim
 from ribomine.config import ConfigError, stages_to_run
 from ribomine.sra import query
 
 
 # --- config ---------------------------------------------------------------
 def test_unknown_key_is_an_error(tmp_path):
-    """A typo'd threshold that is silently ignored is worse than a crash: the run
-    completes, looks fine, and used the wrong number."""
+    """A misspelt config key raises instead of being silently ignored."""
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"qc": {"periodic_minn": 0.9}}))
     with pytest.raises(ConfigError, match="qc.periodic_minn"):
@@ -32,13 +28,12 @@ def test_defaults_are_complete_and_merge():
     cfg = cfgmod.load(None, {"qc": {"periodic_min": 0.9}})
     assert cfg["qc.periodic_min"] == 0.9          # override applied
     assert cfg["qc.tvd_min"] == 0.10              # sibling default survives
-    assert cfg["process.umi_dedup"] is False      # dedup is OFF by default
+    assert cfg["process.umi_dedup"] is False      # dedup is off by default
 
 
 def test_the_default_dedup_tool_can_run_the_default_dedup_method():
-    """Not every method exists in every backend -- `percentile` is umi_tools-only.
-    Shipping a default pair that cannot run would fail only for the users who turn
-    dedup on, i.e. late, on someone else's cohort."""
+    """The default dedup tool implements the default method (not every backend
+    has every method)."""
     from ribomine.process.dedup import TOOLS, UMICOLLAPSE_ALGO
 
     cfg = cfgmod.load(None)
@@ -48,12 +43,23 @@ def test_the_default_dedup_tool_can_run_the_default_dedup_method():
         assert method in UMICOLLAPSE_ALGO
 
 
-def test_every_architecture_threshold_is_wired():
-    """A config key nothing reads is a lie to the user. Thresholds must round-trip."""
+def test_architecture_thresholds_reach_fqdissect():
+    """The `architecture` config block mirrors fqdissect's thresholds, and an
+    override reaches the call."""
     from dataclasses import fields
-    names = {f.name for f in fields(infer.Thresholds)}
-    assert names == set(cfgmod.DEFAULTS["architecture"]), (
-        "architecture config keys and Thresholds fields have drifted apart")
+
+    from fqdissect.infer import Thresholds
+
+    from ribomine import architecture
+    names = {f.name for f in fields(Thresholds)}
+    assert names | {"process_undetermined"} == set(cfgmod.DEFAULTS["architecture"])
+
+    cfg = cfgmod.load(None, {"architecture": {"min_reads": 7}})
+    call = architecture.call({"label": "x", "n_used": 5}, cfg)
+    assert call["thresholds"]["min_reads"] == 7
+    # too few alignments: undetermined, with a reason
+    assert call["status"] == "undetermined" and "5" in call["reason"]
+    assert call["structure"].startswith("UNDETERMINED")
 
 
 @pytest.mark.parametrize("start,end,expect", [
@@ -87,9 +93,8 @@ def test_strong_hits(title):
 
 
 def test_rrna_depletion_never_vetoes_a_real_riboseq_study():
-    """The bug this guards: every Ribo-seq protocol ALSO depletes rRNA, so an
-    exclude list that vetoes on 'rRNA depletion' throws away genuine Ribo-seq.
-    Measured, a naive exclude silently dropped 21 real runs."""
+    """Ribo-seq protocols also deplete rRNA, so the 'rRNA depletion' exclude term
+    must not veto a strong hit."""
     r = _row(study_title="Ribosome profiling with CNOT1 depletion",
              library_construction_protocol="RNA was rRNA-depleted using Ribo-Zero, then ...")
     assert query.classify(r) == "strong"
@@ -107,20 +112,24 @@ def test_plain_rnaseq_is_not_a_candidate():
 
 
 def test_ena_rejects_multiword_terms():
-    """ENA's text index is tokenised: a multi-word wildcard silently matches NOTHING.
-    Fail loudly rather than return an empty archive."""
+    """ENA's text index is tokenised, so a multi-word term matches nothing; it
+    must raise."""
     cfg = cfgmod.load(None, {"query": {"terms": ["ribosome profiling"]}})
     with pytest.raises(ValueError, match="single words"):
         query._ena_query(cfg)
 
 
-# --- trimming and the UMI invariant ---------------------------------------
+# --- trimming (fqdissect + cutadapt) ----------------------------------------
+needs_cutadapt = pytest.mark.skipif(not shutil.which("cutadapt"), reason="cutadapt not on PATH")
+
+FOOT = "ACGTACGTACGTACGTACGTACGTACGTAC"          # 30 nt "footprint"
+ADAP = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
 CALL = {
-    "status": "ok",
-    "umi5_len": 2, "umi3_len": 5, "nt3_len": 0,
-    "barcode3_seq": "AGCTA", "adapter3_name": "illumina_truseq",
-    "adapter3_seq": "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC",
-    "polyA_tail": "none", "footprint_len_mode": 30, "p5_layout": [],
+    "status": "ok", "footprint_len_mode": 30, "polyA_tail": "none",
+    "p5_layout": [{"role": "umi5", "offset": 0, "len": 2}],
+    "p3_layout": [{"role": "umi3", "len": 5},
+                  {"role": "barcode3", "len": 5, "seq": "AGCTA"}],
+    "adapter3_name": "illumina_truseq", "adapter3_seq": ADAP,
     "functional": {"trim_5p": 2, "dedup_umi_len": 7},
 }
 
@@ -137,73 +146,48 @@ def _read(path):
     return [(lines[i][1:], lines[i + 1]) for i in range(0, len(lines), 4)]
 
 
-FOOT = "ACGTACGTACGTACGTACGTACGTACGTAC"          # 30 nt "footprint"
-ADAP = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+@needs_cutadapt
+def test_trimming_leaves_the_footprint_and_moves_the_umi_to_the_read_name(tmp_path):
+    from ribomine import architecture
+
+    cfg = cfgmod.load(None, {"project": {"threads": 1}})
+    with_adapter = "GG" + FOOT + "TTTTT" + "AGCTA" + ADAP    # umi5=GG, umi3=TTTTT
+    no_adapter = "GG" + FOOT + "CCCCCCCCCCCCCCCC"            # insert ran off the read
+    out = str(tmp_path / "o.trimmed.fastq")
+    st = architecture.trim_fastq(CALL, _fastq(tmp_path, [with_adapter, no_adapter]), out, cfg)
+
+    (name, seq), = _read(out)             # the read without the adapter is dropped
+    assert seq == FOOT
+    assert name.endswith("_GGTTTTT")      # 5' UMI + 3' UMI: the form the deduplicators read
+    # the columns mapping_summary.tsv reads from the trim record
+    assert (st["n_reads_in"], st["n_reads_out"]) == (2, 1)
+    assert st["frac_no_adapter"] == 0.5
+    assert st["mean_len_in"] > st["mean_len_out"] == 30.0
 
 
-def test_umi_goes_to_the_header_and_the_rt_base_stays(tmp_path):
-    read = "GG" + FOOT + "TTTTT" + "AGCTA" + ADAP    # umi5=GG, umi3=TTTTT, bc=AGCTA
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [read]), CALL, out, min_len=20)
-    (name, seq), = _read(out)
-    assert seq == FOOT                    # exactly the footprint, nothing else
-    assert name.endswith("_GGTTTTT")      # 5' UMI + 3' UMI, in that order
-    assert st["n_reads_out"] == 1
+@needs_cutadapt
+def test_a_barcode_between_two_umi_blocks_stays_out_of_the_umi(tmp_path):
+    from ribomine import architecture
 
-
-def test_every_umi_has_the_same_length(tmp_path):
-    """umi_tools ABORTS on a variable-length UMI ('not all umis are the same
-    length'). A read without the adapter never sequenced its 3' UMI, so it would
-    carry a 2 nt UMI where every other read carries 7 -- the exact failure this
-    pipeline hit on SRR12285169. Both policies must keep the length fixed."""
-    with_adapter = "GG" + FOOT + "TTTTT" + "AGCTA" + ADAP
-    no_adapter = "GG" + FOOT + "CCCCCCCCCCCCCCCC"        # insert ran off the read
-
-    # default: drop the read that has no adapter
-    out = str(tmp_path / "drop.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [with_adapter, no_adapter]), CALL, out)
-    assert st["n_reads_out"] == 1 and st["n_dropped_untrimmed"] == 1
-    assert {len(n.split("_")[-1]) for n, _ in _read(out)} == {7}
-
-    # keep them: the unsequenced UMI bases are written as N, so the length holds
-    out2 = str(tmp_path / "keep.fastq")
-    st2 = trim.trim_fastq(_fastq(tmp_path, [with_adapter, no_adapter]), CALL, out2,
-                          discard_untrimmed=False)
-    assert st2["n_reads_out"] == 2 and st2["n_umi_padded"] == 1
-    umis = [n.split("_")[-1] for n, _ in _read(out2)]
-    assert {len(u) for u in umis} == {7}, "variable UMI length would break umi_tools"
-    assert any(u.endswith("NNNNN") for u in umis)
-
-
-def test_barcode_between_two_umi_blocks_is_not_swallowed(tmp_path):
-    """iCLIP2-style [UMI][barcode][UMI][footprint]: flattening the layout to totals
-    would take the barcode's bases into the UMI and corrupt the dedup key."""
-    call = dict(CALL, umi5_len=4, p5_layout=[
+    cfg = cfgmod.load(None, {"project": {"threads": 1}})
+    call = dict(CALL, p5_layout=[
         {"role": "umi5", "offset": 0, "len": 2},
         {"role": "barcode5", "offset": 2, "len": 3, "seq": "GAT"},
         {"role": "umi5", "offset": 5, "len": 2},
     ], functional={"trim_5p": 7, "dedup_umi_len": 9})
     read = "AC" + "GAT" + "TG" + FOOT + "TTTTT" + "AGCTA" + ADAP
-    out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [read]), call, out)
+    out = str(tmp_path / "o.trimmed.fastq")
+    architecture.trim_fastq(call, _fastq(tmp_path, [read]), out, cfg)
     (name, seq), = _read(out)
     assert seq == FOOT
-    assert name.endswith("_ACTGTTTTT")     # the two UMI blocks, NOT the barcode GAT
-
-
-def test_infer_refuses_rather_than_guesses():
-    """`undetermined` is a feature: a fabricated architecture would silently
-    mis-trim every read in the dataset."""
-    call = infer.infer({"label": "x", "n_used": 10})
-    assert call["status"] == "undetermined"
-    assert "10" in call["reason"]
+    umi = name.split("_")[-1]             # all three UMI blocks, and not the barcode GAT
+    assert sorted(umi) == sorted("AC" + "TG" + "TTTTT")
 
 
 # --- shipped reference data ------------------------------------------------
 def test_contaminant_fasta_is_bundled():
-    """The QC stage cannot silently run without a contaminant filter: an unfiltered
-    rRNA read maps to hundreds of genomic copies, so the library then looks like
-    ~78% multimapping junk. Shipping the reference means the default just works."""
+    """The contaminant reference ships with the package and is the default, so
+    the filter is never skipped for lack of one."""
     from ribomine import data
     from ribomine.qc import contaminants
 
@@ -215,9 +199,8 @@ def test_contaminant_fasta_is_bundled():
     for kind in ("tRNA", "snRNA", "snoRNA", "rRNA"):
         assert kind in blob, f"{kind} missing from the bundled contaminant reference"
     # The pre-rRNA and the rDNA repeat carry the transcribed spacers (ITS1/2, 5'/3'ETS),
-    # which are excised during maturation and so appear in NO mature rRNA sequence --
-    # without them those fragments reach the aligner and, rDNA being a high-copy repeat,
-    # come back as multimappers. Worth +1.7pp of contaminant catch on an rRNA-heavy run.
+    # which no mature rRNA sequence contains; without them those fragments reach the
+    # aligner and come back as multimappers.
     for acc in ("NR_046235.3", "U13369.1"):
         assert acc in blob, f"{acc} (pre-rRNA/rDNA) missing from the contaminant reference"
 
@@ -242,15 +225,13 @@ def test_missing_contaminant_fasta_is_an_error():
 
 
 def test_no_option_can_leave_a_bam_unindexed():
-    """Every BAM RiboMine leaves on disk is sorted+indexed. There is deliberately no
-    config key that turns that off -- an unindexed BAM is one nobody can open."""
+    """Every BAM left on disk is sorted and indexed; no config key turns that off."""
     assert "sort_index_bam" not in cfgmod.DEFAULTS["process"]
 
 
 def test_null_means_is_documented_for_every_nullable_key():
-    """In JSON a `null` reads as 'nothing / off'. For these keys it means the
-    opposite -- 'work it out for me'. A reader cannot tell those apart from the file,
-    so every nullable default must carry an explanation in the generated config."""
+    """For these keys `null` means 'determine it automatically', so every nullable
+    default needs an explanation in the generated config."""
     def nullable(d, prefix=""):
         out = []
         for k, v in d.items():
@@ -275,9 +256,8 @@ def test_generated_config_explains_itself_and_still_loads(tmp_path):
 
 
 def test_query_does_not_demand_the_accession_list_it_may_produce():
-    """`ribomine query` searches the archive; it has no use for pipeline.start's
-    inputs. Validating them would make the query unusable in exactly the workflow it
-    exists for: query the archive, THEN feed the accessions back in."""
+    """`ribomine query` does not validate pipeline.start's inputs: it may be what
+    produces the accession list. `run` still does."""
     cfg = cfgmod.load(None, {"pipeline": {"start": "accessions",
                                           "accession_list": "does/not/exist.txt"}})
     cfg.validate(need_reference=False, need_inputs=False)      # must not raise
@@ -285,197 +265,9 @@ def test_query_does_not_demand_the_accession_list_it_may_produce():
         cfg.validate(need_reference=False)                     # but `run` still checks
 
 
-# --- the 3' anchor: a hidden adapter must not become a fabricated UMI ---------
-def _t3_profile(t3_match, *, n_anchored=0, frac_anchored=0.0, anchor="none"):
-    """A minimal profile exercising the no-adapter 3' fallback."""
-    import numpy as np
-    plateau = [0.99] * 24
-    return {
-        "label": "x", "n_used": 50_000, "n_anchored": n_anchored,
-        "frac_anchored": frac_anchored, "anchor_kind": anchor, "anchor_offset": 30,
-        "p5_match": plateau, "p5_comp": [[0.25] * 4] * 24,
-        "t3_match": t3_match, "t3_comp": [[0.25] * 4] * len(t3_match),
-        "adap_match": [float("nan")] * 60, "adap_comp": [[float("nan")] * 4] * 60,
-        "footprint_len_hist": {str(L): 100 for L in range(26, 35)},
-        "read_len_hist": {"46": 900}, "top5p_locus_frac": 0.01,
-    }
-
-
-def test_a_flat_3p_tail_is_a_umi():
-    """A genuinely trimmed deposit with a retained UMI: the walked positions sit AT
-    chance for all of them, then jump. That is a step, and it is a real 5-nt UMI."""
-    flat = [0.26, 0.25, 0.26, 0.25, 0.26] + [0.99] * 12      # 5 non-genomic, then plateau
-    call = infer.call_3prime(_t3_profile(flat), 0.99, [], infer.Thresholds())
-    res, deposit = call
-    assert res["umi3_len"] == 5
-    assert deposit == "adapter_trimmed_umi_retained"
-
-
-def test_a_ramping_3p_tail_is_refused_not_read_as_a_long_umi():
-    """SRR11945406: a McGlincy-Ingolia library whose 46-nt reads barely reach the
-    adapter, so the adapter anchor was rejected and the caller fell back to the read's
-    own 3' end. There the construct+adapter SMEAR across positions and the match rate
-    RAMPS instead of stepping. A level-only walk read that ramp as one 11-nt UMI --
-    which was really 5 nt of UMI + a 5-nt barcode + an adapter base. Refuse the ramp."""
-    ramp = [0.27, 0.27, 0.27, 0.26, 0.26, 0.26, 0.28, 0.31, 0.33, 0.39,
-            0.52, 0.72, 0.86, 0.93, 0.96, 0.99]
-    flags: list[str] = []
-    res, deposit = infer.call_3prime(_t3_profile(ramp), 0.99, flags, infer.Thresholds())
-    assert deposit == "unknown", "a ramp must not be read as a fixed-length construct"
-    assert any(f.startswith("3p_tail_ramps_not_steps") for f in flags)
-    assert res["umi3_len"] == "unknown"
-
-
-def test_a_minority_adapter_is_still_an_adapter():
-    """When the insert is as long as the read, only the short-footprint minority
-    reaches the adapter. Enough of those reads (and a construct that sits a FIXED
-    distance from the footprint end) make it a real anchor -- rejecting it is what
-    forced the fallback that fabricated the 11-nt UMI."""
-    from ribomine.qc import profile as prof
-    assert prof.MIN_ANCHOR_READS <= 500
-    # the caller must accept an anchor carried by few reads but many of them
-    thr = infer.Thresholds(min_anchor_frac=0.15)
-    p = _t3_profile([0.99] * 16, n_anchored=742, frac_anchored=0.023, anchor="panel:x")
-    weak = (p["frac_anchored"] < thr.min_anchor_frac
-            and p["n_anchored"] < infer.MIN_ANCHORED_READS)
-    assert not weak, "742 anchored reads is ample evidence, whatever the fraction"
-
-
-# --- the 3' scaffold: the barcode is part of the anchor, not just something to cut ---
-BC_CALL = dict(CALL, umi3_len=5, barcode3_seq="ATCGT", footprint_len_mode=32,
-               functional={"trim_5p": 2, "dedup_umi_len": 7})
-
-
-def test_barcode_is_trimmed_and_kept_out_of_the_umi():
-    """A sample barcode is CONSTANT across the library -- measured on SRR11945406 it is
-    98.6% one sequence, 0.14 bits of entropy against a 5-nt UMI's ~10. Putting it in the
-    dedup key adds no information at all, while adding error-prone positions that eat
-    umi_tools --directional's edit-distance-1 budget. So: trim it, never dedup on it."""
-    fn = infer.functional_view(
-        {"umi5_len": 2, "barcode5_seq": "none", "p5_layout": [], "rt5_len": 0,
-         "rt5_penetrance": 0.0, "rt_nt": False, "ts5_len": 0, "ts5_seq": ""},
-        {"umi3_len": 5, "nt3_len": 0, "barcode3_seq": "ATCGT", "polyA_tail": "none",
-         "adapter3_name": "illumina_truseq", "adapter3_seq": ADAP})
-    bc = [s for s in fn["segments_3p"] if s["role"] == "barcode3"][0]
-    assert bc["cat"] == "fixed-templated" and bc["fate"] == "trim"   # trimmed...
-    assert fn["dedup_umi_len"] == 7                                  # ...but 2+5, not 2+5+5
-    assert "ATCGT" not in fn["dedup_umi_mask"]
-    assert fn["trim_3p_construct"] == 10                             # umi + barcode both cut
-
-
-def test_the_scaffold_anchor_recovers_reads_the_adapter_alone_cannot(tmp_path):
-    """SRR11945406: a 44-nt molecule in a 46-nt read. The adapter runs off the end of
-    97% of reads, so anchoring on it alone found nothing and discard_untrimmed threw the
-    library away (2.3% survived). The BARCODE is just as fixed and just as known, and it
-    sits 5 nt closer to the insert -- anchoring on [barcode + adapter] recovers them."""
-    # a read whose TruSeq is truncated to 2 nt: adapter-only (min_overlap 7) cannot see it
-    read = "GG" + FOOT[:32] + "ACGTA" + "ATCGT" + ADAP[:2]
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [read]), BC_CALL, out, min_len=20)
-    (name, seq), = _read(out)
-    assert seq == FOOT[:32]              # the footprint, exactly
-    assert name.endswith("_GGACGTA")     # 2 nt 5' UMI + 5 nt 3' UMI; barcode NOT in it
-    assert st["n_reads_out"] == 1
-
-
-def test_scaffold_anchoring_is_a_strict_superset(tmp_path):
-    """A sequencing error in the barcode blocks the scaffold match (at a 7-nt overlap the
-    error budget is zero). Those reads were trimmable before, so the adapter alone must
-    still be tried -- the new anchor may only ever find MORE reads, never fewer."""
-    bad_bc = "GG" + FOOT[:32] + "ACGTA" + "ATCGA" + ADAP     # barcode ATCGT -> ATCGA
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [bad_bc]), BC_CALL, out, min_len=20)
-    assert st["n_reads_out"] == 1, "a barcode typo must not lose a read the adapter can anchor"
-    (_, seq), = _read(out)
-    assert seq == FOOT[:32]
-
-
-def test_losing_most_of_a_library_is_reported(tmp_path):
-    """Silently keeping 2% of a dataset is the worst possible outcome: it looks like it
-    worked. The fraction must reach the caller and the TSV."""
-    reads = [ "GG" + FOOT[:32] + "ACGTA" + "ATCGT" + ADAP ] + \
-            [ "GG" + FOOT + "ACGTACGTAC" ] * 9              # 9 reads with no scaffold at all
-    st = trim.trim_fastq(_fastq(tmp_path, reads), BC_CALL, str(tmp_path / "o.fq"))
-    assert st["frac_no_adapter"] == 0.9
-    assert st["frac_kept"] == 0.1
-
-
-def test_polyA_tail_is_trimmed_even_when_an_adapter_is_also_present(tmp_path):
-    """[footprint][poly-A][adapter]: the tail is enzymatically added, variable-length and
-    NOT genomic, and the functional view already says fate=trim. But the adapter branch
-    used to cut only the FIXED construct (here 0 nt), leaving the whole tail on the
-    footprint -- on SRR19641906 that left 99.6% of trimmed reads ending in a run of A's,
-    which end-to-end alignment then has to explain. Both must come off."""
-    # NB the footprint must not itself end in A: poly(A) trimming cannot tell a genomic
-    # terminal A from the tail, and does not try to (nor does cutadapt).
-    fp = FOOT[:28]
-    assert not fp.endswith("A")
-    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
-                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
-    out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAAAA" + ADAP]), call, out, min_len=20)
-    (_, seq), = _read(out)
-    assert seq == fp, "the poly(A) tail must not survive as footprint"
-
-
-def test_an_interrupted_polyA_tail_is_trimmed_whole(tmp_path):
-    """Some poly(A)-primed libraries carry an [A..]-C-[A..] linker before the adapter --
-    a conserved base splitting the tail in two (SRR18113808: a fixed C between a ~10 nt and
-    a ~9 nt A-run before TruSeq). A terminal-only cut removes just the adapter-proximal run
-    and leaves the footprint-proximal run and the C on the read; STAR then soft-clips them,
-    so mean_mapped_len falls ~9 nt below mean_footprint_len. The whole interrupted tail must
-    come off. The [A..]-C-[A..] runs also jitter +-1 nt read to read, so this cannot be
-    named as a fixed adapter/barcode -- it has to be trimmed as the poly(A) it is."""
-    fp = FOOT[:28]
-    assert not fp.endswith("A")
-    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
-                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
-    out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAA" + "C" + "AAAAAAAAA" + ADAP]),
-                    call, out, min_len=20)
-    (_, seq), = _read(out)
-    assert seq == fp, f"the interrupted poly(A) tail must not survive: {seq!r}"
-
-
-def test_polyA_still_trimmed_when_the_adapter_is_beyond_it(tmp_path):
-    """The other poly(A) case -- adapter not visible past the tail -- must keep working."""
-    fp = FOOT[:28]
-    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
-                adapter3_name="none_visible", adapter3_seq="none_visible",
-                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
-    out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call, out, min_len=20)
-    (_, seq), = _read(out)
-    assert seq == fp
-
-
-def test_a_polyA_tail_anchors_the_cut_when_the_adapter_is_gone(tmp_path):
-    """A poly(A) tail is SELF-ANCHORING: it sits between the footprint and the adapter,
-    so it marks the footprint's 3' end whether or not the adapter made it into the read.
-    Discarding those reads instead (SRR19641906: 28% retention) threw away exactly the
-    long-footprint reads, which is also what biased the surviving length distribution."""
-    fp = FOOT[:28]
-    call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none", polyA_tail="polyA",
-                footprint_len_mode=28, functional={"trim_5p": 0, "dedup_umi_len": 0})
-    # the adapter is present but only 2 nt of it -- far too short to anchor on (min 7).
-    # TruSeq begins with an A, so the read does not even END in an A-run.
-    read = fp + "AAAAAAAAAAAA" + ADAP[:2]
-    assert not read.endswith("A")
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=20)
-    assert st["n_reads_out"] == 1, "the tail locates the boundary; the read must survive"
-    (_, seq), = _read(out)
-    assert seq == fp
-
-    # and with NO adapter fragment at all
-    st2 = trim.trim_fastq(_fastq(tmp_path, [fp + "AAAAAAAAAAAA"]), call,
-                          str(tmp_path / "p.fastq"), min_len=20)
-    assert st2["n_reads_out"] == 1
-
-
 # --- gene counts / the read-count matrix ------------------------------------
 READS_PER_GENE = "\n".join([
-    # STAR's four bookkeeping rows, then the genes.
+    # STAR's four summary rows, then the genes.
     # columns: gene_id, unstranded, sense, antisense
     "N_unmapped\t100\t100\t100",
     "N_multimapping\t50\t50\t50",
@@ -508,34 +300,32 @@ def _counts_tab(tmp_path, name: str, text: str = READS_PER_GENE) -> str:
 
 
 def test_gene_counts_are_read_off_the_sense_strand(tmp_path):
-    """A ribosome footprint is a piece of the mRNA, so it maps to the transcript's own
-    strand. Reading the unstranded column would fold in antisense background; reading
-    the antisense column would report the background INSTEAD of the library."""
+    """Counts come from the sense column (a footprint maps to the transcript's
+    own strand), with the summary statistics alongside."""
     from ribomine.process import counts
 
     c, stats = counts.read_counts(_counts_tab(tmp_path, "r.tab"))
     assert c == {"ENSG01": 200, "ENSG02": 0, "ENSG03": 90}   # sense column, not 210/95
     assert stats["n_in_genes"] == 290
     assert stats["n_genes_detected"] == 2                    # the zero gene is not "detected"
-    # what the counts do NOT contain -- the honest denominator
+    # reads outside the counts, which complete the denominator
     assert stats["n_no_feature"] == 35 and stats["n_ambiguous"] == 8
     assert stats["frac_in_genes"] == round(290 / (290 + 35 + 8), 4)
-    # STAR's N_multimapping row is 0 whenever multimap_nmax=1 (multimappers are dropped
-    # before counting), so it is deliberately not reported -- Log.final.out has the truth
+    # STAR's N_multimapping row is 0 when multimap_nmax=1 (multimappers are dropped
+    # before counting), so it is not reported; Log.final.out has the rate
     assert "n_multimapping" not in stats
     assert stats["sense_over_antisense"] == round(290 / 15, 1)
 
 
 def test_a_library_that_is_not_sense_stranded_is_called_out(tmp_path, caplog):
-    """If the reads are on the other strand, the sense column is a fraction of the
-    library rather than a measurement of it -- and every count in the matrix is wrong
-    by that factor. It must not pass silently."""
+    """A library with similar sense and antisense counts triggers a warning: its
+    sense column undercounts it."""
     from ribomine.process import counts
 
     flipped = "\n".join([
         "N_noFeature\t0\t0\t0",
         "N_ambiguous\t0\t0\t0",
-        "ENSG01\t2000\t1000\t1000",     # 1:1 -- unstranded or reversed, not ribo-seq
+        "ENSG01\t2000\t1000\t1000",     # 1:1 -- unstranded or reversed
     ]) + "\n"
     with caplog.at_level("WARNING"):
         _, stats = counts.read_counts(_counts_tab(tmp_path, "f.tab", flipped), label="SRRX")
@@ -544,8 +334,8 @@ def test_a_library_that_is_not_sense_stranded_is_called_out(tmp_path, caplog):
 
 
 def test_the_matrix_has_a_row_for_every_gene_including_the_zero_ones(tmp_path):
-    """A matrix whose row set depends on which runs are in it cannot be compared with
-    the next one. Rows come from the annotation, not from the data."""
+    """Rows come from the annotation, not from the data, so every matrix has the
+    same row set."""
     from ribomine.process import counts
     from ribomine.utils import read_tsv
 
@@ -555,14 +345,13 @@ def test_the_matrix_has_a_row_for_every_gene_including_the_zero_ones(tmp_path):
                    ("SRR2", _counts_tab(tmp_path, "b.tab"))])
     rows = read_tsv(out)
     assert [r["gene_id"] for r in rows] == ["ENSG01", "ENSG02", "ENSG03"]
-    assert rows[0]["gene_name"] == "AAA"          # names come free from the STAR index
+    assert rows[0]["gene_name"] == "AAA"          # names come from the STAR index
     assert rows[0]["SRR1"] == "200" and rows[0]["SRR2"] == "200"
     assert rows[1]["SRR1"] == "0"                 # a gene with no reads is a 0, not a gap
 
 
 def test_a_run_with_no_counts_is_left_out_rather_than_left_blank(tmp_path):
-    """A blank is not a zero. Every downstream tool reads this file as a numeric table,
-    so a run that produced no counts must not become a column of empty cells."""
+    """A run without counts is omitted as a column, not written as empty cells."""
     from ribomine.process import counts
     from ribomine.utils import read_tsv
 
@@ -577,9 +366,8 @@ def test_a_run_with_no_counts_is_left_out_rather_than_left_blank(tmp_path):
 
 # --- what a run leaves behind ------------------------------------------------
 def test_by_default_only_the_bam_survives():
-    """Mining the SRA means hundreds of 1-10 GB runs. Everything except the deliverable
-    BAM is an intermediate the pipeline can rebuild from the accession -- including the
-    QC/architecture working data, whose every result is already in the JSONs and TSVs."""
+    """By default only the BAM is kept; every other file is an intermediate that
+    can be rebuilt from the accession."""
     cfg = cfgmod.load(None)
     keep = cfg["keep"]
     assert keep["bam"] is True
@@ -587,9 +375,8 @@ def test_by_default_only_the_bam_survives():
 
 
 def test_resume_does_not_re_download_a_run_whose_bam_was_deleted_on_purpose(tmp_path):
-    """With keep.bam off the BAM is *supposed* to be gone, so its absence cannot be the
-    test for "needs re-processing" -- that would re-download and re-map the whole cohort
-    on every resume."""
+    """With keep.bam off, a missing BAM does not make `resume` re-process a
+    finished sample."""
     from ribomine.pipeline import is_processed
     from ribomine.utils import Sample, write_json
 
@@ -621,11 +408,8 @@ class _BrokenStream:
 
 
 def test_a_dropped_read_sample_stream_is_retried_not_lost(tmp_path, monkeypatch):
-    """A truncated stream permanently failed the run before this: measured at 2 of 20
-    runs when four samples stream at once. A tenth of a mining cohort is not an
-    acceptable price for a transient, and curl cannot retry it -- it is writing to a
-    pipe, so its retry would splice the head of the file into the middle of the gzip
-    stream rather than recover anything."""
+    """A truncated stream is retried by re-opening it: curl writes to a pipe, so
+    its own retry would corrupt the gzip stream."""
     import io
 
     from ribomine.sra import download
@@ -650,8 +434,7 @@ def test_a_dropped_read_sample_stream_is_retried_not_lost(tmp_path, monkeypatch)
 
 
 def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
-    """Re-reading a corrupt file on disk fails identically every time. Retrying it is
-    pure latency, and it hides the fact that the file -- not the network -- is broken."""
+    """A corrupt local file fails the same way every time, so it is not retried."""
     from ribomine.sra import download
 
     local = tmp_path / "reads.fastq"
@@ -670,11 +453,8 @@ def test_a_corrupt_local_fastq_is_not_retried_four_times(tmp_path, monkeypatch):
 
 # --- bowtie2 thread cap ------------------------------------------------------
 def test_bowtie2_is_capped_at_eight_threads_because_un_corrupts(monkeypatch, tmp_path):
-    """bowtie2's `--un` file interleaves its records across worker threads past a
-    handful of them. The result is a corrupt FASTQ, not an error -- and those reads are
-    exactly the reads we go on to map, so the damage is silent and lands in the BAM.
-    project.threads is 24+ on a big box, so this cap is the only thing between a fast
-    machine and quietly wrong data."""
+    """bowtie2 is capped at 8 threads: with more, the records of its `--un` file
+    interleave and the FASTQ is corrupt without any error."""
     from ribomine.qc import contaminants
 
     seen = {}
@@ -701,10 +481,8 @@ def test_bowtie2_is_capped_at_eight_threads_because_un_corrupts(monkeypatch, tmp
 
 
 def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, tmp_path):
-    """The counts are an exact integrity check on --un: bowtie2 read N and aligned M, so
-    --un must hold N-M reads. If it does not, the file is corrupt -- and it is the file
-    we map. Silently mapping N-M-k reads would show up as an inexplicable read count ten
-    steps downstream, if anyone noticed at all."""
+    """bowtie2 read N and aligned M, so `--un` must hold N-M records; a mismatch
+    means a corrupt file and fails the sample."""
     from ribomine.qc import contaminants
 
     idx = tmp_path / "idx.1.bt2"
@@ -724,7 +502,7 @@ def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, t
         contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "o.fastq"),
                                   cfg, threads=8)
 
-    # and the honest case passes straight through
+    # and matching counts pass
     monkeypatch.setattr(contaminants, "_screen",
                         lambda *a, **k: {"n_in": 60, "n_low_complexity": 5, "n_kept": 55})
     st = contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "o.fastq"),
@@ -733,13 +511,9 @@ def test_a_short_un_file_fails_the_sample_instead_of_being_mapped(monkeypatch, t
 
 
 def test_screen_drops_overlength_and_malformed_reads_that_crash_star(tmp_path):
-    """STAR fatal-errors and SEGFAULTS (exit 139) on input its short-read parser cannot
-    hold -- and under the shared-memory pool that segfault reads as a killed worker
-    ("crash or OOM"), losing the run and its neighbours. _screen guards STAR from the
-    two cases: an OVER-LENGTH read (a long-read run mis-caught by the query, the
-    real-world cause) and a genuinely MALFORMED record (len(qual) != len(seq)). Both are
-    still counted in n_in, so filter_fastq's --un integrity arithmetic balances, and the
-    good short reads pass through so QC can still render a verdict."""
+    """_screen drops over-length and malformed (len(qual) != len(seq)) records,
+    which make STAR fail or segfault, but still counts them in n_in so that
+    filter_fastq's `--un` integrity check balances."""
     from ribomine.qc import contaminants
 
     in_fq = tmp_path / "in.fastq"
@@ -763,13 +537,9 @@ def test_screen_drops_overlength_and_malformed_reads_that_crash_star(tmp_path):
 
 
 def test_bowtie2_abort_on_solid_colourspace_is_retried_on_base_space_reads(monkeypatch, tmp_path):
-    """bowtie2 SIGABRTs (core dumped) on a SOLiD/colour-space read: its bases are encoded
-    as digits 0-3 after a primer base, bowtie2 discards the digits and is left with "more
-    quality values than read characters". That happens INSIDE bowtie2, before _screen can
-    see the record, and under the pool the abort's core-dump OOM-kills a worker. So
-    filter_fastq catches that specific abort, drops the reads it cannot parse as base-
-    space, and retries -- the run fails gracefully on what survives instead of taking the
-    batch down."""
+    """bowtie2 aborts (SIGABRT, "more quality values than read characters") on
+    SOLiD colour-space reads; filter_fastq catches that abort, drops the reads
+    that are not base-space, and retries."""
     from ribomine.qc import contaminants
     from ribomine.utils import ToolError
 
@@ -809,9 +579,8 @@ def test_bowtie2_abort_on_solid_colourspace_is_retried_on_base_space_reads(monke
 
 
 def test_bowtie2_error_that_is_not_a_qual_mismatch_is_not_swallowed(monkeypatch, tmp_path):
-    """The retry is ONLY for the quality-length abort. Any other bowtie2 failure must
-    still propagate -- a real error hidden behind a pointless sanitize-and-retry is worse
-    than the error."""
+    """Only the quality-length abort is retried; any other bowtie2 failure
+    propagates."""
     from ribomine.qc import contaminants
     from ribomine.utils import ToolError
 
@@ -827,111 +596,6 @@ def test_bowtie2_error_that_is_not_a_qual_mismatch_is_not_swallowed(monkeypatch,
     with pytest.raises(ToolError, match="could not open index"):
         contaminants.filter_fastq(str(tmp_path / "in.fastq"), str(tmp_path / "out.fastq"),
                                   cfg, threads=8)
-
-
-def test_an_adapter_followed_by_more_sequence_is_still_found(tmp_path):
-    """The adapter is not always the last thing in the read. Sequence past it -- an
-    index, a second adapter, a sample barcode -- is normal, and the read must still be
-    cut AT the adapter.
-
-    Without EndSkip.QUERY_STOP the aligner demands the alignment reach the END of the
-    read, so an adapter with anything after it matches in ZERO reads. Measured on
-    SRR25706716 ([footprint][Ingolia linker][12nt][TruSeq]): the linker is an exact
-    substring of 98% of its reads and the matcher found it in none of them; with
-    discard_untrimmed on, a 53.7M-read library became a 23 KB BAM. Five of the eight
-    libraries in a random 20-run cohort were hit."""
-    linker = "CTGTAGGCACCATCAAT"
-    truseq = "AGATCGGAAGAGCACACGTCTGAACT"
-    fp = "CGGGACATGTGGCGTACGAA"                      # 20 nt "footprint"
-    read = fp + linker + "GGCCGGTTTCTG" + truseq     # adapter, then 38 nt more
-
-    # the matcher must locate it where it actually is
-    assert read.find(linker) == len(fp)
-    assert trim.find_adapter(read, linker, min_start=14, min_overlap=7) == len(fp)
-
-    call = {"status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
-            "barcode3_seq": "none", "adapter3_name": "ingolia_linker",
-            "adapter3_seq": linker, "polyA_tail": "none", "footprint_len_mode": 20,
-            "p5_layout": [], "functional": {"trim_5p": 0, "dedup_umi_len": 0}}
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [read]), call, out, min_len=15)
-
-    assert st["n_reads_out"] == 1, "the read carries its adapter; it must not be discarded"
-    assert st["frac_no_adapter"] == 0.0
-    (_, seq), = _read(out)
-    assert seq == fp, "everything from the adapter onwards comes off, not just the adapter"
-
-
-def test_an_adapter_at_the_very_end_still_works(tmp_path):
-    """The ordinary case must not regress: adapter runs to the read's end, or past it."""
-    fp = "ACGTACGTACGTACGTACGTACGTACGTAC"
-    for tail in (ADAP, ADAP[:9]):        # complete, and truncated by the read end
-        out = str(tmp_path / f"o{len(tail)}.fastq")
-        call = dict(CALL, umi5_len=0, umi3_len=0, barcode3_seq="none",
-                    footprint_len_mode=30, functional={"trim_5p": 0, "dedup_umi_len": 0})
-        st = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), call, out, min_len=20)
-        assert st["n_reads_out"] == 1
-        (_, seq), = _read(out)
-        assert seq == fp
-
-
-# --- poly(A): the tail is not always the last thing in the read ---------------
-POLYA_CALL = {
-    "status": "ok", "umi5_len": 0, "umi3_len": 0, "nt3_len": 0,
-    "barcode3_seq": "none", "adapter3_name": "none_visible",
-    "adapter3_seq": "none_visible", "polyA_tail": "polyA",
-    "footprint_len_mode": 29, "p5_layout": [],
-    "functional": {"trim_5p": 0, "dedup_umi_len": 0},
-}
-
-
-def test_a_polyA_tail_is_cut_even_when_the_read_runs_on_past_it(tmp_path):
-    """The tail sits BETWEEN the footprint and the construct. A read long enough to
-    sequence through it carries the tail in the middle -- and a terminal-only search
-    finds nothing, leaving footprint+tail+construct on the read, which then does not
-    align at all. SRR30214250 (an adapter the panel cannot name, so the tail is the only
-    anchor): 20% of reads kept their entire 3' end and mapped at 3% vs 14%."""
-    # NB the footprint must not END in A: a genomic A abutting the tail is part of the
-    # same run, and no trimmer can say which side of the boundary it came from
-    fp = "ACGTACGTACGTACGTACGTACGTACGTC"          # 28 nt
-    tail = "A" * 14
-    junk = "GAACGGATGCGCACACGTCTGACCTCAGT"        # the unnamed construct beyond the tail
-
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [fp + tail + junk]), POLYA_CALL, out, min_len=20)
-    assert st["n_reads_out"] == 1
-    (_, seq), = _read(out)
-    assert seq == fp, "everything from the tail onwards is not footprint and must go"
-
-    # the tail ENDING the read (nothing sequenced past it) must still work
-    out2 = str(tmp_path / "p.fastq")
-    st2 = trim.trim_fastq(_fastq(tmp_path, [fp + tail]), POLYA_CALL, out2, min_len=20)
-    (_, seq2), = _read(out2)
-    assert seq2 == fp and st2["n_reads_out"] == 1
-
-
-def test_a_read_with_no_polyA_tail_at_all_is_not_a_complete_footprint(tmp_path):
-    """No tail means the read ended before the molecule did: its 3' end is set by the read
-    length, not by the footprint. That is exactly what a missing adapter means elsewhere,
-    and it gets the same treatment -- otherwise these reads reach STAR carrying their
-    construct and simply fail to align."""
-    fp_only = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"     # 40 nt, no tail anywhere
-    out = str(tmp_path / "o.fastq")
-    st = trim.trim_fastq(_fastq(tmp_path, [fp_only]), POLYA_CALL, out, min_len=20)
-    assert st["n_reads_out"] == 0 and st["n_no_adapter"] == 1
-
-
-def test_the_polyA_search_does_not_eat_into_the_footprint(tmp_path):
-    """A chance A-run inside the footprint lies to the LEFT of the real tail, so the
-    search walks in from the 3' end and stops at the tail -- it must not cut at the
-    internal run and truncate a genuine footprint."""
-    fp = "ACGTAAAAAAACGTACGTACGTACGTACG"      # 29 nt, with an internal A7
-    tail = "A" * 12
-    junk = "GAACGGATGCGCACACG"
-    out = str(tmp_path / "o.fastq")
-    trim.trim_fastq(_fastq(tmp_path, [fp + tail + junk]), POLYA_CALL, out, min_len=20)
-    (_, seq), = _read(out)
-    assert seq == fp, f"cut at the internal A-run instead of the tail: {seq!r}"
 
 
 # --- the pile-up filter's length-concentration cut ---------------------------
@@ -963,12 +627,9 @@ def _bam(tmp_path, name, reads):
 
 
 def test_a_miRNA_pile_is_removed_but_a_translated_codon_is_not(tmp_path):
-    """A mature miRNA is a ~22nt product that stacks on one 5' base exactly like an
-    adapter dimer -- just a shade less length-concentrated, because Dicer is not perfectly
-    precise. let-7i (SRR25706716) sits at 0.78 and walked straight through the old 0.85
-    cut, keeping 5.4% of that BAM. A translated codon stacks too, but its footprints
-    SPREAD over ~26-34nt -- that spread is the only thing telling the two apart, so the
-    cut must sit between them."""
+    """A miRNA pile (one 5' base, ~22 nt, length concentration ~0.78) is removed;
+    a translated codon, whose footprints spread over ~26-34 nt, is kept. The
+    length-concentration cut has to sit between the two."""
     from ribomine.qc import pileups
 
     # a miRNA-like pile: 800 reads on one base, 78% of them exactly 22nt (lc = 0.78)
@@ -990,9 +651,8 @@ def test_a_miRNA_pile_is_removed_but_a_translated_codon_is_not(tmp_path):
 
 
 def test_every_mapping_summary_column_is_actually_produced(tmp_path):
-    """A column in the header that no row ever fills is a blank column, and a key a row
-    fills that the header does not list is silently DROPPED by write_tsv. Either way the
-    table lies about what was measured, so the two lists must match exactly."""
+    """PROCESS_COLUMNS and the keys of a row match exactly: write_tsv leaves an
+    unfilled column blank and drops an unlisted key."""
     from ribomine import reports
     from ribomine.utils import Sample, write_json
 
@@ -1024,23 +684,21 @@ def test_every_mapping_summary_column_is_actually_produced(tmp_path):
     assert not missing, f"columns in the header that no row fills: {missing}"
     assert not extra, f"row keys write_tsv would silently drop: {extra}"
 
-    # the headline columns the table leads with, in order
-    # columns 4 and 5 (0-based): the FOOTPRINTS, then the MAPPINGS, then the soft-clip that
-    # tells the two apart
+    # the leading columns, in order
     assert reports.PROCESS_COLUMNS[:8] == [
         "run_accession", "verdict", "architecture", "n_mapped", "mean_footprint_len",
         "mean_mapped_len", "mean_mapped_softclip", "periodicity_tvd"]
     assert row["n_mapped"] == 30
     assert row["mean_mapped_softclip"] == 0.3
-    # the footprint length is STAR's INPUT (trimmed + contaminant-free), never
-    # mean_len_after_trim, which still has the contaminants in it
+    # the footprint length is that of STAR's input (trimmed, contaminant-free), not
+    # mean_len_after_trim, which still includes the contaminants
     assert row["mean_footprint_len"] == 31.0 != row["mean_len_after_trim"]
     assert row["mean_mapped_len"] == 29.4
 
 
 class _DeadCurl:
-    """curl that already exited non-zero -- ENA answers a burst of requests with 403,
-    and curl then writes NOTHING, so the stream is empty rather than broken."""
+    """A curl that exited non-zero without writing anything (e.g. ENA answering
+    403), which leaves an empty stream rather than a broken one."""
 
     returncode = 22
 
@@ -1060,11 +718,8 @@ class _DeadCurl:
 
 
 def test_a_failed_transfer_is_retried_and_never_read_as_an_empty_run(tmp_path, monkeypatch):
-    """A 403 is not an empty file. curl writes nothing, the gzip stream is empty, the
-    reservoir reads zero records and returns NORMALLY -- nothing raises, so the retry
-    never fired and the sample died as 'no reads obtained'. That is 20 of 100 runs, the
-    first time this pipeline asked ENA for 8 samples at once. The transfer has to be
-    judged by curl's exit status, not by whether bytes happened to arrive."""
+    """An empty stream from a failed curl (e.g. HTTP 403) is retried: the transfer
+    is judged by curl's exit status, not by whether bytes arrived."""
     import io
 
     from ribomine.sra import download
@@ -1088,9 +743,8 @@ def test_a_failed_transfer_is_retried_and_never_read_as_an_empty_run(tmp_path, m
 
 
 def test_a_transfer_that_dies_MID_stream_is_not_kept_as_a_short_sample(tmp_path, monkeypatch):
-    """Worse than the 403: curl dies partway (an SSL read error), the reservoir gets SOME
-    reads and hands them back. A short sample is a BIASED sample, and nothing downstream
-    can tell it apart from a good one."""
+    """If curl dies partway, the partial (and therefore biased) sample is
+    discarded and the transfer retried."""
     import io
 
     from ribomine.sra import download
@@ -1145,11 +799,8 @@ def _qc_dict(reason: str) -> dict:
 
 
 def test_a_long_reason_wraps_instead_of_stretching_the_whole_figure(tmp_path):
-    """A reason is not always a short clause: the MITOCHONDRIAL-DOMINATED one runs to 211
-    characters where every other sits under 52. An unwrapped line does not overflow its
-    panel -- savefig crops to the artists' bounding box, so it widens the FIGURE, which
-    squeezes the six panels into the left third and collides their titles. One sentence
-    made SRR28710934's plot unreadable."""
+    """A long verdict reason wraps. Unwrapped, it widens the saved figure
+    (savefig crops to the artists' bounding box) and squeezes the panels."""
     from PIL import Image
 
     from ribomine.qc import plot
@@ -1174,11 +825,8 @@ def test_a_long_reason_wraps_instead_of_stretching_the_whole_figure(tmp_path):
 
 # --- strandedness / TI-seq ---------------------------------------------------
 def test_a_read_antisense_to_a_CDS_is_counted_as_antisense_not_just_intron():
-    """This is the whole reason a reverse-complemented deposit was invisible. A read on a
-    CDS but on the wrong strand fails the strand check, falls through every other test,
-    and lands in "intron" -- because a CDS sits inside a gene. So the library looks like
-    one with no CDS enrichment and a lot of intronic signal, and it is refused for exactly
-    that, with nothing said about the strand (SRR5750390: 77% of its CDS reads antisense)."""
+    """A read on a CDS but on the wrong strand is classified 'intron', yet `on_cds`
+    is set, so the caller can recognise a reverse-complemented library."""
     import numpy as np
     from ncls import NCLS
 
@@ -1193,19 +841,17 @@ def test_a_read_antisense_to_a_CDS_is_counted_as_antisense_not_just_intron():
     ncls = {"cds": {"1": one}, "utr5": {}, "utr3": {}, "exon_nc": {},
             "gene": {"1": one}}
 
-    region, frame, on_cds = _classify(idx, ncls, "1", 150, 1)      # SENSE read
+    region, frame, on_cds = _classify(idx, ncls, "1", 150, 1)      # sense read
     assert region == "CDS" and frame is not None and on_cds
 
-    region, frame, on_cds = _classify(idx, ncls, "1", 150, -1)     # ANTISENSE read
+    region, frame, on_cds = _classify(idx, ncls, "1", 150, -1)     # antisense read
     assert region == "intron", "an antisense CDS read still falls through to 'intron'"
     assert on_cds, "... but the caller must be able to SEE that a CDS was there"
 
 
 def test_the_tiseq_cut_labels_an_initiation_dominated_run():
-    """40 caught NOTHING in a random 100-run cohort while two runs were plainly
-    initiation-dominated: SRR12790151 at 34 (a 968-read start peak over a 28-read CDS
-    body) and SRR35630261 at 37. Elongating ribo-seq tops out around 30 -- that cohort's
-    third-highest was 14.9 and its median 4.0."""
+    """The TI-seq cut is 30: in a 100-run test cohort the initiation-dominated
+    runs scored 34 and 37, and the highest elongating run 14.9."""
     cfg = cfgmod.load(None)
     cut = cfg["qc.tiseq_ratio_min"]
     assert cut == 30

@@ -1,19 +1,15 @@
 #!/bin/bash
-# prep -- everything that must happen exactly once, before eight nodes start at once.
+# prep: the steps that must run exactly once, before the nodes start.
 #
-#   1. validate the reference paths (a typo here otherwise kills a 24 h job)
+#   1. check the reference paths
 #   2. `ribomine setup`: the GTF index and the bowtie2 contaminant index, into
-#      <workdir>/refs/, which every node then symlinks and only READS
-#   3. the genome .fai -- pysam builds it silently and in place otherwise, so
-#      eight workers would build it into the same file at the same time and leave
-#      a truncated one, after which every architecture call is quietly fabricated
-#   4. the split of meta/candidates.tsv into one accession list + one workdir per node
+#      <workdir>/refs/, which every node symlinks and only reads
+#   3. the genome .fai (pysam would otherwise build it in place, on every node
+#      at the same time)
+#   4. split the cohort into one accession list and one workdir per node
 #
-# It does NOT run the query. slurm/master.sh does that on the login node before
-# submitting this, because the ENA portal search cannot complete from a cm4 compute
-# node -- ENA takes minutes to answer it and the outbound path drops the idle
-# connection. See the long note in master.sh. This job asserts the search already
-# happened rather than quietly trying it again from the one place it cannot work.
+# The archive query is not run here: slurm/master.sh runs it on the login node
+# (see the note there). This job only checks that meta/candidates.tsv exists.
 #
 # Submitted by slurm/master.sh. Required environment:
 #   REPO_DIR, CONFIG_FILE, WORK_DIR, CONDA_ENV, N_SHARDS
@@ -52,9 +48,7 @@ GENOME=$(cfg reference.genome_fasta)
 GTF=$(cfg reference.gtf)
 STAR_INDEX=$(cfg reference.star_index)
 
-# ------------------------------------------------------------------ #
-# 1. the reference. Fail here, in minutes, not there, in a day.       #
-# ------------------------------------------------------------------ #
+# --- 1. reference paths ---
 fail=0
 for p in "${GENOME}" "${GTF}"; do
     if [[ ! -f "${p}" ]]; then echo "[prep] MISSING FILE: ${p}" >&2; fail=1; fi
@@ -65,11 +59,10 @@ if [[ ! -d "${STAR_INDEX}" ]]; then
 fi
 (( fail )) && { echo "[prep] fix reference.* in ${CONFIG_FILE}" >&2; exit 2; }
 
-# The gene-count matrix comes from STAR's own --quantMode GeneCounts, which only
-# works if the annotation is IN the index. It cannot be supplied at mapping time:
-# STAR refuses to insert junctions on the fly against a shared-memory genome, and
-# the shared genome is what makes 28 concurrent samples per node affordable. So an
-# index built without --sjdbGTFfile means no matrix -- say so now, not in 20 hours.
+# The gene-count matrix comes from STAR's --quantMode GeneCounts, which needs the
+# annotation in the index (--sjdbGTFfile at build time): STAR cannot insert
+# junctions at mapping time against a shared-memory genome. Without it no matrix
+# is written, so warn now.
 GENE_INFO="${STAR_INDEX}/geneInfo.tab"
 N_GENES=0
 [[ -f "${GENE_INFO}" ]] && N_GENES=$(head -1 "${GENE_INFO}" | tr -dc '0-9')
@@ -85,9 +78,7 @@ fi
 echo "[prep] free space on the workdir filesystem:"
 df -h "$(dirname "${WORK_DIR}")" || true
 
-# ------------------------------------------------------------------ #
-# 2 + 3. the shared indexes: built once, here, read by every node.    #
-# ------------------------------------------------------------------ #
+# --- 2 + 3. shared indexes: built once here, read by every node ---
 echo "[prep] building the annotation + contaminant indexes"
 ribomine setup -c "${CONFIG_FILE}"
 
@@ -98,12 +89,9 @@ else
     echo "[prep] genome .fai present"
 fi
 
-# ------------------------------------------------------------------ #
-# 4. the split. The query already happened, on the login node.        #
-# ------------------------------------------------------------------ #
-# Assert it, rather than let prepare_run.py fall through to searching ENA from
-# here: that is the one place the search cannot work, it takes ~10 minutes of
-# timeouts to discover, and it takes the job down when it does.
+# --- 4. the split ---
+# With pipeline.start=query, require candidates.tsv: prepare_run.py would otherwise
+# run the query from this compute node, where it cannot complete.
 START=$(cfg pipeline.start)
 if [[ "${START}" == "query" && ! -s "${WORK_DIR}/meta/candidates.tsv" ]]; then
     cat >&2 <<EOF

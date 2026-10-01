@@ -1,18 +1,14 @@
-"""Preprocess an Ensembl GTF into a compact cached index for ribo-seq QC.
+"""Parse an Ensembl GTF once into a pickled index of per-chromosome arrays for QC.
 
-The full GTF is ~1 GB; parsing it on every run is wasteful. It is parsed once
-into per-chromosome integer arrays (pickled) that the QC stage loads in a
-fraction of a second and turns into NCLS interval indexes.
+Stored per chromosome:
+  cds          CDS intervals with strand and frame (GTF column 8)
+  utr5, utr3   UTR intervals
+  exon_nc      exons of non-coding genes (gene_biotype != protein_coding)
+  gene         gene spans (inside a gene but outside any exon = intron)
+  start_codon, stop_codon   first base in translation direction, with strand
 
-What is stored, per chromosome:
-  cds        CDS intervals with strand and reading frame (GTF col 8)
-  utr5/utr3  5' / 3' UTR intervals
-  exon_nc    exons of non-coding genes (gene_biotype != protein_coding)
-  gene       gene spans (a position inside a gene but outside any exon = intron)
-  start/stop codon A-positions, strand-aware (translation-direction first base)
-
-Region priority at a position: MT chrom > CDS > 5'UTR > 3'UTR > ncRNA exon >
-intron (inside a gene) > intergenic.
+Region priority at a position: mito > CDS > 5'UTR > 3'UTR > ncRNA exon >
+intron > intergenic.
 """
 from __future__ import annotations
 
@@ -35,7 +31,7 @@ _BIOTYPE = re.compile(r'gene_biotype "([^"]+)"')
 
 
 def _parse_gtf(gtf_path: str) -> dict[str, Any]:
-    """Parse the GTF into the cache dict. Python lists first, arrays at the end."""
+    """Parse the GTF into the index dict (see the module docstring)."""
     cds = defaultdict(lambda: ([], [], [], []))       # start,end,strand,frame
     utr5 = defaultdict(lambda: ([], []))
     utr3 = defaultdict(lambda: ([], []))
@@ -119,9 +115,8 @@ def _parse_gtf(gtf_path: str) -> dict[str, Any]:
 def build_index(gtf: str, out_pkl: str) -> str:
     """Parse `gtf` and write the pickled index to `out_pkl`. Returns `out_pkl`.
 
-    Written to a temp file in the destination directory and `os.replace`d into
-    position, so a half-written pickle is never visible to a concurrent worker
-    (and a killed build leaves no file that `ensure_index` would trust).
+    Written to a temp file and renamed into place, so a partial pickle is never
+    visible to a concurrent worker or to a later `ensure_index`.
     """
     if not os.path.isfile(gtf):
         raise ValueError(f"GTF not found: {gtf}")
@@ -145,18 +140,15 @@ def build_index(gtf: str, out_pkl: str) -> str:
 def ensure_index(cfg: Config) -> str:
     """Return the annotation index path, building it if it is absent or stale.
 
-    Safe to call from every worker of a process pool: the build goes to a
-    private temp file and is `os.replace`d into place, so concurrent builders
-    cannot see (or write) a partial pickle -- the worst case is that the same
-    index is parsed twice and the second one atomically overwrites an identical
-    first.
+    Safe to call from concurrent workers: the build is atomic, so at worst the
+    same index is built twice.
     """
     gtf = cfg.ref("gtf")
     if not gtf or not os.path.isfile(gtf):
         raise ValueError(f"reference.gtf does not exist: {gtf!r}")
     out_pkl = cfg.annotation_index
 
-    # a pickle older than the GTF was built from a different annotation
+    # an index older than the GTF is stale
     if os.path.isfile(out_pkl) and os.path.getmtime(out_pkl) >= os.path.getmtime(gtf):
         LOG.debug("annotation index up to date: %s", out_pkl)
         return out_pkl

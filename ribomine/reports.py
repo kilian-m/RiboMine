@@ -1,34 +1,18 @@
 """The cross-sample tables: one row per run, one file per end point.
 
-For two of the three end points (`qc`, `architecture`) the TSV *is* the product,
-so the columns are chosen the way a biologist reads them -- identity first, then
-the verdict/call, then the numbers that back it -- and every column is a scalar
-you can sort on. Nothing here re-derives biology: each stage already wrote its
-JSON into the per-sample directory (`utils.Sample`), and a report only joins
-them.
+Each stage already wrote its JSON into the per-sample directory (`utils.Sample`);
+a report only joins them. A run that never reached a stage still gets a row, so
+the table shows which runs fell over. `counts/gene_counts.tsv` is the genes x runs
+matrix of STAR's own gene counts.
 
-A run that never reached a stage still gets a row. A table with 187 rows and 12
-blanks is honest; a table with 175 rows silently hides which runs fell over.
+Where the numbers come from:
 
-The BAM end point has a second deliverable that is not one row per run:
-`counts/gene_counts.tsv`, the genes x runs read-count matrix. It is a join, not a
-measurement -- STAR counted the reads into genes while it aligned them, and this
-only stacks one run's column next to the next one's.
-
-Where the numbers come from (this matters, and the pipeline is deliberate about
-it -- see docs / PIPELINE.md §13):
-
-* periodicity, region composition and the mapping fractions in `qc_summary.tsv`
-  come from the QC stage's **local** alignment of the untrimmed sampled reads.
-  Soft-clipping the 5' construct / RT base gives a cleaner footprint 5' end, and
-  hence sharper periodicity, than an end-to-end alignment of trimmed reads. The
-  same permissiveness inflates multimapping, which is why
-* the mapping numbers in `mapping_summary.tsv` come from the **end-to-end**
-  alignment of the trimmed reads -- the deliverable BAM.
-* the periodicity columns in `mapping_summary.tsv` are a THIRD measurement, and
-  the only one taken on the finished BAM: trimmed, filtered, deduplicated. QC says
-  whether the library is ribo-seq; this says whether what came out of the pipeline
-  still is. They are allowed to disagree -- when they do, the trim is the suspect.
+* `qc_summary.tsv` -- the QC stage's local alignment of the untrimmed read sample
+  (soft-clipping the 5' construct gives the sharpest periodicity, but inflates
+  multimapping);
+* `mapping_summary.tsv` -- mapping numbers from the alignment of the trimmed
+  reads, and periodicity measured again on the finished BAM. When the two
+  periodicities disagree, the trim is the suspect.
 """
 from __future__ import annotations
 
@@ -36,7 +20,7 @@ import logging
 import os
 from typing import Any
 
-from .arch.infer import architecture_string
+from .architecture import structure_string
 from .config import Config
 from .process import counts
 from .utils import Sample, nonempty, read_json, read_tsv, write_tsv
@@ -49,9 +33,7 @@ QC_COLUMNS = [
     "n_reads_sampled", "n_reads_scored", "total_run_reads", "projected_usable_reads",
     "read_len_mode", "read_len_peak_frac", "periodicity_inframe", "periodicity_tvd",
     "cds_frac_of_genic", "start_codon_ratio", "top5p_locus_frac",
-    # a ribo-seq footprint is a piece of the mRNA, so it is SENSE to the gene. Well
-    # under 1 here means the deposit is reverse-complemented -- and every other number
-    # in this row was then measured on the minority of reads that sit the right way.
+    # footprints are sense to the gene; well under 1 = a reverse-complemented deposit
     "cds_sense_frac", "antisense_deposit",
     "mito_dominated", "mito_periodicity_inframe", "n_mito_cds_reads",
     "frac_rRNA_tRNA_etc", "frac_low_complexity", "frac_position_pileup",
@@ -71,16 +53,12 @@ ARCH_COLUMNS = [
 ]
 
 PROCESS_COLUMNS = [
-    # The headline, in the order a reader asks the questions: which run, was it ribo-seq,
-    # what is the read made of, how much of it survived, how long are those reads before
-    # and after they were mapped, and are they periodic. Everything after this is the
-    # evidence behind it, and nobody has to scroll to find out whether the run is usable.
+    # the headline: is the run usable?
     "run_accession", "verdict", "architecture",
-    "n_mapped",              # reads in the deliverable BAM: trimmed, filtered, deduped
-    "mean_footprint_len",    # the FOOTPRINTS: trimmed and contaminant-free, as fed to STAR
-    "mean_mapped_len",       # the MAPPINGS: aligned length of what reached the BAM
-    "mean_mapped_softclip",  # non-genomic nt clipped off the mapped reads: reads the gap
-                             # above -- large = residual the trim missed; ~0 = clean footprints
+    "n_mapped",              # reads in the final BAM
+    "mean_footprint_len",    # trimmed, contaminant-free reads, as fed to STAR
+    "mean_mapped_len",       # aligned length of what reached the BAM
+    "mean_mapped_softclip",  # large = residue the trim missed
     "periodicity_tvd",
     # --- the rest of the BAM's own measurement
     "periodicity_inframe", "read_len_mode", "n_cds_reads", "cds_frac_of_genic",
@@ -88,16 +66,13 @@ PROCESS_COLUMNS = [
     # --- where the reads came from and what was thrown away on the way
     "download_route", "download_mb_per_s", "fastq_bytes",
     "n_reads_raw", "n_reads_after_trim", "frac_trimmed_out", "frac_no_adapter",
-    # mean_len_after_trim is a mean over the trimmed reads INCLUDING the contaminants, so
-    # it is not the footprint length -- mean_footprint_len above is. Kept, because the two
-    # together say how different the contaminants were.
+    # mean_len_after_trim still includes the contaminants; mean_footprint_len does not
     "mean_len_before_trim", "mean_len_after_trim",
     "n_contaminant_removed", "frac_contaminant",
     "n_reads_into_mapping", "n_uniquely_mapped",
     "frac_uniquely_mapped", "frac_multimapping", "frac_unmapped",
     "umi_dedup", "n_reads_after_dedup", "frac_duplicates",
-    # --- STAR's gene counts: taken DURING the alignment, so they precede the pile-up
-    #     filter and any UMI dedup (see ribomine.process.counts)
+    # --- STAR's gene counts (taken during alignment: before pile-up filter and dedup)
     "n_reads_in_genes", "frac_reads_in_genes", "n_genes_detected",
     "n_ambiguous", "n_no_feature", "sense_over_antisense",
     "bam", "bam_bytes",
@@ -114,13 +89,13 @@ REGIONS = [
     ("region_mito", "mito"),
 ]
 
-# a stage that never produced its JSON: said out loud, not left blank
+# a stage that never produced its JSON
 NOT_RUN = "NOT RUN"
 
 
 # --- the three tables --------------------------------------------------------
 def qc_tsv(cfg: Config, accs: list[str]) -> str:
-    """Write `<workdir>/qc/qc_summary.tsv` -- the QC end point's deliverable."""
+    """Write `<workdir>/qc/qc_summary.tsv`."""
     meta = _candidates(cfg)
     fails = _failures(cfg)
     rows = [_qc_row(cfg, acc, meta.get(acc, {}), fails.get(acc, "")) for acc in accs]
@@ -132,8 +107,7 @@ def qc_tsv(cfg: Config, accs: list[str]) -> str:
 
 
 def arch_tsv(cfg: Config, accs: list[str]) -> str:
-    """Write `<workdir>/architecture/architecture.tsv` -- the architecture end
-    point's deliverable: the read layout of every run, one line each."""
+    """Write `<workdir>/architecture/architecture.tsv`: the read layout of every run."""
     fails = _failures(cfg)
     rows = [_arch_row(cfg, acc, fails.get(acc, "")) for acc in accs]
     path = os.path.join(cfg.dir("architecture"), "architecture.tsv")
@@ -144,8 +118,7 @@ def arch_tsv(cfg: Config, accs: list[str]) -> str:
 
 
 def process_tsv(cfg: Config, accs: list[str]) -> str:
-    """Write `<workdir>/mapping_summary.tsv` -- the BAM end point's deliverable:
-    what came out of every run, from bytes downloaded to reads in the BAM."""
+    """Write `<workdir>/mapping_summary.tsv`: from bytes downloaded to reads in the BAM."""
     rows = [_process_row(cfg, acc) for acc in accs]
     path = os.path.join(cfg.workdir, "mapping_summary.tsv")
     write_tsv(path, rows, columns=PROCESS_COLUMNS)
@@ -155,14 +128,9 @@ def process_tsv(cfg: Config, accs: list[str]) -> str:
 
 
 def counts_tsv(cfg: Config, accs: list[str]) -> str:
-    """Write `<workdir>/counts/gene_counts.tsv` -- the genes x runs read-count matrix.
-
-    The columns are STAR's own per-run gene counts (`ReadsPerGene.out.tab`), joined on
-    the gene table of the index STAR aligned against, so the row set and the counts
-    come from the same annotation by construction. Returns "" when there is nothing to
-    join -- an index built without a GTF cannot count, and that is a property of the
-    reference, not a per-run failure, so it is said once rather than 500 times.
-    """
+    """Write `<workdir>/counts/gene_counts.tsv`, the genes x runs read-count matrix,
+    from STAR's per-run `ReadsPerGene.out.tab`. Returns "" when no run has counts
+    (an index built without a GTF cannot count)."""
     if not accs:
         return ""
     cols = [(a, counts.path(Sample(a, cfg.workdir).star_final)) for a in accs]
@@ -243,8 +211,7 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
     contam = read_json(s.contam_json) or {}
     pileup = read_json(s.pileup_json) or {}
 
-    # the run's total read count: from the QC projection if the stage had it,
-    # else straight from the ENA metadata we queried with
+    # the run's total read count: from the QC projection, else the ENA metadata
     total = _some(_get(qc, "usable.total_dataset_reads"), _int(meta.get("read_count")))
     row: dict[str, Any] = {
         "run_accession": acc,
@@ -252,8 +219,6 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
         "total_run_reads": total,
     }
     if not qc:
-        # no verdict: say so in the verdict column rather than leaving a blank
-        # row that reads like a pass
         row["verdict"] = NOT_RUN
         row["verdict_reason"] = failure or "QC produced no output for this run"
         row["n_reads_sampled"] = contam.get("n_input")
@@ -268,8 +233,7 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
     n_scored = qc.get("n_reads_scored")
     projected = _get(qc, "usable.projected_usable_reads")
     if projected is None and total and n_sampled and n_scored is not None:
-        # the QC stage runs before the ENA read count is necessarily known; if we
-        # have both now, project here rather than leave the column empty
+        # the QC stage may have run before the ENA read count was known
         projected = int(round(n_scored / n_sampled * total))
 
     frac_pileup = cm.get("frac_position_pileup")
@@ -292,8 +256,7 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
         "antisense_deposit": qc.get("antisense_deposit"),
         "start_codon_ratio": qc.get("start_codon_ratio"),
         "top5p_locus_frac": qc.get("top5p_locus_frac"),
-        # a mitoribosome-profiling library: the numbers above were measured on its
-        # NUCLEAR reads, which are the minority. These say what its mito reads do.
+        # mitoribosome profiling: the numbers above are from the nuclear reads
         "mito_dominated": qc.get("mito_dominated"),
         "mito_periodicity_inframe": qc.get("mito_periodicity_inframe_frac"),
         "n_mito_cds_reads": qc.get("n_mito_cds_reads"),
@@ -302,7 +265,7 @@ def _qc_row(cfg: Config, acc: str, meta: dict, failure: str) -> dict[str, Any]:
         "frac_low_complexity": _some(cm.get("frac_low_complexity"),
                                      contam.get("frac_low_complexity")),
         "frac_position_pileup": frac_pileup,
-        # local, permissive alignment -- multimapping is inflated by design here
+        # local, permissive alignment: multimapping is inflated here
         "frac_uniquely_mapped": mapping.get("frac_unique"),
         "frac_multimapping": mapping.get("frac_multimapping"),
         "frac_unmapped": mapping.get("frac_unmapped"),
@@ -337,11 +300,9 @@ def _arch_row(cfg: Config, acc: str, failure: str) -> dict[str, Any]:
         "reason": call.get("reason", ""),
         "architecture": _arch_string(call),
         "deposit_state": call.get("deposit_state"),
-        # the trim plan: what actually comes off the read
         "trim_5p": fn.get("trim_5p"),
         "umi5_len": call.get("umi5_len"),
-        # the enzymatic RT addition is KEPT (it is a footprint base), so it is
-        # reported apart from the 5' overhead that is trimmed
+        # the RT addition is kept with the footprint, so it is not part of trim_5p
         "rt_len": fn.get("footprint_retains_rt_nt"),
         "rt_penetrance": call.get("rt_penetrance"),
         "barcode5_seq": call.get("barcode5_seq"),
@@ -379,8 +340,6 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
 
     n_in = trim.get("n_reads_in")
     n_out = trim.get("n_reads_out")
-    # what trimming threw away: reads left shorter than process.min_len once the
-    # construct came off (an adapter-dimer-heavy library loses a lot here)
     frac_trimmed_out = round(1 - n_out / n_in, 4) if n_in and n_out is not None else None
 
     n_contam = None
@@ -406,10 +365,7 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
     per = proc.get("periodicity") or {}
     ct = proc.get("counts") or {}
 
-    # A BAM that `keep.bam: false` deleted on purpose is not the same thing as a BAM
-    # that was never produced, and a blank cell reads like the second. The stage records
-    # what it kept, so this is read back rather than inferred from the missing file --
-    # a BAM someone deleted by hand is then still an empty cell, which is the truth.
+    # a BAM deleted on purpose (`keep.bam: false`) is not a BAM that was never made
     bam = s.bam if nonempty(s.bam) else ""
     bam_bytes = os.path.getsize(bam) if bam else proc.get("bam_bytes")
     bam_cell = _rel(cfg, bam)
@@ -426,9 +382,7 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         "n_reads_raw": n_in,
         "n_reads_after_trim": n_out,
         "frac_trimmed_out": frac_trimmed_out,
-        # reads whose fixed 3' scaffold ran off the end of the read: they cannot be cut
-        # at the footprint boundary and are discarded. High here = the library's
-        # molecules are as long as its reads, and most of its depth is unusable.
+        # reads dropped because the 3' adapter ran off the end of the read
         "frac_no_adapter": trim.get("frac_no_adapter"),
         "mean_len_before_trim": trim.get("mean_len_in"),
         "mean_len_after_trim": trim.get("mean_len_out"),
@@ -436,30 +390,16 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         "frac_contaminant": frac_contam,
         "n_reads_into_mapping": n_map_in,
         "n_uniquely_mapped": mp.get("n_unique"),
-        # end-to-end alignment of the trimmed reads: these three sum to 1
+        # alignment of the trimmed reads: these three sum to 1
         "frac_uniquely_mapped": mp.get("frac_unique"),
         "frac_multimapping": mp.get("frac_multimapping"),
         "frac_unmapped": mp.get("frac_unmapped"),
-        # the pipeline records whether dedup RAN; `dd` only says whether it produced
-        # stats, which is not the same thing (dedup off => no block, but also no 'no')
         "umi_dedup": proc.get("umi_dedup") if proc else None,
         "n_reads_after_dedup": dd.get("n_out"),
         "frac_duplicates": frac_dup,
-        # --- what is actually IN the BAM. The QC table's periodicity is the verdict's:
-        # a sample of the untrimmed reads, locally aligned. This one is the pipeline's
-        # own output measured after every filter, which is the number to trust about
-        # the data you are handed -- and the one that catches a mis-trimmed footprint.
+        # --- measured on the finished BAM, after every filter
         "n_mapped": per.get("n_reads_in_bam"),
-        # The FOOTPRINT reads: what STAR was given, i.e. trimmed AND contaminant-filtered.
-        # STAR already means it, so there is nothing to recompute. This is the number to
-        # read as "how long are this library's footprints" -- `mean_len_after_trim` is
-        # NOT, because the contaminants are still in it and they are not footprints
-        # (SRR30357177: 88% rRNA, ~5 nt longer, dragging that mean from 34 nt up to 39).
         "mean_footprint_len": mp.get("avg_input_len"),
-        # The MAPPINGS: aligned length (soft clips excluded) of the reads that reached the
-        # BAM. Measured on the deliverable itself, so it is after the pile-up filter and
-        # any dedup -- which is why it is our own pass and not STAR's `avg_mapped_len`,
-        # though the two agree to a decimal when nothing is removed after mapping.
         "mean_mapped_len": per.get("mean_mapped_len"),
         "mean_mapped_softclip": per.get("mean_mapped_softclip"),
         "read_len_mode": per.get("read_len_mode"),
@@ -468,9 +408,7 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
         "n_cds_reads": per.get("n_cds_reads"),
         "cds_frac_of_genic": per.get("cds_frac_of_genic"),
         "n_reads_scored_periodicity": per.get("n_reads_scored"),
-        # --- the count matrix's own numbers, per run. `n_reads_in_genes` is the column
-        # this run contributes to counts/gene_counts.tsv; the rest is what it does not
-        # contain (ambiguous between two genes, in no gene at all).
+        # --- STAR's gene counts for this run
         "n_reads_in_genes": ct.get("n_in_genes"),
         "frac_reads_in_genes": ct.get("frac_in_genes"),
         "n_genes_detected": ct.get("n_genes_detected"),
@@ -484,12 +422,8 @@ def _process_row(cfg: Config, acc: str) -> dict[str, Any]:
 
 # --- joins and lookups -------------------------------------------------------
 def _candidates(cfg: Config) -> dict[str, dict]:
-    """run_accession -> its row in `<workdir>/meta/candidates.tsv`.
-
-    The study accession and the run's total read count live in the ENA metadata
-    the query stage wrote. A run that came from a bare accession list or a local
-    FASTQ has no such row -- its cells stay empty, which is the truth.
-    """
+    """run_accession -> its row in `<workdir>/meta/candidates.tsv` (empty for runs
+    that came from an accession list or a local FASTQ)."""
     path = os.path.join(cfg.dir("meta"), "candidates.tsv")
     if not nonempty(path):
         return {}
@@ -501,9 +435,7 @@ def _candidates(cfg: Config) -> dict[str, dict]:
 
 
 def _failures(cfg: Config) -> dict[str, str]:
-    """run_accession -> why the pipeline recorded it as failed, from
-    `<workdir>/failed.tsv`. Best-effort: the table is for humans, and a missing
-    or oddly-shaped failure log must never take a report down."""
+    """run_accession -> why it failed, from `<workdir>/failed.tsv`. Best-effort."""
     path = os.path.join(cfg.workdir, "failed.tsv")
     if not nonempty(path):
         return {}
@@ -522,24 +454,12 @@ def _failures(cfg: Config) -> dict[str, str]:
 
 
 def _arch_string(call: dict) -> str:
-    """The human-readable one-liner, e.g.
-    `5'-[UMI,2nt]-[footprint,~30nt]-[UMI,5nt]-[barcode,AGCTA]-[TruSeq]-3'`."""
-    if not call:
-        return ""
-    try:
-        return architecture_string(call)
-    except (KeyError, TypeError, ValueError) as exc:
-        LOG.debug("no architecture string for %s: %s", call.get("run_accession"), exc)
-        return f"{call.get('status', '?')}: {call.get('reason', '')}"
+    return structure_string(call) if call else ""
 
 
 def _block(d: dict, *names: str, key: str) -> dict:
-    """The sub-dict one stage wrote, wherever the process JSON nested it.
-
-    The processing stage merges several tools' stats (download, contaminant
-    filter, mapping, dedup) into one JSON. Locating a block by a key only that
-    block owns keeps the report robust to how they are nested.
-    """
+    """The sub-dict one stage wrote into the process JSON, located by a key only
+    that block owns."""
     for name in names:
         blk = d.get(name)
         if isinstance(blk, dict) and key in blk:
@@ -562,8 +482,7 @@ def _get(d: dict, dotted: str, default=None):
 
 
 def _some(*vals):
-    """The first value that was actually measured. Not `a or b`: a measured
-    fraction of 0.0 (no low-complexity reads at all) is an answer, not a miss."""
+    """The first value that is not None (a measured 0.0 counts)."""
     for v in vals:
         if v is not None:
             return v
@@ -594,6 +513,5 @@ def _plot(cfg: Config, plot: Any) -> str:
 
 
 def _rel(cfg: Config, path: str) -> str:
-    """Paths in the tables are relative to the workdir (`bams/SRR1.bam`): short
-    enough to read, and the table survives the workdir being moved."""
+    """Paths in the tables are relative to the workdir."""
     return os.path.relpath(path, cfg.workdir) if path else ""

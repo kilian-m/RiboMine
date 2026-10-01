@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ribomine"
 version = "0.1.0"
-description = "Mine Ribo-seq datasets from the SRA: query, QC, read-architecture, download, map."
+description = "Mine Ribo-seq datasets from the SRA: search, QC, read architecture, download, trim, map."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -16,12 +16,8 @@ dependencies = [
     "pysam>=0.22",
     "ncls>=0.0.68",
     "matplotlib>=3.7",
-    "requests>=2.31",
-    # cutadapt is a LIBRARY here, not a tool: arch/trim.py drives its C aligner
-    # (cutadapt.align.Aligner) with RiboMine's own trimming logic. That module is
-    # not a stability-guaranteed API and was last reshaped in 5.0 -- hence <6.
-    "cutadapt>=5.0,<6",
     "xopen>=1.7",
+    "fqdissect @ git+https://github.com/kilian-m/fqdissect.git",
 ]
 
 [project.optional-dependencies]
@@ -37,8 +33,7 @@ Homepage = "https://github.com/kilian-m/RiboMine"
 include = ["ribomine*"]
 
 [tool.setuptools.package-data]
-# the bundled human contaminant reference (rRNA/tRNA/snRNA/snoRNA/Mt) -- see
-# ribomine/data/__init__.py. Without this it is missing from a built wheel.
+# the bundled human contaminant reference
 "ribomine.data" = ["*.fa"]
 
 [tool.pytest.ini_options]

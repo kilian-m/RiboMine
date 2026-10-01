@@ -1,25 +1,16 @@
 #!/bin/bash
-# One node of the run: one `ribomine run` over one shard of the cohort.
+# One node of the run: one `ribomine run` over one shard. Started once per node by
+# slurm/run.sh.
 #
-# srun'd once per node by slurm/run.sh. Everything here is about the two things
-# that are a node's own private business -- its shard, and its shared-memory STAR
-# genome -- so that the eight nodes never touch the same object.
-#
-# THE STAR SHARED-MEMORY GENOME. Each node loads the ~28 GB index into shared
-# memory once and lets its 28 concurrent samples attach to that one copy; without
-# it the node would need 28 x 28 GB and die. RiboMine drops the segment in a
-# `finally` -- but a `finally` does not run when SLURM SIGKILLs the process at the
-# wall-time limit, and a leaked segment holds 28 GB on that node and makes the
-# next job's `LoadAndExit` fail. So the segment is removed here on the way OUT
-# (the trap) and, more importantly, on the way IN: a stale segment from whatever
-# ran here before is cleared before we load ours. That is the recovery path that
-# does not depend on the previous job having exited politely. It is safe because
-# cm4_std allocates nodes exclusively -- there is no other job here whose genome
-# we could be removing.
+# The node loads the STAR index (~28 GB) into shared memory once and its concurrent
+# samples attach to that copy. A segment left behind by a killed job blocks the
+# next load, so stale segments are removed at startup and again on exit (trap).
+# This is safe because cm4_std allocates nodes exclusively.
 #
 # Required environment (inherited from slurm/run.sh through srun):
 #   REPO_DIR, CONFIG_FILE, WORK_DIR, CONDA_ENV,
 #   N_SHARDS, NODES_PER_JOB, RM_JOBS, RM_THREADS
+# Optional: STAR_LOAD_TIMEOUT (seconds, default 900)
 
 set -uo pipefail
 
@@ -54,21 +45,17 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 cd "${REPO_DIR}"
 
-# 28 samples run at once on this node, and numpy/matplotlib in each of them will
-# otherwise each open a BLAS thread pool the size of the node. Cap them: the
-# parallelism that matters here is `--jobs`, and STAR/bowtie2 get their threads
-# from `--threads`.
+# One BLAS/OpenMP thread per process: the parallelism comes from `--jobs`, and
+# STAR/bowtie2 take their threads from `--threads`.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export MPLBACKEND=Agg
 
-# Node-local NVMe for tool scratch. NOT for RiboMine's own download tmpdir --
-# that one must stay on the workdir's filesystem, because the ENA route finishes
-# with os.replace(tmp, out.fastq.gz), which is a rename and fails across devices.
-# It loses nothing: a rename within the workdir is free, whereas /tmp -> DSS would
-# have been a multi-GB copy of every run.
+# Node-local scratch for the tools. RiboMine's download tmpdir stays on the
+# workdir's filesystem: the ENA download ends with a rename, which fails across
+# devices.
 export TMPDIR="/tmp/${USER}/ribomine.${SLURM_JOB_ID}.${SHARD_ID}"
 mkdir -p "${TMPDIR}"
 
@@ -78,18 +65,10 @@ print(json.load(open(sys.argv[1])).get("reference", {}).get("star_index", ""))
 PY
 )
 
-# A STAR killed part-way through loading the genome leaves its shared segment flagged
-# "load in progress" with nobody loading it, and every later STAR then waits on that
-# flag FOREVER -- "Another job is still loading the genome, sleeping for 1 min", over
-# and over. `--genomeLoad Remove` does not reliably clear that state, so the segment
-# has to be taken out with ipcrm. Which is worth doing carefully, because a hang is
-# strictly worse than a crash here: a crash loses one shard and says so, while a hang
-# burns the whole 24 h wall clock in silence and produces nothing.
-#
-# The >1 GiB filter is what keeps this from being a blunt instrument: it removes the
-# genome segments and leaves anything small alone. Only this user's segments are even
-# visible to ipcrm, and cm4_std allocates nodes exclusively, so there is no other job
-# of ours here to take down with it.
+# A STAR killed while loading the genome leaves its shared segment flagged "load in
+# progress", and every later STAR waits on it indefinitely. `--genomeLoad Remove`
+# does not reliably clear that state, so this user's segments larger than 1 GiB
+# (the genome) are removed with ipcrm; smaller segments are left alone.
 star_shm_purge() {
     local id
     for id in $(ipcs -m 2>/dev/null \
@@ -106,9 +85,8 @@ star_genome_remove() {
     star_shm_purge
 }
 
-# `timeout`, not patience: a stuck segment makes LoadAndExit wait forever rather than
-# fail, so without a clock the node hangs instead of erroring. 15 min is many times
-# what a real load takes (~2-5 min from a warm page cache) and a fraction of the wall.
+# Time limit for the load (seconds): on a stuck segment LoadAndExit waits instead
+# of failing. A normal load takes 2-5 min.
 STAR_LOAD_TIMEOUT="${STAR_LOAD_TIMEOUT:-900}"
 
 star_genome_load() {
@@ -124,33 +102,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Clear whatever the last job on this node left behind, before we load ours.
+# Remove whatever the previous job on this node left behind.
 star_genome_remove
 
-# ------------------------------------------------------------------ #
-# Load the shared genome HERE, and refuse to run without it.          #
-# ------------------------------------------------------------------ #
-# RiboMine loads it itself, and if the load fails it warns and falls back to
-# NoSharedMemory -- every worker then loads its OWN ~30 GB copy of the index. On a
-# workstation that is a memory bill. Here it is suicide: RM_JOBS is 28, so the
-# fallback asks the node for 28 x 30 GB = 840 GB, and the node OOM-kills the whole
-# process within seconds. The shard is then lost for the round, and the SLURM log
-# says only "Killed" -- with the actual cause, one WARNING line, scrolled far above.
-#
-# So the decision is taken here instead, where it can be fatal on purpose: load the
-# segment, and if it will not load, STOP. Exporting the result in
-# RIBOMINE_STAR_GENOME_LOAD is what RiboMine reads back (star.genome_load()), so it
-# skips its own load and its own fallback entirely.
+# Load the shared genome here and stop if it fails. If RiboMine's own load fails,
+# it falls back to NoSharedMemory: one ~30 GB copy of the index per concurrent
+# sample, which exceeds the node's memory. With RIBOMINE_STAR_GENOME_LOAD set,
+# RiboMine (star.load_genome()) skips its own load and fallback.
 if [[ -n "${STAR_INDEX}" ]]; then
     echo "[node ${HOST}] loading the STAR genome into shared memory (~30 GB, once for this node)"
     rc=0
     star_genome_load || rc=$?
 
-    # 124 is `timeout`'s: the load did not fail, it HUNG -- which is the signature of a
-    # segment left mid-load by a killed STAR. The purge above should have caught it, so
-    # this is the belt to that braces (a segment created between the purge and now, or
-    # one that Remove revived). Purge again and take exactly one more run at it: a
-    # second hang is a real problem and must not be slept through.
+    # 124 = `timeout`: the load hung on a segment left mid-load. Purge again and
+    # retry once.
     if (( rc == 124 )); then
         echo "[node ${HOST}] the genome load HUNG for ${STAR_LOAD_TIMEOUT}s -- a killed STAR" >&2
         echo "[node ${HOST}] left its segment flagged 'loading'. Purging it and retrying once." >&2
@@ -185,10 +150,8 @@ EOF
 fi
 
 RM_PID=""
-# SLURM's pre-kill SIGTERM: pass it on and let the EXIT trap release the genome.
-# The sample in flight is simply lost -- it has written no JSON, so next round
-# redoes it. That is the whole recovery mechanism, and it is the same one for a
-# SIGKILL and for a dead node.
+# On SLURM's SIGTERM, pass it on to ribomine; the EXIT trap releases the genome.
+# A sample in flight has written no JSON, so the next round redoes it.
 trap 'echo "[node '"${HOST}"'] SIGTERM"; [[ -n "${RM_PID}" ]] && kill -TERM "${RM_PID}" 2>/dev/null; ' TERM
 
 ribomine run \

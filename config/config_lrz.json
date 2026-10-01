@@ -1,24 +1,15 @@
 {
   "_README": [
-    "RiboMine on LRZ CoolMUC-4 (SLURM). Submit from a login node with:",
+    "RiboMine on LRZ CoolMUC-4 (SLURM). Submit from a login node:",
     "    slurm/master.sh config/config_lrz.json",
-    "",
-    "This is an ORDINARY RiboMine config -- `ribomine run -c` accepts it as-is.",
-    "The `_slurm` block below is a comment as far as RiboMine is concerned (config.py",
-    "ignores every key starting with '_'); it is read by slurm/master.sh alone. Keeping",
-    "it here means the cluster shape and the pipeline settings cannot drift apart.",
-    "",
-    "BEFORE THE FIRST SUBMIT, check the three `reference` paths below. slurm/prep.sh",
-    "validates them and fails in minutes rather than letting a 24 h job die on a typo."
+    "This is an ordinary RiboMine config. Keys starting with '_' are comments; the",
+    "`_slurm` block is read only by slurm/master.sh. See docs/SLURM.md.",
+    "Check the three `reference` paths before the first submit (slurm/prep.sh validates them)."
   ],
 
   "_slurm": {
-    "_": "Read by slurm/master.sh only. 2 jobs x 4 nodes x 112 cores = 896 cores.",
-    "_limits": [
-      "cm4_std: 2-4 nodes PER JOB (max 448 cores), 2 jobs running at once, 24 h.",
-      "So 896 cores is not one job -- it is an ARRAY OF 2, each 4 nodes wide.",
-      "cm4 nodes: 112 physical cores, 488 GiB, exclusive on cm4_std."
-    ],
+    "_": "2 jobs x 4 nodes x 112 cores = 896 cores.",
+    "_limits": "cm4_std: 2-4 nodes per job, 2 jobs running at once, 24 h. Nodes have 112 physical cores and 488 GiB and are allocated exclusively.",
     "job_prefix": "rm-",
     "conda_env": "ribomine",
     "mail_user": "",
@@ -38,43 +29,20 @@
   "project": {
     "name": "ribomine-lrz",
     "_workdir": [
-      "The ROOT. Per-node workdirs are <workdir>/shards/work_NN -- one per node, so",
-      "the eight `ribomine run` processes never write the same file. slurm/merge.sh",
-      "then builds <workdir>/merged/, from which the cohort-wide tables are written.",
-      "",
-      "It LOOKS like it is under $HOME and it is not: data_dir is a symlink into the",
-      "dssfs02 container (DSS-CONTAINER), which is the whole reason this run fits.",
-      "Do not 'simplify' it to a real home path -- the DSS home is 100 GB, and the run",
-      "wants 2.1 TB. (`df -h` on it says dssfs02; `dssusrinfo all` shows the container.)",
-      "",
-      "SPACE, measured on the 2026-07-14 pilot rather than guessed -- mean per run:",
-      "2.08 GB downloaded, 298 MB of BAM kept, 4.85 GB alive on disk while it runs.",
-      "For the ~3,300 runs expected to survive QC:",
-      "  ~1.0 TB  the BAMs. Accumulates to the end. A FLOOR -- no knob shrinks it.",
-      "  ~6.9 TB  downloaded, but passing THROUGH: each run's FASTQ is deleted as soon",
-      "           as its BAM exists, so it is never all resident.",
-      "  ~1.1 TB  transient high-water = 224 runs in flight x 4.85 GB. THIS is the",
-      "           lever: it scales with project.jobs (28 -> 8 makes it ~0.3 TB).",
-      "  = ~2.1 TB needed free, against 4.9 TB in the container as of 2026-07-14.",
-      "",
-      "The container is SHARED with the project (5.1 of 10 TB used, ~2.8 of it other",
-      "people's). Yours fits with room; if a round fails strangely, check it has not",
-      "filled from someone else's side."
+      "Root of the run. Per-node workdirs are <workdir>/shards/work_NN; slurm/merge.sh",
+      "builds <workdir>/merged/ and writes the cohort tables there.",
+      "Disk, per run (measured on the pilot): 2.08 GB downloaded, 298 MB of BAM kept,",
+      "4.85 GB on disk while it is processed. For ~3,300 runs kept by QC: ~1.0 TB of",
+      "BAMs, plus 4.85 GB x runs in flight (8 nodes x project.jobs: ~0.55 TB at 14,",
+      "~1.1 TB at 28). FASTQs are deleted once the BAM exists.",
+      "Put it on a project filesystem (a DSS container); the home quota is too small."
     ],
-    "workdir": "/path/to/data_dir/ribomine/all",
+    "workdir": "/path/to/ribomine/all",
     "_jobs": [
-      "28 x 8 = 224 = the node's LOGICAL core count (112 physical + hyperthreads),",
-      "so this is deliberately twice as many samples in flight as there are physical",
-      "cores. It should be: the stage spends much of its time blocked on an ENA",
-      "download, and a sample that is waiting on the network is not using a core --",
-      "the other 27 can. Oversubscription is the point, not an accident.",
-      "It costs memory, though: ~28 GB for the node's one shared STAR genome plus",
-      "roughly 8 GB per sample in flight, so budget ~250 GB of the node's 480 GB.",
-      "If a node starts swapping, this is the number to cut. Cut from 28 to 14 after",
-      "the 2026-07-15 run: at 28 the startup wave (LPT packs the deepest runs first,",
-      "so the first batch is the heaviest) OOM-killed a worker, and a killed worker",
-      "used to break the whole pool. pipeline._pool now recovers from that, but 14 is",
-      "the width that stops tripping it in the first place."
+      "Samples in flight per node. jobs x threads may exceed the 112 physical cores, up",
+      "to the 224 hardware threads: a sample waiting on a download uses no core.",
+      "Memory: ~28 GB for the node's shared STAR genome plus roughly 8 GB per sample.",
+      "14 rather than 28, because at 28 the first (heaviest) batch ran a node out of memory."
     ],
     "jobs": 14,
     "threads": 8
@@ -82,11 +50,8 @@
 
   "pipeline": {
     "_end": [
-      "Set to 'qc' for the cheap first pass: it streams a 200k-read sample per run",
-      "instead of downloading anything, so a whole archive-wide screen costs hours",
-      "rather than days, and tells you how many of the hits are real Ribo-seq before",
-      "you spend a cohort's worth of bandwidth on them. Then set it to 'bam' and",
-      "resubmit -- resume reuses every QC verdict."
+      "Set to 'qc' for a first screening pass: QC streams a 200k-read sample per run",
+      "instead of downloading it. Then set 'bam' and resubmit; the QC verdicts are reused."
     ],
     "start": "query",
     "end": "bam"
@@ -94,59 +59,32 @@
 
   "reference": {
     "_": [
-      "CHECK THESE -- they are price2-expansive's, reused. prep.sh validates all",
-      "three and dies in minutes rather than letting a 24 h job die on a typo.",
-      "star_index is the one to look at: price2-expansive names it RELATIVE to its",
-      "own repo (resources/indexes/STAR-index), so the absolute path below is an",
-      "inference. It must also have been built with --sjdbGTFfile, or there is no",
-      "gene-count matrix -- the copy on this workstation carries 58,302 genes, so",
-      "the LRZ one almost certainly does too, and prep.sh prints the number it finds."
+      "Validated by slurm/prep.sh. star_index must have been built with --sjdbGTFfile,",
+      "otherwise no gene-count matrix is written."
     ],
     "species": "Homo sapiens",
     "taxon_id": 9606,
-    "genome_fasta": "/path/to/index_files/homo_sapiens.90.fasta",
-    "gtf": "/path/to/index_files/homo_sapiens.90.gtf",
-    "star_index": "/path/to/price2-expansive/resources/indexes/STAR-index"
+    "genome_fasta": "/path/to/homo_sapiens.90.fasta",
+    "gtf": "/path/to/homo_sapiens.90.gtf",
+    "star_index": "/path/to/STAR-index"
   },
 
   "qc": {
     "_min_unique_frac": [
-      "0.15 IS RIBOMINE'S OWN DEFAULT. It is written out here, explicitly, because it",
-      "was reviewed against real evidence and DELIBERATELY LEFT ALONE -- so that the",
-      "next person to find that evidence does not read it as an oversight and 'fix' it.",
-      "",
-      "The evidence (pilot, 2026-07-14, 18 runs): two runs were rejected by this gate",
-      "ALONE, with every other signal saying ribosome profiling. SRR26410348 -- 61%",
-      "in-frame, TVD 0.28, 71% of genic reads in CDS, a 30 nt footprint, 99.5% sense,",
-      "and 2.6M projected usable reads -- failed at 13.2% unique against this 15% cut.",
-      "SRR23563665 likewise at 6.7%. That was 2 of the 8 runs that passed the signal",
-      "tests: a quarter of the real ribo-seq in the pilot, and on the order of a",
-      "thousand runs across the 8,904 strong-tier candidates.",
-      "",
-      "The call: keep 0.15. A library that maps at 13% is dirty whatever its",
-      "mappable minority does, and with ~8,900 candidates the cohort can afford",
-      "precision over recall. The gate is doing what it was tuned to do (that cohort:",
-      "median 42% unique, p10 20%, broken libraries <10%).",
-      "",
-      "If you ever want them back, the honest lever is not this number but",
-      "`projected_usable_reads`, which RiboMine already computes: it measures the thing",
-      "the gate is a proxy FOR. And note the cost of changing your mind late -- the",
-      "verdict is cached in qc.json and the BAM behind it is deleted, so re-deciding",
-      "means re-running the whole QC pass over every run."
+      "RiboMine's default, set explicitly because it was reviewed and kept. In the",
+      "18-run pilot this gate alone rejected 2 of the 8 runs that passed every other",
+      "test (13.2% and 6.7% uniquely mapped); with ~8,900 candidates, precision was",
+      "preferred over recall. QC verdicts are cached in qc.json, so changing this",
+      "later means re-running QC for every run."
     ],
     "min_unique_frac": 0.15
   },
 
   "download": {
     "_connections": [
-      "PER RUN -- and 28 runs download at once on each of 8 nodes, so the sockets",
-      "open against ENA at peak are 8 nodes * 28 runs * this. At 4 that is ~900,",
-      "already a lot to point at one host; RiboMine's own default of 8 would be",
-      "~1800. Lowering it costs less than it looks: the per-run connection count",
-      "exists to beat ENA's ~12 MB/s per-stream cap, and with 224 runs already in",
-      "flight the link saturates long before any single one of them does.",
-      "If downloads start failing (they show up in failed.tsv and in",
-      "mapping_summary.tsv), this is still the first knob to turn -- downwards."
+      "Per run. Connections open against ENA at peak = nodes x project.jobs x this",
+      "(8 x 14 x 4 = 448); RiboMine's default is 8. Lower it first if downloads start",
+      "failing (they show up in failed.tsv and mapping_summary.tsv)."
     ],
     "connections": 4
   },

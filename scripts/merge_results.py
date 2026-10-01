@@ -1,25 +1,19 @@
-"""Put the eight nodes' results back together, and say whether the run is done.
+"""Merge the per-node results and report whether the run is complete.
 
-`slurm/merge.sh` runs this after the big array, `--dependency=afterany` -- so it
-runs however the array ended: clean, out of wall time, or with a dead node. It is
-the one job that sees the whole cohort.
+    merge_results.py -c CONFIG --shards N
 
-**The merged view.** Each node wrote into its own `shards/work_NN/`, because
-`ribomine run` puts its cohort-level tables (`qc_summary.tsv`, `architecture.tsv`,
-`mapping_summary.tsv`, `counts/gene_counts.tsv`, `failed.tsv`) at fixed paths under
-its workdir, and eight nodes sharing one workdir would each overwrite the other
-seven. So this builds `merged/` -- a workdir made of symlinks into all eight, one
-per accession -- and then calls RiboMine's own report writers against it. The
-tables are therefore produced by the same code that would have produced them on
-one machine, over the whole cohort, rather than by a bespoke TSV concatenator that
-would have to be kept in step with the columns.
+Called by `slurm/merge.sh` after the run array, however the array ended.
 
-**The verdict.** Whether more work remains is decided from the per-sample JSONs --
-the durable record of what actually ran -- and never from SLURM exit codes. A node
-that is SIGKILLed at the wall-time limit and a node that finished cleanly leave the
-same evidence behind, so recovery does not have to tell them apart. The answer goes
-to `logs/status.txt` as COMPLETE or RESUBMIT NEEDED, because a cm4 compute node is
-not allowed to `sbatch` and so this job cannot start the next round itself.
+Merged view: each node wrote into its own `shards/work_NN/`. This builds
+`<root>/merged/`, a workdir of symlinks into all of them, and runs RiboMine's own
+report writers on it. The cohort tables (`qc/qc_summary.tsv`,
+`architecture/architecture.tsv`, `mapping_summary.tsv`, `counts/gene_counts.tsv`)
+are therefore written by the same code as on a single machine. The shards'
+`failed.tsv` files are concatenated.
+
+Status: what remains is decided from the per-sample JSONs, not from SLURM exit
+codes, and written to `logs/status.txt` as COMPLETE or RESUBMIT NEEDED. A compute
+node cannot call `sbatch`, so the next round is submitted by hand.
 """
 from __future__ import annotations
 
@@ -37,8 +31,7 @@ from prepare_run import shard_list, shard_workdir
 
 # ---------------------------------------------------------------------------
 def owners(root: str, n: int) -> dict[str, int]:
-    """acc -> the shard that owns it. The shard lists are what the nodes read,
-    so they are what decides where an accession's results are."""
+    """acc -> the shard that owns it, from the shard lists the nodes read."""
     out: dict[str, int] = {}
     for k in range(n):
         p = shard_list(root, k)
@@ -53,10 +46,9 @@ def owners(root: str, n: int) -> dict[str, int]:
 
 
 def build_view(root: str, own: dict[str, int]) -> str:
-    """`<root>/merged`: one workdir, symlinked together out of the eight.
+    """Build `<root>/merged`: one workdir of symlinks into the shard workdirs.
 
-    Rebuilt from scratch every round -- a stale symlink to a sample that has since
-    been re-run on another shard would quietly report the old result.
+    Rebuilt from scratch every round, so that no stale symlink survives.
     """
     merged = os.path.join(root, "merged")
     for sub in ("samples", "bams", "qc/plots", "architecture/plots", "meta"):
@@ -96,9 +88,8 @@ def _link(target: str, link: str) -> None:
 
 
 def _merge_failures(root: str, merged: str, own: dict[str, int]) -> None:
-    """One `failed.tsv` out of the eight. `reports` reads it to say, on the QC row
-    of a run that has no verdict, *why* it has no verdict -- so losing seven
-    eighths of it would turn seven eighths of the explanations into blanks."""
+    """Concatenate the shards' `failed.tsv` into one. `reports` reads it to say
+    why a run has no QC verdict."""
     rows: list[dict] = []
     for k in sorted(set(own.values())):
         p = os.path.join(shard_workdir(root, k), "failed.tsv")
@@ -116,13 +107,12 @@ def _merge_failures(root: str, merged: str, own: dict[str, int]) -> None:
 
 # ---------------------------------------------------------------------------
 def state(cfg, accs: list[str]) -> dict:
-    """What ran, what is still owed, and what tried and failed.
+    """Count what is done, what is still to do and what failed.
 
-    Read off the per-sample JSONs, which is the only record that survives a node
-    being killed. "Owed" follows the pipeline's own gates: every run gets a QC
-    verdict; only a run whose verdict is kept gets an architecture call; only a
-    run whose architecture was called gets downloaded and mapped. A run that QC
-    rejected is *finished*, not missing.
+    Read from the per-sample JSONs. "To do" follows the pipeline's gates: every
+    run gets a QC verdict; only a kept verdict gets an architecture call; only a
+    run with an architecture call is downloaded and mapped. A run rejected by QC
+    counts as finished.
     """
     end = cfg["pipeline.end"]
     keep = set(cfg["pipeline.keep_verdicts"])
@@ -170,11 +160,8 @@ def state(cfg, accs: list[str]) -> dict:
 
 
 def write_status(root: str, st: dict, cfg_path: str) -> str:
-    """`logs/status.txt` -- the one file to look at after a round.
-
-    A cm4 compute node may not `sbatch`, so this job cannot launch the next round.
-    It writes down what is left and the exact command instead.
-    """
+    """Write `logs/status.txt`: the state of the cohort and, if anything is left,
+    the command for the next round."""
     todo, stuck = st["todo"], st["stuck"]
     retryable = [a for a in todo if a not in set(stuck)]
     complete = not retryable
@@ -249,8 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     merged = build_view(root, own)
     print(f"merged view: {merged}")
 
-    # the same Config, pointed at the merged view: the report writers then see one
-    # workdir holding every sample, and write the cohort tables they always would
+    # the same Config, pointed at the merged view, so the report writers see one
+    # workdir holding every sample
     mcfg = cfgmod.Config(data=copy.deepcopy(cfg.data), path=cfg.path)
     mcfg.data["project"]["workdir"] = merged
 

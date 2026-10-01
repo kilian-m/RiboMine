@@ -4,6 +4,9 @@ work/
 build/
 dist/
 
+# your own configs (site paths, mail address)
+*.local.json
+
 # data that must never be committed
 *.fastq
 *.fastq.gz

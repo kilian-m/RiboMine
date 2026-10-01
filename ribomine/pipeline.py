@@ -1,25 +1,17 @@
 """Stage orchestration: what runs, in what order, and what a resume skips.
 
-The pipeline has four stages and three entry points into them:
-
     query ──► qc ──► architecture ──► bam
       ▲        ▲
       │        └── start="accessions" (a list) or start="fastq" (a local directory)
       └── start="query"
 
-and it stops after the stage named by `pipeline.end` ("qc", "architecture" or
-"bam"). The two early end points are real deliverables, not debug hooks: each
-writes a TSV and a per-dataset figure.
-
-Why the stages split where they do: the QC stage already samples, filters, maps
-(locally) and profiles the reads, and the architecture stage reads *only* the
-profile JSON that produced. So calling the architecture costs milliseconds once
-QC has run, and the architecture thresholds can be re-tuned over a whole cohort
+A run stops after the stage named by `pipeline.end`. The QC stage samples,
+filters, aligns (locally) and profiles the reads; the architecture stage reads
+only the profile JSON, so it costs milliseconds and can be re-run over a cohort
 without touching a BAM.
 
 Per-sample work runs in a process pool. A sample that fails is recorded in
-failed.tsv and does not take the run down -- at 500 datasets, something always
-fails.
+failed.tsv and does not take the run down.
 """
 from __future__ import annotations
 
@@ -29,23 +21,18 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
-from . import reports
-from .arch import infer as arch_infer
-from .arch import plot as arch_plot
-from .arch import trim as arch_trim
+from . import architecture, reports
 from .config import Config, stages_to_run
 from .process import counts
 from .process import dedup as proc_dedup
 from .process import star
-from .qc import annotation, contaminants, pileups, plot as qc_plot, profile, verdict
+from .qc import annotation, contaminants, pileups, plot as qc_plot, verdict
 from .sra import download, query
 from .utils import (LOG, Sample, human, nonempty, read_json, read_lines, read_tsv,
                     rm, write_json, write_tsv)
 
 
-# ---------------------------------------------------------------------------
-# sample list: the three start points
-# ---------------------------------------------------------------------------
+# --- the sample list: the three start points -------------------------------
 def resolve_inputs(cfg: Config) -> tuple[list[str], dict[str, str]]:
     """(accessions, source_map). `source_map[acc]` is what the reads come from:
     an accession (streamed from ENA) or a local FASTQ path."""
@@ -53,18 +40,14 @@ def resolve_inputs(cfg: Config) -> tuple[list[str], dict[str, str]]:
 
     if start == "fastq":
         d = cfg._abs(cfg["pipeline.fastq_dir"])
-        exts = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
-        files = sorted(f for f in os.listdir(d) if f.endswith(exts))
-        if not files:
-            raise RuntimeError(f"no FASTQ files in {d}")
+        exts = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
         src = {}
-        for f in files:
-            label = f
-            for e in exts:            # strip the longest matching extension
-                if label.endswith(e):
-                    label = label[: -len(e)]
-                    break
-            src[label] = os.path.join(d, f)
+        for f in sorted(os.listdir(d)):
+            ext = next((e for e in exts if f.endswith(e)), None)
+            if ext:
+                src[f[: -len(ext)]] = os.path.join(d, f)
+        if not src:
+            raise RuntimeError(f"no FASTQ files in {d}")
         LOG.info("start=fastq: %d local FASTQ file(s) in %s", len(src), d)
         return list(src), src
 
@@ -79,32 +62,21 @@ def resolve_inputs(cfg: Config) -> tuple[list[str], dict[str, str]]:
         LOG.info("resume: reusing %s (delete it to re-query)", tsv)
     else:
         tsv = query.run_query(cfg)
-    rows = read_tsv(tsv)
-    accs = [r["run_accession"] for r in rows]
+    accs = [r["run_accession"] for r in read_tsv(tsv)]
     LOG.info("start=query: %d candidate run(s) from %s", len(accs), tsv)
     return accs, {a: a for a in accs}
 
 
 def _ensure_fasta_index(cfg: Config) -> None:
-    """Build the genome `.fai` up front.
-
-    `pysam.FastaFile` builds a missing `.fai` *in place*, silently. In a process
-    pool that means every worker starts building the same index for the same 3 GB
-    FASTA at the same time, and their interleaved writes leave a truncated one --
-    after which `fetch()` returns the wrong sequence and every architecture call
-    downstream is quietly fabricated. Build it once, here, where only one process
-    is running.
-    """
+    """Build the genome `.fai` before the pool starts. pysam builds a missing
+    index in place, so concurrent workers would corrupt it."""
     fasta = cfg.ref("genome_fasta")
-    fai = fasta + ".fai"
-    if nonempty(fai):
+    if nonempty(fasta + ".fai"):
         return
     import pysam
 
     LOG.info("indexing the genome FASTA (once): %s", fasta)
-    t0 = time.time()
     pysam.faidx(fasta)
-    LOG.info("  -> %s (%.0fs)", fai, time.time() - t0)
 
 
 def _run_meta(cfg: Config) -> dict[str, dict]:
@@ -115,9 +87,7 @@ def _run_meta(cfg: Config) -> dict[str, dict]:
     return {r["run_accession"]: r for r in read_tsv(tsv)}
 
 
-# ---------------------------------------------------------------------------
-# stage 2: read sample -> contaminant filter -> local map -> profile -> QC
-# ---------------------------------------------------------------------------
+# --- stage qc: sample -> contaminant filter -> local alignment -> profile -> verdict
 def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
     s = Sample(acc, cfg.workdir)
     resume = cfg["pipeline.resume"]
@@ -129,7 +99,7 @@ def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
 
     t0 = time.time()
 
-    # 1. a uniform read sample -- nothing is downloaded in full at this stage
+    # 1. a uniform read sample, streamed -- nothing is downloaded in full here
     if not (resume and nonempty(s.sample_fastq)):
         st = download.sample_reads(src, s.sample_fastq, n=cfg["qc.sample_reads"],
                                    scan=cfg["qc.scan_reads"], seed=cfg["project.seed"])
@@ -138,49 +108,38 @@ def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
         if st.get("sorted_warning"):
             LOG.warning("[%s] %s", acc, st["sorted_warning"])
 
-    # 2. contaminants: rRNA/tRNA/snRNA/Mt (bowtie2) + low-complexity. Reads stay
-    #    UNTRIMMED -- the architecture is read out of the soft clips, so the 5'
-    #    construct and the 3' adapter must still be on the read.
+    # 2. contaminants (rRNA/tRNA/snRNA/Mt, low complexity). The reads stay untrimmed:
+    #    the architecture is read out of the soft clips.
     if not (resume and nonempty(s.filtered_fastq) and nonempty(s.contam_json)):
         cst = contaminants.filter_fastq(s.sample_fastq, s.filtered_fastq, cfg,
                                         label=acc, threads=threads, log=s.log)
         write_json(s.contam_json, cst)
     cst = read_json(s.contam_json, {})
 
-    # 3. LOCAL alignment: everything non-genomic lands in the soft clips
+    # 3. local alignment: everything non-genomic lands in the soft clips
     if not (resume and nonempty(s.local_bam)):
         star.align_local(s.filtered_fastq, s.star_local, cfg, threads=threads, log=s.log)
 
-    # 4. position pile-ups (adapter dimers, fixed contaminants) -- data-driven
+    # 4. position pile-ups (adapter dimers, fixed contaminants)
     if not (resume and nonempty(s.pileup_bam) and nonempty(s.pileup_json)):
         pst = pileups.filter_bam(s.local_bam, s.pileup_bam, cfg, label=acc)
         write_json(s.pileup_json, pst)
     pst = read_json(s.pileup_json, {})
 
-    # 5. positional profile (feeds the architecture caller). The anchor gate is the
-    #    architecture's own, so the two cannot drift apart.
+    # 5. the positional profile the architecture is called from
     if not (resume and nonempty(s.profile_json)):
-        prof = profile.profile_bam(s.pileup_bam, cfg.ref("genome_fasta"), label=acc,
-                                   max_reads=cfg["qc.sample_reads"],
-                                   min_panel_frac=cfg["architecture.min_anchor_frac"])
-        write_json(s.profile_json, prof)
+        write_json(s.profile_json, architecture.profile_bam(s.pileup_bam, cfg, label=acc))
 
     # 6. the verdict
-    total = _total_reads(acc, meta)
     q = verdict.qc(s.pileup_bam, cfg.annotation_index, cfg, star_log=s.local_log,
-                   label=acc, contam=cst, pileup=pst, total_reads=total)
+                   label=acc, contam=cst, pileup=pst, total_reads=_total_reads(acc, meta))
     write_json(s.qc_json, q)
-
     if cfg["plots.enabled"]:
         qc_plot.plot_qc(q, s.qc_plot(cfg["plots.format"]), dpi=cfg["plots.dpi"])
 
-    # 7. the working data behind the verdict and the architecture call. Every number
-    #    they produced is already in qc.json / profile.json (and the architecture
-    #    stage reads ONLY the profile), so by default the reads and their alignments
-    #    go -- at several hundred runs they are the bulk of the workdir. Kept, they
-    #    are sorted and indexed: the BAM a call was computed on is the one to open in
-    #    a browser when the call looks wrong. STAR writes them unsorted, and the steps
-    #    above read them in file order, so that has to happen here, at the end.
+    # 7. the working data. Every number is already in the JSONs, so the sample and
+    #    its alignments go unless `keep` says otherwise; kept BAMs are sorted and
+    #    indexed (only now -- the steps above read them in file order).
     if cfg["keep.qc_bam"]:
         for b in (s.local_bam, s.pileup_bam):
             if nonempty(b):
@@ -198,9 +157,8 @@ def qc_sample(acc: str, cfg: Config, src: str, meta: dict) -> dict:
 
 def _total_reads(acc: str, meta: dict) -> int | None:
     """Reads in the whole run -- used to project how much usable data it holds."""
-    row = meta.get(acc) or {}
     try:
-        return int(row["read_count"])
+        return int((meta.get(acc) or {})["read_count"])
     except (KeyError, TypeError, ValueError):
         pass
     from .sra import metadata
@@ -210,39 +168,26 @@ def _total_reads(acc: str, meta: dict) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# stage 3: the architecture call (reads only the profile JSON)
-# ---------------------------------------------------------------------------
+# --- stage architecture: the call, from the profile JSON alone --------------
 def arch_sample(acc: str, cfg: Config) -> dict:
     s = Sample(acc, cfg.workdir)
     prof = read_json(s.profile_json)
     if prof is None:
         raise RuntimeError(f"{acc}: no profile ({s.profile_json}); run the qc stage first")
 
-    call = arch_infer.infer(prof, arch_infer.Thresholds.from_config(cfg))
+    call = architecture.call(prof, cfg)
     write_json(s.arch_json, call)
     if cfg["plots.enabled"]:
-        arch_plot.plot_arch(prof, call, s.arch_plot(cfg["plots.format"]), dpi=cfg["plots.dpi"])
-
-    if call["status"] == "ok":
-        LOG.info("[%s] %s", acc, arch_infer.architecture_string(call))
-    else:
-        LOG.info("[%s] architecture %s: %s", acc, call["status"], call.get("reason", "")[:80])
+        architecture.plot_call(prof, call, s.arch_plot(cfg["plots.format"]),
+                               dpi=cfg["plots.dpi"])
+    LOG.info("[%s] %s", acc, call["structure"][:120])
     return call
 
 
-# ---------------------------------------------------------------------------
-# stage 4: full download -> trim -> filter -> map (-> dedup)
-# ---------------------------------------------------------------------------
+# --- stage bam: download -> trim -> filter -> map (-> dedup) ----------------
 def is_processed(cfg: Config, s: Sample) -> bool:
-    """Has stage 4 already finished for this sample? (What `resume` skips.)
-
-    What "finished" looks like on disk depends on what the config KEEPS. With
-    `keep.bam` off the deliverable is deleted on purpose, so its absence is not
-    evidence that the sample needs re-processing -- the process JSON is. Testing for
-    the BAM would silently re-download and re-map an entire cohort on every resume of
-    a counts-only run.
-    """
+    """Has the bam stage finished for this sample? With `keep.bam` off the BAM is
+    deleted on purpose, so the process JSON is the evidence, not the BAM."""
     return nonempty(s.process_json) and (nonempty(s.bam) or not cfg["keep.bam"])
 
 
@@ -263,12 +208,10 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
             f"{acc}: architecture is '{call['status']}' ({call.get('reason', '')[:60]}); "
             f"set architecture.process_undetermined=true to trim it with a best-effort plan")
 
-    # The process record keeps each step's own stats verbatim, in its own block, so
-    # the record stays a faithful account of what ran rather than a lossy summary --
-    # and `reports.process_tsv` reads those blocks by name.
+    # each step's own stats, verbatim, in its own block (`reports.process_tsv` reads them)
     info: dict = {"run_accession": acc}
 
-    # 1. the full dataset. A local FASTQ start point skips the download entirely.
+    # 1. the full dataset; a local FASTQ needs no download
     if os.path.exists(src):
         full = src
         info["download"] = {"route": "local", "bytes": os.path.getsize(src)}
@@ -279,17 +222,15 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         LOG.info("[%s] downloaded %s via %s at %.1f MB/s", acc,
                  human(dl.get("bytes")), dl["route"], dl.get("mb_per_s") or 0)
 
-    # 2. trim with the inferred architecture: 5' construct off (RT base kept),
-    #    3' construct + adapter off, UMI content into the read name.
+    # 2. trim to the footprint (the RT base stays); UMIs go to the read name
     if not (resume and nonempty(s.trimmed_fastq) and nonempty(s.trim_json)):
-        tst = arch_trim.trim_fastq(full, call, s.trimmed_fastq,
-                                   min_len=cfg["process.min_len"], label=acc,
-                                   discard_untrimmed=cfg["process.discard_untrimmed"],
-                                   min_overlap=cfg["process.adapter_min_overlap"])
+        tst = architecture.trim_fastq(call, full, s.trimmed_fastq, cfg)
         write_json(s.trim_json, tst)
+        LOG.info("[%s] trimmed: %s of %s reads kept", acc,
+                 human(tst["n_reads_out"]), human(tst["n_reads_in"]))
     info["trim"] = read_json(s.trim_json, {})
 
-    # 3. contaminants again -- on the whole run this time, not on the 200k sample
+    # 3. contaminants again, on the whole run
     to_map = s.trimmed_fastq
     contam_full = os.path.join(s.dir, f"{acc}.contam_full.json")
     if cfg["process.filter_contaminants"]:
@@ -300,22 +241,15 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         info["contaminants"] = read_json(contam_full, {})
         to_map = s.clean_fastq
 
-    # 4. map end-to-end -- the deliverable alignment. STAR counts the reads into genes
-    #    as it aligns them (--quantMode GeneCounts), so the count matrix costs nothing
-    #    extra; `reports.counts_tsv` joins the per-run tables at the end of the batch.
+    # 4. the deliverable alignment; STAR counts reads into genes as it aligns
     bam = star.align_final(to_map, s.star_final, cfg, threads=threads, log=s.log)
     info["mapping"] = star.parse_log(os.path.join(s.star_final, "Log.final.out"))
 
     gene_counts = counts.path(s.star_final)
     if nonempty(gene_counts):
         info["counts"] = counts.read_counts(gene_counts, label=acc)[1]
-        LOG.info("[%s] gene counts: %s reads in %s genes (%.0f%% of counted reads)", acc,
-                 human(info["counts"]["n_in_genes"]),
-                 human(info["counts"]["n_genes_detected"]),
-                 100 * (info["counts"].get("frac_in_genes") or 0))
 
-    # 5. pile-up removal (adapter dimers / fixed contaminants that survived the
-    #    sequence filter). Cheapest on the unsorted BAM STAR just wrote.
+    # 5. pile-up removal, on the unsorted BAM STAR just wrote
     if cfg["process.filter_pileups"]:
         pb = os.path.join(s.star_final, "aligned.pileup.bam")
         pst = pileups.filter_bam(bam, pb, cfg, label=acc)
@@ -324,40 +258,28 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
         rm(bam)
         bam = pb
 
-    # 6. sort + index -- the BAM users get
+    # 6. sort + index
     star.sort_index(bam, s.bam, threads=min(threads, 8))
     rm(bam)
 
-    # 7. optional UMI deduplication. OFF by default, and deliberately so: it is only
-    #    correct when the library actually carries a UMI, and on a library that does
-    #    not it silently collapses genuine duplicate footprints -- which in ribo-seq
-    #    are real signal (a highly translated codon IS covered many times).
+    # 7. optional UMI deduplication (off by default: without a UMI it would
+    #    collapse genuine footprints that share a start position)
     info["umi_dedup"] = bool(cfg["process.umi_dedup"])
     if cfg["process.umi_dedup"]:
         tmp = s.bam + ".dedup.bam"
         info["dedup"] = proc_dedup.dedup(s.bam, tmp, cfg, log=s.log)
         os.replace(tmp, s.bam)
         rm(s.bam + ".bai", tmp + ".bai")
-        # Both backends hand back the coordinate order they were given, so this is an
-        # index and not a re-sort -- but it is `ensure_sorted_indexed` rather than
-        # `index` so that the "every BAM RiboMine leaves behind is sorted and indexed"
-        # invariant holds because it is CHECKED, not because a third-party tool is
-        # assumed to have been well behaved.
         star.ensure_sorted_indexed(s.bam, threads=min(threads, 8))
         LOG.info("[%s] UMI dedup: %s -> %s reads (%.0f%% duplicates)", acc,
                  human(info["dedup"]["n_in"]), human(info["dedup"]["n_out"]),
                  100 * (1 - info["dedup"]["frac_kept"]))
         if "counts" in info:
-            # STAR counted during the alignment, which is before this step ran. Say so
-            # once, per sample, rather than let someone discover it in a volcano plot.
             LOG.warning("[%s] the gene counts are NOT deduplicated: STAR counts while it "
-                        "aligns, and UMI dedup happens after. The BAM is deduplicated; "
-                        "the count matrix is of the reads that went into it.", acc)
+                        "aligns, and UMI dedup happens after.", acc)
 
-    # 8. periodicity of the reads we are actually handing over. The QC verdict was
-    #    decided on a 200k-read sample of the UNTRIMMED reads, locally aligned; this
-    #    is the finished article -- trimmed, filtered, deduplicated, end-to-end. A
-    #    trim that cut the footprint boundary wrong shows up here and nowhere else.
+    # 8. periodicity of the finished BAM. The QC verdict was measured on a sample of
+    #    the untrimmed reads; a mis-trimmed footprint boundary shows up only here.
     info["periodicity"] = verdict.periodicity(
         s.bam, cfg.annotation_index, max_reads=cfg["qc.max_reads_scored"], label=acc)
 
@@ -367,9 +289,7 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
                     for k in ("bam", "fastq", "trimmed_fastq", "clean_fastq")}
     write_json(s.process_json, info)
 
-    # 9. housekeeping. A ribo-seq run is 1-10 GB and a mining run holds hundreds of
-    #    them, so nothing is kept unless `keep` says so. This is the LAST thing the
-    #    stage does: every number above was measured before its input was deleted.
+    # 9. housekeeping, last: everything above was measured before its input goes
     if not cfg["keep.fastq"] and not os.path.exists(src):
         rm(s.full_fastq)                       # never the user's own input FASTQ
     if not cfg["keep.trimmed_fastq"]:
@@ -377,18 +297,14 @@ def process_sample(acc: str, cfg: Config, src: str) -> dict:
     if not cfg["keep.clean_fastq"]:
         rm(s.clean_fastq)
     if not cfg["keep.bam"]:
-        # the counts and the periodicity are already measured and written; the gene
-        # count table STAR wrote stays, so the matrix can still be built
-        rm(s.bam, s.bam + ".bai")
+        rm(s.bam, s.bam + ".bai")              # STAR's gene count table stays
 
     LOG.info("[%s] BAM %s (%.0f%% uniquely mapped)", acc, human(info["bam_bytes"]),
              100 * (info.get("mapping", {}).get("frac_unique") or 0))
     return info
 
 
-# ---------------------------------------------------------------------------
-# the driver
-# ---------------------------------------------------------------------------
+# --- the driver -------------------------------------------------------------
 def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
     """Run `fn(acc, ...)` over `items` in a process pool. One sample's failure is
     recorded and the rest carry on."""
@@ -412,21 +328,11 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                 failed.append({"run_accession": acc, "stage": stage, "error": str(exc),
                                "traceback": traceback.format_exc(limit=3)})
     else:
-        # A worker that RAISES is recorded and the pool carries on -- but a worker that is
-        # *killed* (the OOM killer under the startup memory wave; a segfault in STAR on one
-        # dataset's reads) is different: it breaks the whole ProcessPoolExecutor, and every
-        # future still pending then fails at once with BrokenProcessPool. Unhandled, that
-        # discards the entire rest of the shard -- one dead worker throwing away ~1000
-        # samples. Two distinct causes need two distinct answers, and both are here:
-        #
-        #   * the memory wave (many samples at once spike memory at startup): narrow the
-        #     pool -- halve the width and retry the un-run items. A smaller wave fits.
-        #   * a poison-pill dataset (its reads reproducibly kill STAR/the worker): narrowing
-        #     never helps, because the one dataset kills a pool of any width. So once we are
-        #     down to a single worker and it STILL dies, the dataset it died on is the head
-        #     of the queue (at width 1 the pool runs in submission order and nothing new
-        #     completed). Charge the failure to exactly that one, drop it, and go back to
-        #     full width for the rest. NEVER dump the untried remainder.
+        # A worker that is KILLED (OOM, a segfault in STAR) breaks the whole pool and
+        # every pending future fails with BrokenProcessPool. Retry what did not run:
+        #   * at half the width -- a memory wave fits in a narrower pool;
+        #   * and if a single worker still dies, the head of the queue is the dataset
+        #     that kills it: fail that one alone and return to full width.
         remaining = list(items)
         workers = jobs
         while remaining:
@@ -441,9 +347,7 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                         ok.append(acc)
                         done.add(acc)
                     except BrokenProcessPool:
-                        # This future never ran (or was the one killed); leave it out of
-                        # `done` so it is retried below. Do not record it as a failure.
-                        broke = True
+                        broke = True          # never ran, or was the one killed: retry
                     except Exception as exc:  # noqa: BLE001
                         LOG.error("[%s] %s failed: %s", acc, stage, exc)
                         failed.append({"run_accession": acc, "stage": stage, "error": str(exc)})
@@ -456,10 +360,6 @@ def _pool(cfg: Config, fn, items, stage: str) -> tuple[list[str], list[dict]]:
                 LOG.error("stage %s: a worker was killed (pool broken); retrying %d "
                           "remaining dataset(s) at %d job(s)", stage, len(remaining), workers)
                 continue
-            # Width 1 and still broke: `remaining[0]` is the dataset that killed the worker
-            # (at width 1 the pool runs in submission order, and nothing new landed in
-            # `done` this round). Fail that one alone and carry on with the rest at full
-            # width -- so a single poison pill costs one dataset, not the whole shard.
             poison = remaining[0]
             LOG.error("stage %s: [%s] repeatedly killed its worker process (pool broken); "
                       "recording it failed and continuing with %d other dataset(s)",
@@ -490,30 +390,27 @@ def run(cfg: Config) -> dict:
     all_failed: list[dict] = []
     summary: dict = {"n_input": len(accs), "workdir": cfg.workdir}
 
-    # ---- everything the workers SHARE gets built here, in the parent, before the
-    # pool forks. Anything built lazily inside a worker is built by all of them at
-    # once, and two processes writing the same file is corruption, not a slowdown.
-    annotation.ensure_index(cfg)     # the 22 MB GTF pickle
-    contaminants.ensure_index(cfg)   # the bowtie2 contaminant index (bundled FASTA by default)
-    _ensure_fasta_index(cfg)         # the genome .fai -- pysam builds it silently otherwise
+    # Everything the workers share is built here, before the pool forks: two
+    # processes building the same file at once corrupt it.
+    annotation.ensure_index(cfg)
+    contaminants.ensure_index(cfg)
+    _ensure_fasta_index(cfg)
     meta = _run_meta(cfg)
 
-    # STAR's ~28 GB genome index goes into shared memory once for the whole batch
-    # rather than once per worker. At jobs=8 the difference is 28 GB against 224 GB;
-    # this is what makes a several-hundred-dataset run possible at all.
+    # one copy of the STAR index in shared memory for the whole batch
     star.load_genome(cfg)
     LOG.info("STAR genome load: %s", star.genome_load())
     try:
         ok, failed = _pool(cfg, qc_sample, [(a, cfg, src[a], meta) for a in accs], "qc")
         all_failed += failed
         reports.qc_tsv(cfg, accs)
-        summary["qc"] = _verdict_counts(cfg, ok)
+        summary["qc"] = _tally(cfg, ok, "qc_json", "verdict")
         LOG.info("QC verdicts: %s", ", ".join(f"{k} {v}" for k, v in summary["qc"].items()))
 
         if cfg["pipeline.end"] == "qc":
             return _finish(cfg, accs, summary, all_failed)
 
-        # ---- stage 3: architecture, on the runs QC kept
+        # architecture, on the runs QC kept
         keep = set(cfg["pipeline.keep_verdicts"])
         passed = [a for a in ok if (read_json(Sample(a, cfg.workdir).qc_json, {})
                                     .get("verdict") in keep)]
@@ -523,12 +420,12 @@ def run(cfg: Config) -> dict:
         ok_a, failed = _pool(cfg, arch_sample, [(a, cfg) for a in passed], "architecture")
         all_failed += failed
         reports.arch_tsv(cfg, passed)
-        summary["architecture"] = _arch_counts(cfg, ok_a)
+        summary["architecture"] = _tally(cfg, ok_a, "arch_json", "status")
 
         if cfg["pipeline.end"] == "architecture":
             return _finish(cfg, accs, summary, all_failed)
 
-        # ---- stage 4: the full datasets
+        # the full datasets
         if not cfg["architecture.process_undetermined"]:
             ok_a = [a for a in ok_a
                     if read_json(Sample(a, cfg.workdir).arch_json, {}).get("status") == "ok"]
@@ -553,17 +450,10 @@ def _finish(cfg: Config, accs: list[str], summary: dict, failed: list[dict]) -> 
     return summary
 
 
-def _verdict_counts(cfg: Config, accs: list[str]) -> dict:
+def _tally(cfg: Config, accs: list[str], json_attr: str, key: str) -> dict:
+    """How many samples carry each value of `key` in one of their stage JSONs."""
     out: dict[str, int] = {}
     for a in accs:
-        v = read_json(Sample(a, cfg.workdir).qc_json, {}).get("verdict", "?")
+        v = read_json(getattr(Sample(a, cfg.workdir), json_attr), {}).get(key, "?")
         out[v] = out.get(v, 0) + 1
-    return out
-
-
-def _arch_counts(cfg: Config, accs: list[str]) -> dict:
-    out: dict[str, int] = {}
-    for a in accs:
-        st = read_json(Sample(a, cfg.workdir).arch_json, {}).get("status", "?")
-        out[st] = out.get(st, 0) + 1
     return out

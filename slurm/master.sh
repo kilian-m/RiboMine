@@ -1,36 +1,24 @@
 #!/bin/bash
-# RiboMine on LRZ CoolMUC-4 -- the submitter. Run it on a LOGIN node.
+# Submit the RiboMine job chain on LRZ CoolMUC-4. Run on a login node.
 #
 #   slurm/master.sh config/config_lrz.json            # prep -> run -> merge
-#   slurm/master.sh config/config_lrz.json run        # another round (the usual case)
-#   slurm/master.sh config/config_lrz.json prep       # just the query + the split
-#   slurm/master.sh config/config_lrz.json merge      # just re-merge + re-report
+#   slurm/master.sh config/config_lrz.json run        # another round: run -> merge
+#   slurm/master.sh config/config_lrz.json prep       # query + split only
+#   slurm/master.sh config/config_lrz.json merge      # re-merge and re-report only
 #   DRY_RUN=1 slurm/master.sh config/config_lrz.json  # print the sbatch lines, submit nothing
 #
-# The chain, and why it is shaped like this:
+#   prep   cm4_tiny, 1 node. Builds the shared indexes and splits the cohort into
+#          one accession list and one workdir per node.
+#   run    cm4_std, array of _slurm.jobs jobs x _slurm.nodes_per_job nodes. cm4_std
+#          allows at most 4 nodes per job and 2 running jobs, so 8 nodes (896
+#          cores) are an array of two 4-node jobs. Each node runs one
+#          `ribomine run` over its own shard.
+#   merge  cm4_tiny, afterany run. Links the per-node workdirs into one, writes
+#          the cohort tables and logs/status.txt.
 #
-#   prep   cm4_tiny, 1 node   query ENA/NCBI -> candidates.tsv; build the GTF and
-#                             contaminant indexes; split the cohort into one
-#                             accession list + one workdir per node.
-#                             Everything that must happen exactly once.
-#
-#   run    cm4_std, ARRAY OF 2 x 4 NODES = 896 cores
-#                             cm4_std takes at most 4 nodes (448 cores) in ONE job,
-#                             but will run 2 jobs at once -- so 896 cores is an array
-#                             of two 4-node jobs, not one 8-node job. Each of the 8
-#                             nodes runs one `ribomine run` over its own shard.
-#
-#   merge  cm4_tiny, afterany run
-#                             Symlinks the 8 workdirs into one, writes the cohort
-#                             tables, and says in logs/status.txt whether anything
-#                             is left. `afterany`, so it runs however the array ended
-#                             -- clean, out of wall time, or with a node dead.
-#
-# The run has a 24 h ceiling and a cohort of hundreds of runs does not fit in it.
-# So expect to resubmit: `slurm/master.sh <config> run`, once per round, until
-# status.txt says COMPLETE. Each round skips what is already finished. It is manual
-# because a cm4 compute node is not permitted to sbatch, so no job in the chain can
-# launch the next one.
+# The run job is limited to 24 h, so a large cohort needs several rounds: resubmit
+# with `run` until status.txt says COMPLETE. Finished samples are skipped. The
+# resubmission is manual because compute nodes cannot call sbatch.
 
 set -euo pipefail
 
@@ -53,9 +41,9 @@ esac
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_ABS="$(readlink -f "${CONFIG_FILE}")"
 
-# The config is read with python, not jq: jq is not on every LRZ login node, and
-# python3 is. (RiboMine ignores every `_`-prefixed key, which is why the cluster
-# shape can live in the same file as the pipeline settings.)
+# Read a dotted key from the config; $2 is the default. python3 is used because
+# jq is not on every login node. RiboMine ignores keys starting with `_`, so the
+# `_slurm` block can live in the same file as the pipeline settings.
 cfg() {
     python3 - "${CONFIG_ABS}" "$1" "${2-}" <<'PY'
 import json, sys
@@ -102,10 +90,8 @@ if (( S_JOBS > 2 )); then
     echo "note: cm4_std runs only 2 jobs at a time -- array tasks beyond the 2nd" >&2
     echo "      will queue rather than add cores." >&2
 fi
-# A cm4 node has ${S_CPUS} physical cores and twice that many hardware threads, and
-# running up to 2x the physical cores' worth of samples is deliberate: a sample
-# blocked on an ENA download is not using a core. Past 2x there are not even
-# hardware threads left to hold them, and the node only thrashes.
+# Up to 2x the physical cores is intended: a sample waiting on a download uses no
+# core. Beyond that the node has no hardware threads left.
 if (( RM_JOBS * RM_THREADS > 2 * S_CPUS )); then
     echo "WARNING: project.jobs x project.threads = $(( RM_JOBS * RM_THREADS )) is more than" >&2
     echo "         2 x ${S_CPUS} = $(( 2 * S_CPUS )) hardware threads on a node. It will thrash." >&2
@@ -136,8 +122,7 @@ submit() {
         return 0
     fi
     echo "[submit] ${label}" >&2
-    # LRZ is a multi-cluster SLURM: `--parsable` returns "<jobid>;<cluster>", and
-    # --dependency does not parse the suffix.
+    # On LRZ `--parsable` prints "<jobid>;<cluster>"; --dependency needs the bare id.
     sbatch --parsable "$@" | cut -d';' -f1
 }
 
@@ -149,24 +134,10 @@ RUN_JID=""
 MERGE_JID=""
 
 # ---------------------------------------------------------------- prep ----- #
-# The SRA query runs HERE, on the login node -- not in the prep job.
-#
-# It cannot run on a cm4 compute node. The ENA portal search is a heavy one (11
-# tokens x 4 fields of wildcard text over the whole read_run index) and ENA takes
-# minutes to answer it, during which the TCP connection sits idle -- and something
-# on the compute nodes' outbound path (a stateful NAT, most likely) drops it. The
-# first attempt died on the 180 s read timeout; every retry after that could not
-# open a connection at all (Errno 110). A longer timeout does not fix this, because
-# nothing is timing out at the application layer: the connection is being killed.
-#
-# Note what DOES work from a compute node, because it says what the limit is: the
-# short ENA calls (`filereport`, 60 s) and the multi-GB bulk downloads, all day.
-# It is not reachability. It is holding one connection open and idle for minutes.
-#
-# A login node has no such problem, and master.sh is already on one. So the query
-# happens here, once, before anything is submitted -- and prep then finds
-# meta/candidates.tsv already written and reuses it. (price2-expansive's master.sh
-# populates its stage-1 pool synchronously in the same way, for the same reason.)
+# The archive query runs here on the login node, before anything is submitted.
+# ENA takes minutes to answer the portal search, and the compute nodes' outbound
+# path drops the idle connection (short ENA calls and bulk downloads work there).
+# prep reuses the resulting meta/candidates.tsv.
 query_on_login_node() {
     local tsv="${WORK_DIR}/meta/candidates.tsv"
     if [[ -s "${tsv}" ]]; then
@@ -214,9 +185,8 @@ fi
 # ---------------------------------------------------------------- run ------ #
 if [[ "${STEP}" == "all" || "${STEP}" == "run" ]]; then
     dep=()
-    # afterok, not afterany: without the shard lists and the shared indexes that
-    # prep writes, every node would fail at once -- and eight nodes each building
-    # the same bowtie2 index into the same path is corruption, not a slow start.
+    # afterok: without prep's shard lists and shared indexes every node would fail,
+    # or all nodes would build the same index into the same path at once.
     [[ -n "${PREP_JID}" ]] && dep=(--dependency="afterok:${PREP_JID}")
 
     RUN_JID=$(submit "run" \
@@ -238,9 +208,8 @@ fi
 # ---------------------------------------------------------------- merge ---- #
 if [[ "${STEP}" == "all" || "${STEP}" == "run" || "${STEP}" == "merge" ]]; then
     dep=()
-    # afterany: the array is EXPECTED to hit the 24 h wall and be killed. Merge
-    # works out what finished from the per-sample JSONs, not from exit codes, so
-    # a killed node and a clean one are the same to it.
+    # afterany: the array is expected to hit the wall-time limit. merge decides what
+    # finished from the per-sample JSONs, not from exit codes.
     [[ -n "${RUN_JID}" ]] && dep=(--dependency="afterany:${RUN_JID}")
 
     MERGE_JID=$(submit "merge" \

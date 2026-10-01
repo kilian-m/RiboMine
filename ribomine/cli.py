@@ -1,14 +1,13 @@
 """Command line interface.
 
-    ribomine init-config config.json        # write a fully-commented default config
+    ribomine init-config config.json        # write a commented default config
     ribomine run -c config.json             # the pipeline, start/end from the config
     ribomine run -c config.json --to qc     # ... stopping after the QC verdict
     ribomine run -c config.json --from accessions --accessions runs.txt
-    ribomine query -c config.json           # just the SRA search -> candidates.tsv
+    ribomine query -c config.json           # only the SRA search -> candidates.tsv
     ribomine setup -c config.json           # build the annotation + contaminant indexes
 
-Everything the CLI can set also lives in the config; the flags exist so a config
-does not have to be edited to move an end point. A flag always wins over the file.
+Flags override the corresponding keys of the config file.
 """
 from __future__ import annotations
 
@@ -18,12 +17,12 @@ import sys
 
 from . import __version__, config as cfgmod
 from .config import END_POINTS, START_POINTS, ConfigError
-from .utils import LOG, setup_logging
+from .utils import setup_logging
 
 
 def _overrides(a: argparse.Namespace) -> dict:
-    """CLI flags -> a config overlay. Only flags the user actually passed appear,
-    so an unset flag never overwrites the config file."""
+    """CLI flags -> a config overlay. Only flags that were passed appear, so an
+    unset flag never overwrites the config file."""
     o: dict = {"project": {}, "pipeline": {}, "process": {}, "plots": {}, "query": {}}
     if a.workdir:
         o["project"]["workdir"] = a.workdir

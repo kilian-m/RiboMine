@@ -1,20 +1,12 @@
-"""The ribo-seq QC figure: six panels that answer "is this ribo-seq, and how good?".
+"""The six-panel ribo-seq QC figure, drawn from the dict `ribomine.qc.verdict.qc()`
+returns (or the same read back from `Sample.qc_json`). Nothing is recomputed.
 
-The figure is a visual audit of the verdict, not a separate summary -- every
-signal `ribomine.qc.verdict` decides on is drawn, with the threshold it was
-compared against on top of it:
-
-  A  read-length distribution      -- footprints peak tightly at ~28-32 nt
-  B  start-codon metagene          -- 5'-end density around start codons; a clean
-                                      3-nt-periodic comb with a P-site offset ~12
-                                      is the hallmark of translating ribosomes
+  A  read-length distribution, with the footprint window
+  B  start-codon metagene (5' ends; a 3-nt comb with a P-site offset of ~12)
   C  stop-codon metagene
-  D  periodicity by read length    -- in-frame fraction per length (chance = 1/3)
-  E  region composition            -- CDS / UTR / ncRNA / intron / intergenic / mito
-  F  verdict + mapping stats + the projected usable-read count
-
-The QC dict is the one `ribomine.qc.verdict.qc()` returns (or the same thing read
-back from `Sample.qc_json`); the plotter never recomputes a signal.
+  D  in-frame fraction per read length (chance = 1/3)
+  E  region composition, with the CDS floor
+  F  verdict, reasons, contaminant and mapping stats, projected usable reads
 """
 from __future__ import annotations
 
@@ -23,7 +15,7 @@ import os
 
 import matplotlib
 
-matplotlib.use("Agg")           # process-pool safe: no display, no GUI thread
+matplotlib.use("Agg")           # no display needed; safe in a process pool
 
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np               # noqa: E402
@@ -39,17 +31,14 @@ REGION_COLORS = {
     "intron": "#e0a81e", "intergenic": "#b8b8b8", "mito": "#c8443b",
 }
 
-# Thresholds the figure DRAWS. They mirror the `qc` section of the config
-# defaults; the verdict was made with the config's values, so if the QC dict
-# carries the thresholds it was scored against (a `thresholds` block, or the
-# keys inline) those win and these are only the fallback. The plotter takes no
-# config of its own -- a figure must show the numbers the call was made with,
-# not the numbers the plotting process happens to be configured with.
+# Fallback thresholds, equal to the `qc` config defaults. The figure draws the
+# thresholds recorded in the QC dict (its `thresholds` block) when present, so it
+# shows the values the verdict was made with.
 FP_LEN_LO, FP_LEN_HI = 25, 36     # qc.footprint_len_lo / qc.footprint_len_hi
 PERIODIC_MIN = 0.42               # qc.periodic_min      (chance = 1/3)
 PERIODIC_STRONG = 0.50            # qc.periodic_strong
-READ_LEN_MIN_FRAC = 0.75          # qc.read_len_min_frac -- specificity floor (read length)
-CDS_REGION_MIN = 0.50             # qc.cds_region_min    -- specificity floor (region composition)
+READ_LEN_MIN_FRAC = 0.75          # qc.read_len_min_frac (hard gate, read length)
+CDS_REGION_MIN = 0.50             # qc.cds_region_min    (hard gate, region composition)
 
 # metagene window drawn around the codon (nt, 5'-end based)
 META_LO, META_HI = -30, 45
@@ -82,16 +71,16 @@ def plot_qc(qc: dict, out_path: str, *, dpi: int = 110) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
         fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     finally:
-        # hundreds of samples run through a process pool -- a leaked figure is a
-        # leaked megabyte
+        # always close: figures otherwise accumulate across samples
         plt.close(fig)
     LOG.debug("wrote %s", out_path)
     return out_path
 
 
-# --- thresholds / histogram plumbing ---------------------------------------
+# --- helpers ----------------------------------------------------------------
 def _thr(qc: dict, name: str, default: float) -> float:
-    """The threshold the verdict was actually made with, if it recorded it."""
+    """The threshold recorded in the QC dict (`thresholds` block or top level),
+    else `default`."""
     block = qc.get("thresholds")
     if isinstance(block, dict) and isinstance(block.get(name), (int, float)):
         return float(block[name])
@@ -101,8 +90,7 @@ def _thr(qc: dict, name: str, default: float) -> float:
 
 
 def _int_keys(h: dict | None) -> dict[int, float]:
-    """Histogram/metagene keys are ints in memory and strings after a JSON
-    round-trip; the figure is drawn from either."""
+    """Histogram with int keys (they are strings after a JSON round-trip)."""
     return {int(k): v for k, v in (h or {}).items()}
 
 
@@ -132,12 +120,12 @@ def _plot_len(ax, qc: dict) -> None:
     fr = [y / tot for y in ys]
     ax.bar(xs, fr, width=0.85, color=[C_IN if flo <= x <= fhi else C_OUT for x in xs],
            edgecolor="white", linewidth=0.3)
-    # the footprint window, shaded at the cell edges of the first/last length in it
+    # shade the footprint window
     ax.axvspan(flo - 0.5, fhi + 0.5, color=C_IN, alpha=0.06)
     ax.set_xlabel("read length (nt)")
     ax.set_ylabel("fraction of reads")
     ax.set_title(title, loc="left", fontsize=10, fontweight="bold")
-    # specificity floor: the fraction inside the window must clear this, or LOW QUALITY
+    # hard gate: the fraction of reads inside the window must reach this
     rl_floor = _thr(qc, "read_len_min_frac", READ_LEN_MIN_FRAC)
     peak = qc.get("read_len_peak_frac", 0) or 0
     ax.text(0.98, 0.95,
@@ -157,8 +145,7 @@ def _plot_metagene(ax, meta: dict | None, title: str, lo: int = META_LO,
         return
     xs, ys = _densify(m, lo, hi)
     peak = xs[int(np.argmax(ys))]                       # dominant offset (~-12)
-    # colour the comb in the peak's own frame: a translating ribosome puts its
-    # 5' ends on every third base counted from the P-site offset, not from 0
+    # highlight every third base counted from the peak (the P-site offset), not from 0
     cols = [C_HL if (x - peak) % 3 == 0 else C_OUT for x in xs]
     ax.bar(xs, ys, width=0.85, color=cols, edgecolor="white", linewidth=0.2)
     ax.axvline(0, color=C_BAD, lw=1.2, ls="--")
@@ -202,9 +189,7 @@ def _plot_regions(ax, qc: dict) -> None:
         ax.text(v + 0.01, yi, f"{v:.0%}", va="center", fontsize=8)
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
-    # specificity floor: CDS must be at least this share of ALL reads, or LOW QUALITY.
-    # Drawn only across the CDS bar -- it is the CDS share the floor is about, not the
-    # others'.
+    # hard gate: CDS must be at least this share of all reads; drawn on the CDS bar only
     cds_floor = _thr(qc, "cds_region_min", CDS_REGION_MIN)
     xhi = max((max(vals) if vals else 0.0), cds_floor) * 1.18
     if "CDS" in labels:
@@ -249,16 +234,12 @@ def _plot_verdict(ax, qc: dict) -> None:
     if qc.get("verdict_reason"):
         lines += _wrap("reason: " + qc["verdict_reason"])
         lines.append("")
-    # Wrap the bullets too. A reason is not always one short clause: the
-    # MITOCHONDRIAL-DOMINATED one runs to 211 characters where the rest sit under 52,
-    # and an unwrapped line does not overflow its panel -- it widens the whole FIGURE
-    # (savefig crops to the artists' bounding box), which squeezes the six panels into
-    # the left third and collides their titles. One long sentence, and the entire plot
-    # is unreadable, so this is a layout invariant and not a nicety.
+    # Wrap the reasons too: an unwrapped long line widens the whole figure, because
+    # savefig crops to the bounding box of all artists.
     for r in qc.get("reasons", []):
         wrapped = _wrap(r, width=56)
         lines.append(f"• {wrapped[0]}")
-        lines += [f"  {w}" for w in wrapped[1:]]      # continuation lines, hanging indent
+        lines += [f"  {w}" for w in wrapped[1:]]      # hanging indent
 
     cm = qc.get("contaminants") or {}
     if cm.get("n_sampled"):

@@ -1,16 +1,12 @@
 #!/bin/bash
-# merge -- the cohort tables, and the answer to "is it done?".
+# merge: write the cohort tables and logs/status.txt.
 #
-# Runs `--dependency=afterany` on the run array, so it runs however that array
-# ended: cleanly, out of wall time, or with a node dead. It works out what
-# finished from the per-sample JSONs the nodes wrote, never from exit codes,
-# so it does not have to tell those three cases apart.
+# Submitted with --dependency=afterany on the run array, so it runs however the
+# array ended. What finished is read from the per-sample JSONs, not from exit
+# codes. status.txt says COMPLETE, or RESUBMIT NEEDED with the command to run from
+# a login node (compute nodes cannot call sbatch).
 #
-# It cannot resubmit the next round itself: a cm4 compute node is not permitted
-# to sbatch. It writes {work_dir}/logs/status.txt instead -- COMPLETE, or
-# RESUBMIT NEEDED with the command to run from a login node.
-#
-# Required environment:
+# Submitted by slurm/master.sh. Required environment:
 #   REPO_DIR, CONFIG_FILE, WORK_DIR, CONDA_ENV, N_SHARDS
 #
 #SBATCH --job-name=rm-merge

@@ -1,22 +1,19 @@
 #!/bin/bash
-# run -- the big one. 896 cores: an ARRAY OF 2 JOBS, each 4 nodes x 112 cores.
+# run: the array job. Each array task is one multi-node job, and srun starts one
+# `ribomine run` per node (slurm/node_worker.sh).
 #
-# Why an array and not one 8-node job: cm4_std caps a single job at 4 nodes (448
-# cores) but will run 2 of them concurrently. So the only way to hold 896 cores is
-# two 4-node jobs, and `--array=0-1 --nodes=4` is that. (--nodes and --array are
-# both set by slurm/master.sh from the config, and override the headers below.)
+# --array and --nodes are set by slurm/master.sh from the config and override the
+# headers below. cm4_std allows at most 4 nodes per job and 2 running jobs, so
+# 8 nodes (896 cores) are an array of two 4-node jobs.
 #
-# srun starts exactly ONE `ribomine run` per node. Not two, and not one per core:
-# each node loads the ~28 GB STAR index into its own shared memory and every one
-# of that node's 28 concurrent samples attaches to that single copy. A second
-# ribomine on the same node would race it -- whichever finished first would call
-# `STAR --genomeLoad Remove` and pull the index out from under the other.
+# One process per node: the node loads the STAR index into shared memory once and
+# all of its concurrent samples attach to that copy. A second `ribomine run` on
+# the same node could remove the genome while the first still uses it.
 #
-# A node's shard is its global index across the whole array:
+# A node's shard is its index across the whole array:
 #     shard = SLURM_ARRAY_TASK_ID * NODES_PER_JOB + SLURM_PROCID
-# (SLURM_PROCID is the node ordinal, because there is one task per node.) That
-# must agree with the N_SHARDS that prepare_run.py split the cohort into, or a
-# node reads someone else's list.
+# (one task per node, so SLURM_PROCID is the node ordinal). This must match the
+# N_SHARDS that prepare_run.py split the cohort into.
 #
 # Required environment (set by slurm/master.sh via --export):
 #   REPO_DIR, CONFIG_FILE, WORK_DIR, CONDA_ENV,
@@ -31,13 +28,10 @@
 #SBATCH --cpus-per-task=112
 #SBATCH --mem=480G
 #SBATCH --time=24:00:00
-# SIGTERM 10 min before the wall-time SIGKILL. RiboMine has no signal handler --
-# it does not need one: every stage writes its JSON atomically and only *after*
-# the work it records is complete, so a sample killed mid-flight simply has no
-# JSON and is redone next round. The 10 minutes are for node_worker.sh's own trap,
-# which releases the shared-memory STAR genome -- a segment leaked by a SIGKILL
-# holds 28 GB on that node until someone removes it by hand, and the next job to
-# land there cannot load its own.
+# SIGTERM 10 min before the wall-time limit, so that node_worker.sh can release the
+# shared-memory STAR genome. RiboMine needs no signal handler: each stage writes
+# its JSON atomically after the work is done, so an interrupted sample has no JSON
+# and is redone in the next round.
 #SBATCH --signal=B:TERM@600
 
 set -euo pipefail

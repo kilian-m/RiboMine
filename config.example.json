@@ -1,11 +1,13 @@
 {
   "_README": [
-    "Every key below is RiboMine's own default; delete anything you do not want to change. Keys starting with '_' are comments and are ignored.",
-    "An unknown key is an ERROR, not a silent no-op -- a typo'd threshold that gets ignored is worse than a crash."
+    "Every key below is RiboMine's default; delete what you do not change. Keys starting with '_' are comments. An unknown key is an error."
   ],
   "_null_means": {
-    "reference.contaminant_fasta": "use the HUMAN contaminant reference bundled with RiboMine (rRNA/tRNA/snRNA/snoRNA/Mt + 45S pre-rRNA + rDNA repeat). Contaminant filtering is ON either way -- set contaminants.enabled=false to turn it off.",
-    "reference.contaminant_index": "build the bowtie2 index from contaminant_fasta into <workdir>/refs/ on first use (takes ~1s). Set this only to reuse an index you already have.",
+    "reference.genome_fasta": "REQUIRED: the genome FASTA.",
+    "reference.gtf": "REQUIRED: the annotation GTF.",
+    "reference.star_index": "REQUIRED: a STAR index of the genome, built with the GTF.",
+    "reference.contaminant_fasta": "use the human contaminant reference bundled with RiboMine. Contaminant filtering is on either way; set contaminants.enabled=false to turn it off.",
+    "reference.contaminant_index": "build the bowtie2 index from contaminant_fasta into <workdir>/refs/ on first use.",
     "reference.annotation_index": "build the cached GTF index into <workdir>/refs/<gtf-stem>.idx.pkl on first use.",
     "query.taxon_id": "use reference.taxon_id.",
     "query.ncbi_api_key": "no key: NCBI Entrez is rate-limited to 3 requests/s instead of 10.",
@@ -35,11 +37,11 @@
   "reference": {
     "species": "Homo sapiens",
     "taxon_id": 9606,
-    "genome_fasta": "/path/to/data/homo_sapiens.90.fasta",
-    "gtf": "/path/to/data/homo_sapiens.90.gtf",
-    "star_index": "/path/to/data/index_files/STAR-index",
-    "contaminant_index": null,
+    "genome_fasta": null,
+    "gtf": null,
+    "star_index": null,
     "contaminant_fasta": null,
+    "contaminant_index": null,
     "annotation_index": null
   },
   "query": {
@@ -154,8 +156,8 @@
     "filter_pileups": true
   },
   "mapping": {
-    "align_ends_type": "EndToEnd",
-    "multimap_nmax": 1,
+    "align_ends_type": "Local",
+    "multimap_nmax": 10,
     "mismatch_nmax": 3,
     "mismatch_noverlmax": 0.1,
     "match_nmin_over_lread": 0.9,

@@ -1,28 +1,16 @@
-"""STAR alignment: the permissive LOCAL pass, and the end-to-end pass.
+"""STAR alignment: the permissive local pass and the final pass.
 
-Two alignments, for two different jobs:
+* `align_local` -- QC / architecture alignment of the untrimmed reads, with the
+  fixed permissive settings `LOCAL_ARGS` (from `fqdissect.align`): non-genomic
+  sequence (UMIs, RT additions, barcode, adapter) ends up in the soft clips,
+  where fqdissect reads the architecture.
+* `align_final` -- the deliverable BAM: the trimmed reads, aligned with the
+  `mapping` section of the config. Mapping metrics and gene counts
+  (`--quantMode GeneCounts`) come from this alignment; the permissive local one
+  inflates multimapping.
 
-* `align_local` -- the QC / architecture alignment. The reads are **untrimmed**:
-  the adapter is an *output* of this pipeline, not an input, so nothing may be
-  removed before we look. STAR runs with `--alignEndsType Local` and permissive
-  length/score filters so that everything non-genomic (5' UMI, RT additions,
-  3' UMI, sample barcode, adapter) is pushed into the **soft clips** instead of
-  preventing the alignment. The architecture is then read back out of those
-  clips. These parameters are what make the architecture readable at all, so
-  they are hard-coded here rather than exposed in the config.
-
-* `align_final` -- the deliverable BAM. The trimmed reads, aligned end-to-end
-  with the `mapping` section of the config. Mapping metrics are taken from this
-  alignment, never from the local one (a permissive local alignment inflates
-  multimapping). This pass also counts reads into genes as it goes
-  (`--quantMode GeneCounts`), which is where the read-count matrix comes from.
-
-Both write an unsorted BAM; `sort_index` produces the coordinate-sorted+indexed
-file. That split is not cosmetic: STAR's own BAM sorting is incompatible with
-the shared-memory genome (`--genomeLoad LoadAndKeep`), and the shared genome is
-what makes a 500-sample run affordable -- the 28 GB index is loaded once for the
-whole batch instead of once per sample. `pipeline.run` calls `load_genome` before
-the process pool and `unload_genome` in a `finally`; see below.
+Both write an unsorted BAM that `sort_index` sorts with samtools, because
+STAR's own sorting is incompatible with the shared-memory genome.
 """
 from __future__ import annotations
 
@@ -30,83 +18,35 @@ import os
 import re
 import shutil
 
+from fqdissect.align import LOCAL_ARGS
+
 from ..config import Config
 from ..utils import LOG, nonempty, require_tools, rm, run
 
-# --- the shared-memory genome: how the mode gets from the parent to the workers
+# --- genome-load mode ------------------------------------------------------
+# Without a shared genome, each worker of the `project.jobs` process pool loads
+# its own copy of the index (~28 GB for human). `load_genome` loads it once
+# (`--genomeLoad LoadAndExit`), the alignments attach to it (`LoadAndKeep`), and
+# `unload_genome` removes it (`Remove`).
 #
-# The per-sample aligners run in a `project.jobs`-wide PROCESS POOL. Without a
-# shared genome each worker mmaps its own copy of the ~28 GB index -- at jobs=8
-# that is 224 GB and the box dies. So the batch loads the index into shared
-# memory ONCE (`--genomeLoad LoadAndExit`), every sample then attaches to that
-# one segment (`--genomeLoad LoadAndKeep`), and the batch drops it at the end
-# (`--genomeLoad Remove`). This is what the reference batch driver
-# (read_architecture/bin/run_batch.sh) does, and it is what makes a
-# several-hundred-dataset run affordable.
-#
-# The "are we sharing?" decision is made in the parent but has to be visible to
-# the workers, so it is kept in the ENVIRONMENT rather than in a module global:
-# a global mutated in the parent after the pool has forked would not reach the
-# children (and would not survive a `spawn` start method at all), whereas
-# `os.environ` is inherited by both fork and spawn children. `load_genome`
-# writes the effective mode into RIBOMINE_STAR_GENOME_LOAD before the pool is
-# created; `align_local`/`align_final` read it back through `genome_load()`.
-#
-# Resolution order, most specific first:
-#   RIBOMINE_STAR_GENOME_LOAD -- the decision this batch actually made (it already
-#                                accounts for the user's wish AND for whether the
-#                                shared load succeeded)
-#   STAR_GENOME_LOAD          -- the user's override, honoured when no batch
-#                                decision has been made (e.g. a single align_local
-#                                call outside `pipeline.run`)
-#   NoSharedMemory            -- safe default: every process loads its own index
+# The effective mode reaches the workers through the environment, which both
+# fork and spawn children inherit. Resolution order:
+#   RIBOMINE_STAR_GENOME_LOAD -- set by `load_genome`: the mode this batch uses
+#   STAR_GENOME_LOAD          -- the user's override
+#   NoSharedMemory            -- default: every process loads its own index
 STATE_ENV = "RIBOMINE_STAR_GENOME_LOAD"
 GENOME_LOAD_ENV = "STAR_GENOME_LOAD"
 DEFAULT_GENOME_LOAD = "NoSharedMemory"
 SHARED = "LoadAndKeep"
-# the modes an *alignment* may legally run with. LoadAndExit/Remove are genome
-# management ops, not alignment modes; LoadAndRemove has the first sample to
-# finish unload the genome out from under the rest of the pool, so the pipeline
-# never selects it -- but a user who asks for it explicitly gets it.
+# Modes an alignment may run with. The pipeline never selects LoadAndRemove: the
+# first finished sample would unload the genome for the rest of the pool.
 ALIGN_LOADS = ("NoSharedMemory", "LoadAndKeep", "LoadAndRemove")
-
-# The permissive LOCAL alignment (identical to the reference map_reads.sh).
-#   MD                            -- cheap, and consumers (profiler, pile-ups) use it
-#   outSAMunmapped None           -- the profile only ever looks at aligned reads
-#   alignEndsType Local           -- the whole point: non-genomic ends -> soft clips
-#   outFilterMultimapNmax 1       -- unique only; a multimapper has no single genomic
-#                                    context to compare the read bases against
-#   outFilterMatchNmin 20         -- 20 genomic bases is enough to place a footprint...
-#   outFilterMatchNminOverLread 0 -- ...and the *fraction* filters must be off, or a
-#   outFilterScoreMinOverLread 0     read that is half construct is thrown away for
-#                                    being "too short" -- exactly the reads we need
-#   outFilterMismatchNmax 3 / NoverLmax 0.12 -- tolerate real mismatches inside the
-#                                    footprint without letting construct bases in
-#   seedSearchStartLmax 20        -- seed inside a short footprint that is flanked by
-#                                    non-genomic sequence
-#   outSJtype None                -- no splice-junction output; nothing reads it
-LOCAL_ARGS: list[str] = [
-    "--outSAMtype", "BAM", "Unsorted",
-    "--outSAMattributes", "NH", "HI", "AS", "nM", "MD",
-    "--outSAMunmapped", "None",
-    "--alignEndsType", "Local",
-    "--outFilterMultimapNmax", "1",
-    "--outFilterMatchNmin", "20",
-    "--outFilterMatchNminOverLread", "0",
-    "--outFilterScoreMinOverLread", "0",
-    "--outFilterMismatchNmax", "3",
-    "--outFilterMismatchNoverLmax", "0.12",
-    "--seedSearchStartLmax", "20",
-    "--alignSJoverhangMin", "8",
-    "--alignSJDBoverhangMin", "2",
-    "--outSJtype", "None",
-]
 
 _STAR_BAM = "Aligned.out.bam"     # what STAR writes
 _OUT_BAM = "aligned.bam"          # what we hand on (Sample.local_bam / star_final)
 _LOG_FINAL = "Log.final.out"
-# --quantMode GeneCounts writes this next to the BAM; the index's gene table names
-# the rows (id -> symbol, biotype). Both are read by ribomine.process.counts.
+# Written by --quantMode GeneCounts next to the BAM, and the index's gene table
+# (id, name, biotype). Both are read by ribomine.process.counts.
 GENE_COUNTS = "ReadsPerGene.out.tab"
 GENE_INFO = "geneInfo.tab"
 
@@ -114,11 +54,10 @@ GENE_INFO = "geneInfo.tab"
 # --- alignment -------------------------------------------------------------
 def align_local(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
                 log: str = "") -> str:
-    """Permissive LOCAL alignment of the untrimmed sampled reads. Returns the BAM.
+    """Permissive local alignment of the untrimmed sampled reads. Returns the BAM.
 
-    Nothing is trimmed beforehand -- the 5' UMI, RT nt, 3' UMI, barcode and
-    adapter are supposed to land in the soft clips, which is where the profiler
-    reads the architecture from.
+    UMIs, RT additions, barcode and adapter land in the soft clips, from which
+    fqdissect reads the architecture.
     """
     return _align(fastq, outdir, cfg, args=LOCAL_ARGS, threads=threads, log=log,
                   what="local")
@@ -126,24 +65,18 @@ def align_local(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
 
 def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
                 log: str = "") -> str:
-    """Alignment of the TRIMMED reads: the deliverable BAM.
+    """Align the trimmed reads with the `mapping` config section. Returns the BAM.
 
-    Parameters come from `cfg['mapping']` -- this alignment is the user's, and
-    what "a mapped read" means for their downstream analysis is theirs to set.
-
-    Also emits `ReadsPerGene.out.tab` (`--quantMode GeneCounts`) when the index
-    carries the annotation: STAR counts reads into genes *while* it aligns them,
-    which is free, so RiboMine does not run a second counting tool over the BAM.
-    See `ribomine.process.counts` for what those counts do and do not include.
+    Also writes `ReadsPerGene.out.tab` (`--quantMode GeneCounts`) when the index
+    carries an annotation; see `ribomine.process.counts` for what is counted.
     """
     args = [
-        # STAR writes UNSORTED, always: its coordinate sorter is incompatible with the
-        # shared-memory genome (LoadAndKeep) the batch runs on, so sort_index() below
-        # coordinate-sorts + indexes the deliverable with samtools afterwards.
+        # Unsorted: STAR's sorter is incompatible with the shared-memory genome;
+        # sort_index() sorts and indexes with samtools afterwards.
         "--outSAMtype", "BAM", "Unsorted",
         "--outSAMattributes", "nM", "MD", "NH",
         "--alignEndsType", str(cfg.get("mapping.align_ends_type", "Local")),
-        "--outFilterMultimapNmax", str(int(cfg.get("mapping.multimap_nmax", 1))),
+        "--outFilterMultimapNmax", str(int(cfg.get("mapping.multimap_nmax", 10))),
         "--outFilterMismatchNmax", str(int(cfg.get("mapping.mismatch_nmax", 3))),
         "--outFilterMismatchNoverLmax", str(float(cfg.get("mapping.mismatch_noverlmax", 0.1))),
         "--outFilterMatchNminOverLread", str(float(cfg.get("mapping.match_nmin_over_lread", 0.9))),
@@ -164,21 +97,16 @@ def align_final(fastq: str, outdir: str, cfg: Config, *, threads: int = 8,
 
 
 def has_annotation(cfg: Config) -> bool:
-    """Was the STAR index generated with a GTF?
+    """True if the STAR index was generated with a GTF.
 
-    `--quantMode GeneCounts` needs the annotation to be IN the index. It can also be
-    supplied at mapping time (`--sjdbGTFfile`), but that inserts junctions on the fly,
-    which STAR refuses to do against a shared-memory genome -- and the shared genome
-    is what makes a several-hundred-sample batch affordable. So the index either has
-    the annotation or the run gets no gene counts; it is not a trade we can make
-    per-sample.
-
-    `geneInfo.tab` holds the gene count on its first line, and an index built without
-    a GTF still has the file -- with a 0 in it.
+    `--quantMode GeneCounts` needs the annotation in the index: supplying it at
+    mapping time (`--sjdbGTFfile`) inserts junctions on the fly, which STAR
+    refuses to do against a shared-memory genome. `geneInfo.tab` holds the gene
+    count on its first line; an index built without a GTF has a 0 there.
     """
-    gene_info = os.path.join(_index(cfg), GENE_INFO)   # a missing index raises here,
-    try:                                               # rather than being reported as
-        with open(gene_info) as fh:                    # a missing annotation
+    gene_info = os.path.join(_index(cfg), GENE_INFO)   # a missing index raises here
+    try:
+        with open(gene_info) as fh:
             return int((fh.readline() or "0").strip()) > 0
     except (OSError, ValueError):
         return False
@@ -194,10 +122,7 @@ def _align(fastq: str, outdir: str, cfg: Config, *, args: list[str], threads: in
     # a killed STAR leaves _STARtmp behind and the next run refuses to start
     rm(os.path.join(outdir, "_STARtmp"))
 
-    # genome_load() reads the mode the batch settled on out of the environment, so a
-    # pool worker sees it across the fork. NOTE: the shared genome (LoadAndKeep) is
-    # incompatible with STAR's own BAM sorting -- which is why both arg sets say
-    # `--outSAMtype BAM Unsorted` and sort_index() sorts with samtools afterwards.
+    # genome_load() returns the mode the batch settled on (from the environment)
     cmd = [
         "STAR",
         "--runMode", "alignReads",
@@ -231,18 +156,13 @@ def _read_files_command(fastq: str) -> list[str]:
     return ["--readFilesCommand", "zcat"] if fastq.endswith(".gz") else []
 
 
-# --- the shared-memory genome ----------------------------------------------
+# --- shared-memory genome --------------------------------------------------
 def genome_load() -> str:
-    """The effective `--genomeLoad` mode for an alignment (see the note above).
-
-    Public so the pipeline can log which mode a run actually got -- "is the genome
-    shared?" is the difference between 28 GB and jobs x 28 GB of resident memory.
-    """
+    """The effective `--genomeLoad` mode for an alignment (resolution order above)."""
     mode = (os.environ.get(STATE_ENV) or os.environ.get(GENOME_LOAD_ENV)
             or DEFAULT_GENOME_LOAD)
     if mode not in ALIGN_LOADS:
-        # a typo (or a management op) in the override would make every STAR call
-        # die; fall back rather than take the run down
+        # an invalid override would make every STAR call fail; fall back instead
         LOG.warning("ignoring --genomeLoad %r (not one of %s); using %s",
                     mode, ", ".join(ALIGN_LOADS), DEFAULT_GENOME_LOAD)
         return DEFAULT_GENOME_LOAD
@@ -252,25 +172,18 @@ def genome_load() -> str:
 def load_genome(cfg: Config) -> bool:
     """Load the STAR index into shared memory once, for the whole batch.
 
-    Call before the process pool is created: on success the per-sample aligners
-    attach to the one segment with `--genomeLoad LoadAndKeep` instead of each
-    loading their own ~28 GB copy.
-
-    Idempotent, and it never raises. A shared segment can be legitimately
-    unavailable (SHMALL/SHMMAX too small, another user's stale segment, no STAR on
-    PATH); that is a performance problem, not a correctness one, so we warn and
-    fall back to NoSharedMemory -- the run still produces the same BAMs, it just
-    pays for the index per worker.
-
-    Returns True if the batch is sharing the genome.
+    Call before the process pool is created. Idempotent; never raises: if shared
+    memory is unavailable (e.g. SHMALL/SHMMAX too small) it warns and falls back
+    to NoSharedMemory, which gives the same output with one index copy per
+    worker. Returns True if the batch shares the genome.
     """
-    # already decided (a second call, e.g. a nested driver) -- do not re-load
+    # already decided by an earlier call
     if STATE_ENV in os.environ:
         return os.environ[STATE_ENV] == SHARED
 
     want = os.environ.get(GENOME_LOAD_ENV)
     if want and want != SHARED:
-        # the user asked for something else on purpose (small SHMALL, shared box)
+        # the user asked for another mode
         LOG.info("STAR shared genome not used ($%s=%s)", GENOME_LOAD_ENV, want)
         os.environ[STATE_ENV] = want if want in ALIGN_LOADS else DEFAULT_GENOME_LOAD
         return False
@@ -280,7 +193,7 @@ def load_genome(cfg: Config) -> bool:
         LOG.info("STAR genome loaded into shared memory (one copy for the whole batch)")
         return True
 
-    # fall back: correctness is untouched, memory is not
+    # fall back: one copy of the index per worker
     os.environ[STATE_ENV] = DEFAULT_GENOME_LOAD
     LOG.warning("STAR shared genome unavailable -- falling back to %s: each of the "
                 "%d concurrent job(s) will load its OWN copy of the index. Lower "
@@ -290,15 +203,13 @@ def load_genome(cfg: Config) -> bool:
 
 
 def unload_genome(cfg: Config) -> bool:
-    """Drop the shared-memory genome. Call it in a `finally` -- a leaked segment
-    holds 28 GB of RAM until someone runs `STAR --genomeLoad Remove` by hand.
+    """Remove the shared-memory genome. Call it in a `finally`: a leaked segment
+    holds its RAM until `STAR --genomeLoad Remove` is run by hand.
 
-    Idempotent (a second call is a no-op) and never raises: a run that finished
-    must not fail in its cleanup.
+    Idempotent; never raises.
     """
     shared = os.environ.get(STATE_ENV) == SHARED
-    # forget the decision, so this is a no-op the second time and a later
-    # load_genome() may start over
+    # clear the decision: a second call is a no-op, and load_genome() can run again
     os.environ.pop(STATE_ENV, None)
     if not shared:
         return False
@@ -355,11 +266,9 @@ def is_coordinate_sorted(bam: str) -> bool:
 def ensure_sorted_indexed(bam: str, *, threads: int = 4) -> str:
     """Leave `bam` coordinate-sorted and indexed, in place. Idempotent.
 
-    Every BAM RiboMine leaves behind goes through this, so there is never a BAM on
-    disk that a genome browser cannot open. It is called only AFTER the analysis
-    steps have read a BAM, never before: `qc/pileups.py` and `qc/profile.py` read
-    their input in file order, and re-ordering an input they are about to read would
-    be a change to the analysis, not to the packaging.
+    Applied to every BAM that is kept. Call it only after the analysis steps
+    have read the BAM: the pile-up filter and the architecture profile read
+    their input in file order.
     """
     if is_coordinate_sorted(bam) and nonempty(bam + ".bai"):
         return bam
@@ -373,9 +282,8 @@ def ensure_sorted_indexed(bam: str, *, threads: int = 4) -> str:
 def index(bam: str, *, threads: int = 4) -> str:
     """Index an already coordinate-sorted BAM.
 
-    Separate from `sort_index` because a deduplicator preserves the coordinate order
-    of its input: re-sorting its output would be pure waste, but the old index no
-    longer matches the new file and must be rebuilt.
+    For a BAM that is sorted but has no valid index, such as a deduplicator's
+    output, which keeps the coordinate order of its input.
     """
     require_tools("samtools")
     if not nonempty(bam):
@@ -387,8 +295,8 @@ def index(bam: str, *, threads: int = 4) -> str:
 def parse_log(star_log: str) -> dict:
     """Mapping stats from a STAR `Log.final.out`. Empty dict if there is no log.
 
-    `unique + multi + unmapped` sums to 1 by construction: STAR reports the
-    mapped classes only, and "unmapped" is whatever is left of the input.
+    `frac_unmapped` is the remainder of the input, so unique + multi + unmapped
+    sums to 1.
     """
     if not star_log or not os.path.exists(star_log):
         return {}
@@ -405,11 +313,9 @@ def parse_log(star_log: str) -> dict:
     toomany = grab("Number of reads mapped to too many loci") or 0
     out: dict = {
         "n_input": inp, "n_unique": uniq, "n_multi": multi + toomany,
-        # The length of the FOOTPRINT reads: STAR's input is the trimmed, contaminant-
-        # filtered FASTQ, so this is the mean length of the reads that are candidate
-        # footprints -- and NOT `mean_len_after_trim`, which still has the rRNA in it and
-        # is therefore a mean over the contaminants (88% of the reads on SRR30357177,
-        # and ~5 nt longer than a real footprint).
+        # STAR's input is the trimmed, contaminant-filtered FASTQ, so this is the mean
+        # length of the candidate footprints (`mean_len_after_trim` still includes
+        # the contaminants).
         "avg_input_len": grab("Average input read length", float),
         "avg_mapped_len": grab("Average mapped length", float),
     }

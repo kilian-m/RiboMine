@@ -1,50 +1,18 @@
-"""Find Ribo-seq runs in the SRA/ENA.
+"""Find candidate Ribo-seq runs in the SRA/ENA.
 
-Why this is not one search box
-------------------------------
-Ribo-seq has no `library_strategy` of its own. Submitters deposit it as
-`RNA-Seq` (mostly), `OTHER`, or occasionally `ncRNA-Seq` -- the same values a
-plain RNA-seq run carries. So the *only* signal that a run is ribo-seq is the
-free text: the study / experiment / sample titles and the library construction
-protocol.
+Ribo-seq has no `library_strategy` of its own (it is deposited as `RNA-Seq`,
+`OTHER` or `ncRNA-Seq`), so runs are found by their free text, in three steps:
 
-That forces a three-step search, because neither archive can do what we need on
-its own:
+1. Recall. ENA's portal index is token-based and a multi-word wildcard matches
+   nothing, so single tokens (`query.terms`) are ORed across the text fields.
+2. Precision. Phrases are matched here as regexes: STRONG (unambiguous, e.g.
+   "ribosome profiling") and WEAK (also used in plain RNA-seq, e.g.
+   "translatome"). EXCLUDE (rRNA-depleted RNA-seq, e.g. "Ribo-Zero") vetoes
+   weak hits only, because Ribo-seq protocols deplete rRNA too.
+3. Verification is left to the QC stage, so the query is tuned for recall.
 
-1. **Recall (the archive does this).** ENA's portal query language is
-   token-based: `study_title="*ribosome profiling*"` matches *nothing* -- a
-   multi-word wildcard phrase is not a token. Only single tokens work
-   (`"*ribosome*"`, `"*RPF*"`). So we OR broad single tokens across the text
-   fields and pull a deliberately over-inclusive candidate set (~190k human
-   runs; most are Ribo-Zero RNA-seq).
-
-2. **Precision (we do this).** The phrases the archive could not match are
-   applied here as regexes, in two tiers:
-
-   * **strong** -- unambiguous ("ribo-seq", "ribosome profiling", "RPF",
-     "ribosome-protected fragments", "TI-seq", "ARTseq", …). Nothing vetoes these.
-   * **weak** -- suggestive but also common in plain RNA-seq ("translatome",
-     "harringtonine", "polysome profiling"). An exclude term vetoes these.
-
-   The exclude list describes rRNA-**depleted RNA-seq** ("Ribo-Zero", "rRNA
-   depletion", "ribo-minus"). It must **never** veto a strong hit: every ribo-seq
-   protocol *also* depletes rRNA, so a naive exclude throws away real ribo-seq
-   studies -- measured, it silently dropped 21 genuine runs (a CNOT1 ribosome-
-   profiling study and a "ribosome footprinting" study whose abstracts mention
-   ribosomal RNA depletion).
-
-3. **Verification (the QC stage does this).** The query is a *candidate*
-   generator, not a classifier. Whether a run really is ribo-seq is decided by
-   3-nt periodicity on its own reads, not by what its submitter wrote. So this
-   stage is tuned for recall: a false positive costs one QC job, a false negative
-   is invisible and permanent.
-
-On the human archive as of 2026-07 the chain yields ~9,100 single-end Illumina
-runs (≥1M reads) across ~560 studies.
-
-The Entrez route (`query.source: "entrez" | "both"`) runs the same idea over
-NCBI's own index, which is worth doing because the two are not subsets of each
-other -- SRA-only submissions and very fresh deposits show up there first.
+`query.source: "entrez" | "both"` adds NCBI's index, which also holds SRA-only
+and very recent submissions.
 """
 from __future__ import annotations
 
@@ -58,7 +26,7 @@ from ..config import Config
 from ..utils import LOG, write_tsv
 from . import metadata
 
-# --- tier 1: unambiguous. An exclude term never vetoes one of these. ---------
+# --- tier 1: unambiguous; never vetoed by EXCLUDE ---
 STRONG = re.compile(r"""
     (?<![a-z]) ribo [\s._-]* seq (?![a-z])
   | ribosom\w* [\s._-]* (?: profiling | profile | footprint\w* | protected )
@@ -71,7 +39,7 @@ STRONG = re.compile(r"""
   | translatome [\s._-]* seq
 """, re.I | re.X)
 
-# --- tier 2: suggestive, but also said by plain RNA-seq studies. ------------
+# --- tier 2: suggestive, but also used by plain RNA-seq studies ---
 WEAK = re.compile(r"""
     translatom\w*
   | harringtonine | lactimidomycin
@@ -79,7 +47,7 @@ WEAK = re.compile(r"""
   | \b 40S [\s._-]* footprint\w*
 """, re.I | re.X)
 
-# --- rRNA-depleted RNA-seq: not ribo-seq. Vetoes a WEAK hit, never a STRONG one.
+# --- rRNA-depleted RNA-seq: vetoes a WEAK hit, never a STRONG one ---
 EXCLUDE = re.compile(r"""
     ribo [\s_-]* zero | ribozero
   | ribosomal \s+ RNA \s+ deplet\w*
@@ -88,11 +56,11 @@ EXCLUDE = re.compile(r"""
   | riboswitch | ribozyme
 """, re.I | re.X)
 
-# fields whose text the tiers are matched against
+# fields the tiers are matched against
 TEXT_FIELDS = ("study_title", "experiment_title", "sample_title",
                "library_construction_protocol", "description")
 
-# fields ENA will accept a wildcard token search on
+# fields ENA accepts a wildcard token search on
 SEARCHABLE = ("study_title", "experiment_title", "sample_title",
               "library_construction_protocol")
 
@@ -111,15 +79,9 @@ def classify(row: dict) -> str:
     return "none"
 
 
-# ---------------------------------------------------------------------------
-# route 1: ENA portal
-# ---------------------------------------------------------------------------
+# --- route 1: ENA portal ---
 def _ena_query(cfg: Config) -> str:
-    """OR the wildcard tokens across the searchable text fields.
-
-    Single tokens only -- ENA's index is tokenised, so `"*ribosome profiling*"`
-    matches nothing while `"*ribosome*"` matches 5,307 human runs.
-    """
+    """OR the wildcard tokens (single words only) across the searchable text fields."""
     tokens = [t.strip() for t in cfg["query.terms"] if t.strip()]
     if not tokens:
         raise ValueError("query.terms is empty")
@@ -151,14 +113,12 @@ def search_ena(cfg: Config) -> list[dict]:
     return rows
 
 
-# ---------------------------------------------------------------------------
-# route 2: NCBI Entrez
-# ---------------------------------------------------------------------------
+# --- route 2: NCBI Entrez ---
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
 
 def _entrez_term(cfg: Config) -> str:
-    """Entrez *can* do phrases, so it gets the precise ones directly."""
+    """Entrez supports phrase search, so it gets the precise phrases directly."""
     org = cfg["reference.species"]
     phrases = [
         "ribo-seq", "riboseq", "ribosome profiling", "ribosome footprint",
@@ -186,8 +146,7 @@ def _eget(endpoint: str, params: dict, *, retries: int = 4) -> str:
 
 
 def search_entrez(cfg: Config) -> list[dict]:
-    """esearch (history) -> efetch runinfo CSV. runinfo gives run accessions plus
-    enough metadata to filter without a second round-trip."""
+    """esearch (history) -> efetch runinfo CSV, mapped onto the ENA field names."""
     import csv
 
     key = cfg["query.ncbi_api_key"]
@@ -247,9 +206,7 @@ def search_entrez(cfg: Config) -> list[dict]:
     return rows
 
 
-# ---------------------------------------------------------------------------
-# union, filter, write
-# ---------------------------------------------------------------------------
+# --- union, filter, write ---
 def search(cfg: Config) -> list[dict]:
     src = cfg["query.source"]
     rows: list[dict] = []
@@ -263,7 +220,7 @@ def search(cfg: Config) -> list[dict]:
                 raise
             LOG.warning("Entrez search failed (%s); continuing with the ENA hits alone", exc)
 
-    # union on run_accession, ENA's record winning (it has fastq_ftp and read_count)
+    # union on run_accession; the first record (ENA's) wins
     merged: dict[str, dict] = {}
     for r in rows:
         acc = r["run_accession"]
@@ -276,9 +233,8 @@ def search(cfg: Config) -> list[dict]:
         else:
             merged[acc] = dict(r)
 
-    # Entrez-only runs carry no fastq_ftp / study_title: ask ENA for their record.
-    # A run ENA has never heard of (DDBJ-only) keeps what Entrez gave us and will
-    # be downloaded through the SRA-toolkit route.
+    # Entrez-only runs lack fastq_ftp / study_title: ask ENA for their record.
+    # Runs ENA does not know keep their Entrez fields.
     thin = [a for a, r in merged.items() if not r.get("fastq_ftp")]
     if thin:
         LOG.info("filling ENA metadata for %d Entrez-only run(s)", len(thin))
@@ -290,7 +246,7 @@ def search(cfg: Config) -> list[dict]:
 
 
 def _filter(cfg: Config, rows: list[dict]) -> list[dict]:
-    """The tiered text filter plus the mechanical eligibility filters."""
+    """The tiered text filter, then the eligibility filters and the run caps."""
     stats = {"strong": 0, "weak": 0, "excluded": 0, "none": 0}
     kept = []
     for r in rows:
@@ -333,8 +289,7 @@ def _filter(cfg: Config, rows: list[dict]) -> list[dict]:
              dropped["strategy"], dropped["layout"], dropped["depth"],
              f"{min_reads:,}", dropped["excluded"])
 
-    # at most N runs per study, deepest first -- one deep run says as much about a
-    # protocol as six shallow replicates, and QC time is the scarce resource
+    # at most N runs per study, deepest first (replicates share a protocol)
     per_study = int(cfg["query.runs_per_study"] or 0)
     if per_study:
         by_study: dict[str, list[dict]] = {}

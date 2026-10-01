@@ -1,29 +1,19 @@
-"""Split a cohort across the nodes of the SLURM run, once, and stably.
+"""Split a cohort across the nodes of the SLURM run. Called by `slurm/prep.sh`.
 
-This is the small job (`slurm/prep.sh`) that the big one depends on. It does the
-three things that must happen exactly once, in one process, before eight nodes
-start at the same time:
+    prepare_run.py -c CONFIG --shards N [--accessions LIST] [--reshard]
 
-1. **The query.** `ribomine query` searches ENA + NCBI and writes
-   `<root>/meta/candidates.tsv`. Eight nodes each running their own copy of that
-   search would be eight identical requests and eight different answers.
+1. Cohort: `pipeline.accession_list` (or `--accessions`), otherwise
+   `<root>/meta/candidates.tsv`. `slurm/master.sh` writes that file on the login
+   node; the query is run from here only if the file is missing.
+2. Split: one accession list per node (`<root>/shards/shard_NN.txt`), packed by
+   `read_count`, largest first, so that the nodes carry similar loads.
+3. Workdirs: one `<root>/shards/work_NN` per node, because `ribomine run` writes
+   its cohort tables at fixed paths under its workdir. `refs/` and
+   `meta/candidates.tsv` are symlinked from the root and only read.
 
-2. **The split.** The candidates are packed into one accession list per node.
-   Packing is by `read_count`, longest-first (LPT) -- a run is 1-10 GB, and a
-   node that draws the deep ones sets the wall time for the whole job.
-
-3. **The per-node workdirs.** Each node gets its own `<root>/shards/work_NN`,
-   because `ribomine run` writes cohort-level tables (`qc_summary.tsv`,
-   `failed.tsv`, ...) at fixed paths under its workdir: eight nodes sharing one
-   workdir would overwrite each other's. What they *may* share is seeded as a
-   symlink -- `refs/` (the GTF index and the bowtie2 contaminant index, built
-   once by `ribomine setup`) and `meta/candidates.tsv`.
-
-**The split is pinned.** Re-running this after the query has grown does not
-reshuffle: an accession that already has a shard keeps it, and only the new ones
-are packed into the least-loaded nodes. Moving a finished accession to another
-node would strand its results in a workdir nobody looks in any more, and its BAM
-would be downloaded and mapped a second time.
+The split is pinned: on a re-run an accession that already has a shard keeps it,
+and only new accessions are packed. Moving a finished accession would leave its
+results in a workdir that is no longer read, and the run would be processed again.
 """
 from __future__ import annotations
 
@@ -55,15 +45,10 @@ def manifest_path(root: str) -> str:
 
 # ---------------------------------------------------------------------------
 def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
-    """The cohort, and each run's read count (the packing weight).
+    """Return the cohort and each run's read count (the packing weight).
 
-    Where the cohort comes from is `pipeline.start`, the same as it would be for a
-    plain `ribomine run` -- so a config that names its own `accession_list` (a
-    pilot, a re-run of a curated set) is split as it stands, and is NOT sent to
-    search the archive behind its own back.
-
-    A run whose read count ENA does not give gets the cohort median rather than
-    zero: an unknown-size run is an average-size run, not a free one.
+    The source follows `pipeline.start`, as for `ribomine run`: a config with its
+    own `accession_list` is split as given, without querying the archive.
     """
     start = cfg["pipeline.start"]
     if start == "fastq":
@@ -84,12 +69,8 @@ def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
         with open(src) as fh:
             accs = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
         print(f"accessions: {len(accs)} from {src}  (pipeline.start={start})")
-        # A bare list carries no sizes -- but if a query has ever run in this workdir,
-        # its candidates.tsv did, and the runs are the same runs. Without this the
-        # packing weighs a 6 GB run the same as a 0.2 GB one, which is exactly the
-        # imbalance the packing exists to prevent. It matters most in the case people
-        # will actually hit: screening with end="qc", then feeding the survivors back
-        # in as a list.
+        # A bare list has no sizes. If an earlier query left a candidates.tsv in this
+        # workdir, take the read counts from it so the packing is still by size.
         w = _weights_from_candidates(cfg, accs)
         if w:
             print(f"            {len(w)}/{len(accs)} weighted by read_count from "
@@ -120,8 +101,7 @@ def accessions(cfg, override: str | None) -> tuple[list[str], dict[str, int]]:
 
 def _weights_from_candidates(cfg, accs: list[str]) -> dict[str, int]:
     """read_count for the runs in `accs`, from a candidates.tsv left by an earlier
-    query in this workdir. Empty dict if there is none -- the packing then falls back
-    to one-run-one-weight, which is the old behaviour and not wrong, only blunter."""
+    query in this workdir. Empty if there is none; all runs then weigh the same."""
     tsv = os.path.join(cfg.workdir, "meta", "candidates.tsv")
     if not (os.path.exists(tsv) and os.path.getsize(tsv) > 0):
         return {}
@@ -142,13 +122,10 @@ def _weights_from_candidates(cfg, accs: list[str]) -> dict[str, int]:
 
 def pack(accs: list[str], weights: dict[str, int], n: int,
          pinned: dict[str, int]) -> list[list[str]]:
-    """LPT bin-packing into `n` shards, honouring `pinned` (acc -> shard).
+    """Pack `accs` into `n` shards, keeping `pinned` (acc -> shard) in place.
 
-    Longest-processing-time-first: place the heaviest run on the lightest node,
-    repeatedly. It is the standard 4/3-approximation, and here it is close to
-    optimal because no single run is a meaningful fraction of a node's load --
-    which is exactly the property PRICE2's stage-4 locus partition does *not*
-    have, and why that one is imbalanced however it is packed.
+    Longest-processing-time-first: the heaviest remaining run goes to the least
+    loaded shard. A run without a read count gets the median weight.
     """
     default = int(statistics.median(weights.values())) if weights else 1
     bins: list[list[str]] = [[] for _ in range(n)]
@@ -175,8 +152,8 @@ def pack(accs: list[str], weights: dict[str, int], n: int,
 
 
 def existing_pins(root: str, n: int) -> dict[str, int]:
-    """acc -> shard, from the shard lists already on disk. The lists are the
-    truth, not the manifest: they are what the nodes actually read."""
+    """acc -> shard, from the shard lists already on disk (the files the nodes
+    read), not from the manifest."""
     pins: dict[str, int] = {}
     for k in range(n):
         p = shard_list(root, k)
@@ -191,13 +168,11 @@ def existing_pins(root: str, n: int) -> dict[str, int]:
 
 
 def seed_workdir(root: str, k: int, cfg) -> str:
-    """One node's workdir: its own everything, except what may safely be shared.
+    """Create one node's workdir.
 
-    `refs/` and `meta/candidates.tsv` are symlinked to the root's, so the GTF
-    index and the bowtie2 contaminant index are built once (by `ribomine setup`,
-    in prep) and merely *read* by all eight nodes. RiboMine notices they are
-    current and does not rebuild them -- which is the point: eight
-    `bowtie2-build`s into one prefix is corruption, not a slowdown.
+    `refs/` and `meta/candidates.tsv` are symlinks to the root's, so the GTF index
+    and the bowtie2 contaminant index are built once (by `ribomine setup`, in prep)
+    and only read by the nodes.
     """
     wd = shard_workdir(root, k)
     os.makedirs(wd, exist_ok=True)
@@ -247,10 +222,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"root workdir : {root}")
     print(f"shards       : {n}")
 
-    # `ribomine setup` must already have run: it builds refs/ (the GTF index and
-    # the bowtie2 contaminant index), which every shard workdir then symlinks and
-    # only reads. Without it each node discovers them missing and builds its own --
-    # eight GTF parses and eight bowtie2-builds, for nothing.
+    # refs/ is built by `ribomine setup` and symlinked into every shard workdir.
+    # Without it each node would build its own copy of the indexes.
     if not os.path.isdir(os.path.join(root, "refs")):
         print(f"WARNING: {root}/refs does not exist -- run `ribomine setup -c {a.config}` "
               f"first, or every node will build its own copy of the indexes.",

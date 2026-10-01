@@ -1,13 +1,7 @@
 """ENA portal metadata: the run records everything downstream is keyed on.
 
-ENA and SRA mirror each other's submissions, but ENA's portal API is the one
-worth talking to: a single request returns the full run record *including the
-direct fastq URLs*, where NCBI would need an esearch, an esummary and then a
-separate resolver call to find out where the data actually lives.
-
-Caveat that bites: DRR runs submitted to DDBJ have a browser record but no
-portal record, so they come back empty. Those fall back to the SRA toolkit
-download route.
+One portal request returns the full run record, including the direct FASTQ
+URLs. Runs without a portal record (e.g. DDBJ-only DRR runs) come back empty.
 """
 from __future__ import annotations
 
@@ -21,7 +15,7 @@ from ..utils import LOG
 
 PORTAL = "https://www.ebi.ac.uk/ena/portal/api"
 
-# the fields every stage may ask for, in the order they appear in candidates.tsv
+# the fields requested for every run
 FIELDS = [
     "run_accession",
     "experiment_accession",
@@ -81,11 +75,7 @@ def _parse_tsv(text: str) -> list[dict]:
 
 def fetch_runs(accessions: list[str], *, batch: int = 100,
                fields: list[str] | None = None) -> list[dict]:
-    """ENA read_run records for a list of run accessions.
-
-    Runs ENA does not know about (DDBJ-only DRR runs, very fresh submissions) are
-    simply absent from the result -- the caller decides what to do about that.
-    """
+    """ENA read_run records for the given runs; runs ENA does not know are absent."""
     out: list[dict] = []
     flds = ",".join(fields or FIELDS)
     for i in range(0, len(accessions), batch):
@@ -118,7 +108,7 @@ def search(query: str, *, fields: list[str] | None = None, limit: int = 0) -> li
 
 
 def filereport(acc: str, fields: list[str]) -> dict:
-    """The lightweight per-run endpoint (used for fastq URLs / read counts)."""
+    """The per-run filereport endpoint; {} if the run is unknown or the call fails."""
     q = urllib.parse.urlencode({
         "accession": acc, "result": "read_run",
         "fields": ",".join(fields), "format": "tsv",
@@ -137,19 +127,13 @@ def filereport(acc: str, fields: list[str]) -> dict:
 
 
 def fastq_urls(acc: str) -> list[str]:
-    """Direct https FASTQ URLs for a run, R1 first.
-
-    ENA serves the submitter's own FASTQ, so nothing has to be converted out of
-    an .sra container. A run with no ENA fastq mirror returns [] and the caller
-    falls back to another route.
-    """
+    """Direct https URL of a run's FASTQ at ENA, as a list: one file (R1 of a
+    paired deposit), or [] when ENA has no FASTQ for the run."""
     row = filereport(acc, ["fastq_ftp", "fastq_bytes"])
     paths = [p for p in (row.get("fastq_ftp") or "").split(";") if p]
     if not paths:
         return []
-    # A paired deposit lists _1 and _2. Ribo-seq is single-end; when a run is
-    # paired anyway (an RNA-seq control in the same study, or a UMI read split out
-    # into R2), the footprint is in R1.
+    # a paired deposit lists _1 and _2; the footprint is in R1
     if len(paths) > 1:
         r1 = [p for p in paths if p.endswith("_1.fastq.gz")]
         paths = r1 or paths[:1]

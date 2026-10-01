@@ -1,32 +1,18 @@
-"""The read-count matrix: genes x runs, straight out of STAR.
+"""The read-count matrix: genes x runs, from STAR's `--quantMode GeneCounts`.
 
-STAR counts reads into genes *while it aligns them* (`--quantMode GeneCounts`),
-so the matrix costs nothing beyond the alignment we already run -- no second pass
-over the BAM, no htseq/featureCounts, no gene model of our own to keep in step
-with the one STAR aligned against. Each run's `star_final/ReadsPerGene.out.tab`
-is one column; this module reads them and joins them.
+STAR counts reads into genes while it aligns them. Each run's
+`star_final/ReadsPerGene.out.tab` is one column; this module reads and joins them.
 
-**What a count is.** STAR's rule (htseq-count's `union` model): a read is counted
-into a gene if it overlaps that gene's exons and no other gene's. A read
-overlapping two genes is `ambiguous` and counted into neither; a read in no gene
-at all (intron, intergenic) is `no_feature`; a multimapper is not counted. The
-count is therefore over the WHOLE GENE -- every exon of every biotype -- not over
-the CDS. For a ribo-seq library the CDS is where the footprints are, so the two
-are close but not the same number, and UTR / ncRNA signal is inside these counts.
-
-**The strand.** The table carries three count columns -- unstranded, sense and
-antisense -- and RiboMine takes the SENSE one: a ribosome footprint is a piece of
-the mRNA, so it maps to the transcript's own strand. The antisense column is read
-too, and a library whose antisense counts rival its sense counts gets a warning:
-that is a reversed or unstranded library, and its sense column is then an
-undercount, not a measurement.
-
-**What these counts are NOT.** They are taken during the alignment, which is
-*before* the pile-up filter and before optional UMI deduplication. So a gene
-sitting under an adapter-dimer pile is counted with that pile included, and with
-`process.umi_dedup` on the counts are of the duplicated reads while the BAM is of
-the deduplicated ones. `mapping_summary.tsv` reports both read totals side by
-side, so the gap is visible rather than implied.
+* Counting follows htseq-count's `union` model: a read counts for a gene if it
+  overlaps that gene's exons and no other gene's. Multimappers, reads in two
+  genes (`ambiguous`) and reads in none (`no_feature`) are not counted. Counts
+  cover all exons of a gene, so they include UTR and ncRNA signal.
+* The sense column is used, because a footprint maps to the transcript's own
+  strand. A library whose antisense counts rival its sense counts (reversed or
+  unstranded) gets a warning: its sense column is an undercount.
+* Counts are taken during alignment, before the pile-up filter and optional UMI
+  deduplication, so they can exceed the reads in the final BAM.
+  `mapping_summary.tsv` reports both totals.
 """
 from __future__ import annotations
 
@@ -35,28 +21,25 @@ import os
 from ..utils import LOG, nonempty, write_tsv
 from .star import GENE_COUNTS, GENE_INFO
 
-# ReadsPerGene.out.tab: gene_id, unstranded, sense, antisense. `sense` is
-# htseq-count -s yes ("1st read strand aligned with RNA"), which is what a
-# single-end ribo-seq read is.
+# ReadsPerGene.out.tab columns: gene_id, unstranded, sense, antisense. `sense`
+# is htseq-count -s yes (read on the RNA strand), as for single-end ribo-seq.
 COL_UNSTRANDED, COL_SENSE, COL_ANTISENSE = 1, 2, 3
-# the four bookkeeping rows STAR puts above the genes
+# the four summary rows STAR puts above the genes
 SUMMARY_ROWS = ("N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous")
-# below this sense:antisense ratio the library does not read as sense-stranded
+# below this sense:antisense ratio the library is not considered sense-stranded
 MIN_SENSE_RATIO = 2.0
 
 
 def path(star_final_dir: str) -> str:
-    """Where STAR left this run's counts."""
+    """Path of a run's `ReadsPerGene.out.tab`."""
     return os.path.join(star_final_dir, GENE_COUNTS)
 
 
 def read_counts(tab: str, *, label: str = "") -> tuple[dict[str, int], dict]:
-    """Parse one `ReadsPerGene.out.tab` -> ({gene_id: sense count}, summary).
+    """Parse one `ReadsPerGene.out.tab` -> ({gene_id: sense count}, stats).
 
-    The summary is what the counts do NOT contain: reads that fell in no gene, and
-    reads that straddled two. Those are the honest denominator for "what fraction of
-    this library landed in a gene", so they are carried into the report rather than
-    dropped on the floor.
+    The stats include the reads that fell in no gene or in two (`n_no_feature`,
+    `n_ambiguous`), which form the denominator of `frac_in_genes`.
     """
     counts: dict[str, int] = {}
     summary: dict[str, int] = {}
@@ -76,19 +59,17 @@ def read_counts(tab: str, *, label: str = "") -> tuple[dict[str, int], dict]:
             n_anti += int(f[COL_ANTISENSE])
 
     n_in_genes = sum(counts.values())
-    # STAR's N_multimapping row is NOT read. Under the default `mapping.multimap_nmax:
-    # 1` STAR drops multimappers before it ever counts, so that row says 0 while the
-    # library may be 90% multimapping -- a number that is worse than no number. The
-    # real one comes from Log.final.out and is already in the `mapping` block.
+    # STAR's N_multimapping row is not reported: with `mapping.multimap_nmax: 1`
+    # STAR drops multimappers before counting, so the row reads 0. The multimapping
+    # rate comes from Log.final.out (the `mapping` block).
     stats = {
         "n_in_genes": n_in_genes,
         "n_genes_detected": sum(1 for v in counts.values() if v > 0),
         "n_no_feature": summary.get("N_noFeature"),
         "n_ambiguous": summary.get("N_ambiguous"),
         "n_antisense": n_anti,
-        # A sense-stranded library sits at 10-100x here. Near 1 means the strand
-        # column we are reading is not the one the reads are on, and the matrix
-        # would be a fraction of the real signal -- say so rather than ship it.
+        # A sense-stranded library is at 10-100x; near 1 the reads are not on the
+        # sense strand and the counts are an undercount (warned about below).
         "sense_over_antisense": round(n_sense / n_anti, 1) if n_anti else None,
     }
     counted = n_in_genes + (stats["n_no_feature"] or 0) + (stats["n_ambiguous"] or 0)
@@ -104,11 +85,10 @@ def read_counts(tab: str, *, label: str = "") -> tuple[dict[str, int], dict]:
 
 
 def gene_table(star_index: str) -> list[tuple[str, str]]:
-    """[(gene_id, gene_name)] in the index's own order -- the matrix's rows.
+    """[(gene_id, gene_name)] in the index's own order: the rows of the matrix.
 
-    STAR wrote `geneInfo.tab` from the same GTF it counted against, so this row set
-    matches the count tables exactly; there is no join to get wrong. Line 1 is the
-    gene count, then id / name / biotype.
+    STAR wrote `geneInfo.tab` from the GTF it counts against, so the rows match
+    the count tables. Line 1 is the gene count, then id / name / biotype.
     """
     rows: list[tuple[str, str]] = []
     with open(os.path.join(star_index, GENE_INFO)) as fh:
@@ -123,14 +103,10 @@ def gene_table(star_index: str) -> list[tuple[str, str]]:
 def matrix(out_tsv: str, star_index: str, columns: list[tuple[str, str]]) -> str:
     """Write the genes x runs matrix. `columns` is [(accession, ReadsPerGene path)].
 
-    Every gene in the annotation gets a row, including the all-zero ones: a matrix
-    whose row set depends on which runs happened to be in it cannot be compared with
-    the next one, and every downstream tool would rather filter zeros itself than
-    guess why a gene is missing.
-
-    Runs with no counts are LEFT OUT as columns rather than filled with blanks --
-    a blank is not a zero, and the difference matters to everything that reads this
-    file as a numeric table. `mapping_summary.tsv` still has a row for them.
+    Every annotated gene gets a row, including all-zero ones, so that matrices
+    from different batches share one row set. Runs without counts are left out
+    as columns rather than written as blanks, which would not parse as numbers;
+    `mapping_summary.tsv` still has a row for them.
     """
     genes = gene_table(star_index)
     per_run = {}
